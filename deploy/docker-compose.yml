@@ -1,0 +1,76 @@
+# The Aggregation Layer next to the local OpenG2P stack: the service and its own Postgres.
+#
+#   python scripts/register-aggregator.py          # once: Keycloak, key, PM, CM bindings, .env
+#   docker compose -p aggregation-layer -f deploy/docker-compose.yml up -d --build
+#
+# The Consent Manager, Partner Management and the registries are separate
+# deployments, reached by container name on the shared stack network.
+# Host port 8110 (8100 belongs to Kong when the OAN gateway is running).
+services:
+  aggregation-db:
+    image: postgres:16
+    container_name: aggregation-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: aggregation_layer_db
+    volumes:
+      - aggregation-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d aggregation_layer_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  aggregation-layer:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: openg2p-aggregation-layer:local
+    container_name: aggregation-layer
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      AGGREGATION_LAYER_DB_HOSTNAME: aggregation-db
+    ports:
+      - "8110:8100"
+    # "localhost:8080" must be Keycloak on the host, so the tokens this service
+    # fetches and verifies carry the same issuer the CM expects
+    # (http://localhost:8080/realms/staff) - the CM backend does the same.
+    extra_hosts:
+      - "localhost:host-gateway"
+    volumes:
+      - ./keys:/keys:ro
+    depends_on:
+      aggregation-db:
+        condition: service_healthy
+    networks:
+      default:
+      openg2p:
+        aliases:
+          - aggregation-layer
+
+  # Dev only: stands in for the partner's on-search endpoint. Postman's
+  # callback_url is http://localhost:9099/on-search; GET /last or /all shows
+  # what was delivered.
+  agg-callback:
+    image: python:3.12-slim
+    container_name: agg-callback
+    restart: unless-stopped
+    command: ["python", "/cb/callback_receiver.py"]
+    ports:
+      - "9099:9099"
+    volumes:
+      - ../postman:/cb:ro
+    networks:
+      default:
+      openg2p:
+
+volumes:
+  aggregation-db:
+
+networks:
+  openg2p:
+    external: true
+    name: ${OPENG2P_NETWORK:-openg2p-developer_default}
