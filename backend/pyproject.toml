@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "openg2p-aggregation-layer"
+authors = [
+  { name = "OpenG2P", email = "info@openg2p.org" },
+]
+description = "OpenG2P Aggregation Layer — one consent-gated partner call across several registries, delivered as a DCI on-search."
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)",
+  "Operating System :: OS Independent",
+]
+dependencies = [
+  "openg2p-fastapi-common >=1.1.4",
+  "asyncpg",
+  # 2.1 stopped installing greenlet, which the async engine needs: an
+  # unpinned build starts and then every worker dies (seen on the CM image).
+  "sqlalchemy[asyncio] >=2.0,<2.1",
+  "psycopg2-binary",
+  "cryptography >=42.0.0",
+  "pyjwt >=2.8.0",
+  "httpx",
+  # Only used when otp_publish_enabled (dev-only OTP drop box).
+  "boto3",
+  # Fan-out and callback queues; imported lazily, only when kafka_enabled.
+  "aiokafka >=0.10",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://openg2p.org"
+Repository = "https://github.com/Centre-for-Open-Societal-Systems/aggregation-layer"
+
+[tool.hatch.version]
+path = "src/openg2p_aggregation_layer/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/openg2p_aggregation_layer"]
