@@ -256,6 +256,10 @@ class IdentifierMatch(_Strict):
     path: str
     value_key: str = "identifier_value"
     type_key: Optional[str] = "identifier_type"
+    # Prefixes that do not change the number (a Fayda FAN is stored with or
+    # without "FAN-"). Stripped, case-insensitively, from both sides before
+    # comparing, and from the value the registry is searched with.
+    strip_prefixes: List[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _paths(self):
@@ -263,13 +267,35 @@ class IdentifierMatch(_Strict):
         for key in (self.value_key, self.type_key):
             if key is not None and not _SEGMENT_RE.match(key):
                 raise ValueError("invalid key '%s'" % key)
+        if any(not p for p in self.strip_prefixes):
+            raise ValueError("strip_prefixes may not contain an empty prefix")
         return self
+
+    def normalise(self, value: Any) -> str:
+        """The identifier as it is compared: trimmed, known prefixes removed."""
+        return strip_known_prefixes(value, self.strip_prefixes)
 
     @property
     def scope(self) -> str:
         """The top-level block the identifiers are read from."""
         head = self.path.split(".")[0]
         return head[:-2] if head.endswith("[]") else head
+
+
+def strip_known_prefixes(value: Any, prefixes: Iterable[str]) -> str:
+    """Trim ``value`` and remove any of ``prefixes`` (case-insensitive) from its
+    start, repeatedly: a prefix typed twice ("FAN-FAN-...") is still the same
+    number. Only the start is touched; nothing is ever added."""
+    text = str(value or "").strip()
+    prefixes = [p for p in prefixes if p]
+    stripped = True
+    while stripped:
+        stripped = False
+        for prefix in prefixes:
+            if text.upper().startswith(prefix.upper()):
+                text = text[len(prefix):].strip()
+                stripped = True
+    return text
 
 
 class Search(_Strict):
@@ -444,11 +470,19 @@ class RegistryEntry(_Strict):
         the identifier check reads (never released unless it was granted)."""
         return sorted(set(granted) | {self.search.match.scope})
 
+    def search_value(self, foundational_id: str) -> str:
+        """The value the registry is searched with. Without a strippable prefix
+        a substring search finds the number stored either way."""
+        return self.search.match.normalise(foundational_id)
+
     def identifies(self, record: Any, foundational_id: str) -> bool:
         """True if ``record`` belongs to ``foundational_id``, by exact match."""
         match = self.search.match
+        wanted = match.normalise(foundational_id)
+        if not wanted:
+            return False
         for item in rows_at(record, match.path):
-            if str(item.get(match.value_key) or "").strip() != foundational_id:
+            if match.normalise(item.get(match.value_key)) != wanted:
                 continue
             if match.type_key is None or item.get(match.type_key) == self.search.id_type:
                 return True
@@ -499,6 +533,13 @@ class RegistryCatalog(_Strict):
 
     def get(self, code: str) -> Optional[RegistryEntry]:
         return self.registries.get(code)
+
+    def same_identifier(self, a: Any, b: Any) -> bool:
+        """Whether two spellings are the same foundational ID, ignoring any
+        prefix some registry declares as not changing the number."""
+        prefixes = {p for e in self.registries.values() for p in e.search.match.strip_prefixes}
+        left, right = strip_known_prefixes(a, prefixes), strip_known_prefixes(b, prefixes)
+        return bool(left) and left == right
 
     @staticmethod
     def scope_id(code: str, scope: str) -> str:

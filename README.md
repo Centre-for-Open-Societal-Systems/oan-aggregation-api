@@ -353,6 +353,7 @@ registries:
                                          #   released only if consented)
         value_key: identifier_value      # default
         type_key: identifier_type        # default; null = compare the value only
+        strip_prefixes: ["FAN-"]         # optional: same number with or without the prefix
       page_size: 10                      # optional
     registers:                           # bene-360 registers the record maps onto
       FARMER:

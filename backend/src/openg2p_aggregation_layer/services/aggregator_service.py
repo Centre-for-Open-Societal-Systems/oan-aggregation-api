@@ -194,7 +194,7 @@ class AggregatorService(BaseService):
                 "none of the requested registries' scopes are within the consent")
 
         subject = decision.get("subject_id") or {}
-        self._check_subject(query, subject.get("value"))
+        self._check_subject(query, subject.get("value"), get_catalog().same_identifier)
 
         # Who the partner is: the CM looked the binding up by the object's
         # ``aud`` and verified the signature against that partner's key, so
@@ -279,15 +279,20 @@ class AggregatorService(BaseService):
         return request
 
     @staticmethod
-    def _check_subject(query: Dict[str, Any], subject_value: Optional[str]) -> None:
+    def _check_subject(query: Dict[str, Any], subject_value: Optional[str],
+                       same=None) -> None:
         """The beneficiary asked about must be the one who consented.
 
         The registries are searched by ``foundationalId``, and on the hop the
         CM checks the aggregator's binding, not the subject. So this is the
         only place that stops a partner holding one person's consent from
-        fetching another person's record.
+        fetching another person's record. ``same`` compares two spellings of
+        one ID (``RegistryCatalog.same_identifier``: "FAN-1234" is "1234");
+        without it the values must be equal.
         """
-        if not subject_value or query.get("foundationalId") != subject_value:
+        asked = query.get("foundationalId")
+        same = same or (lambda a, b: bool(a) and a == b)
+        if not subject_value or not same(asked, subject_value):
             raise AggregationError(
                 403, "subject_mismatch",
                 "foundationalId must be the consent object's subject_id.value")
@@ -315,7 +320,7 @@ class AggregatorService(BaseService):
         claims = self.cm.decode_claims(consent_jws)
         subject = claims.get("subject_id") or {}
         audience = claims.get("aud")
-        self._check_subject(query, subject.get("value"))
+        self._check_subject(query, subject.get("value"), get_catalog().same_identifier)
 
         # Ask for exactly what the partner's object names within the
         # registries in play; the subject decides how much of it to grant.
@@ -1005,7 +1010,8 @@ class AggregatorService(BaseService):
             try:
                 records = await self.registries.search(
                     registry, entry, request.subject_id_type, request.subject_id_value,
-                    foundational_id, entry.hop_scopes(scopes), request.purpose)
+                    entry.search_value(foundational_id), entry.hop_scopes(scopes),
+                    request.purpose)
             except RegistryError as exc:
                 _logger.warning("Aggregation %s: %s failed - %s %s",
                                 request.id, registry, exc.reason, exc.detail)

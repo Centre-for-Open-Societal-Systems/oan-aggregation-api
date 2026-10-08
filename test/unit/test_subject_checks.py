@@ -70,3 +70,20 @@ def test_release_by_the_subject(service):
     me = {"subject_id_type": "national_id", "subject_id_value": "761"}
     _release(service, me, SubjectId(type="national_id", value="761"))
     assert service.released == [("agg-1", "123456")]
+
+
+def test_subject_check_ignores_a_declared_prefix(fixtures):
+    import yaml
+    from openg2p_aggregation_layer.registry_catalog import parse_catalog
+
+    raw = yaml.safe_load((fixtures / "catalogs" / "three-registries.yaml")
+                         .read_text(encoding="utf-8"))
+    raw["registries"]["FARMER_REGISTRY"]["search"]["match"]["strip_prefixes"] = ["FAN-"]
+    same = parse_catalog(raw).same_identifier
+    fan = "1111222233334444"
+    for asked, subject in [("FAN-" + fan, fan), (fan, "FAN-" + fan),
+                           ("FAN-FAN-" + fan, fan), (" fan-" + fan, "FAN-" + fan)]:
+        AggregatorService._check_subject({"foundationalId": asked}, subject, same)
+    for asked, subject in [("FAN-" + fan, fan + "5"), ("FAN-", "FAN-"), ("", "")]:
+        with pytest.raises(AggregationError):
+            AggregatorService._check_subject({"foundationalId": asked}, subject, same)

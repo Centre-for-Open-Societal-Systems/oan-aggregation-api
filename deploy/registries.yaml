@@ -35,6 +35,8 @@
 #                         check and released only if the consent covers it
 #     value_key           default identifier_value
 #     type_key            default identifier_type; null skips the type check
+#     strip_prefixes      prefixes that do not change the number (e.g. "FAN-"),
+#                         removed from both sides and from the search value
 #   search.page_size      optional, overrides AGGREGATION_LAYER_AGGREGATOR_PAGE_SIZE
 #
 #   registers.<MNEMONIC>  a bene-360 register the record maps onto:
@@ -81,6 +83,7 @@ registries:
       id_type: UIN
       match:
         path: farmer_personal_details.member_identifier[]
+        strip_prefixes: ["FAN-"]       # a Fayda FAN is the same number with or without it
     registers:
       FARMER:
         name: Farmer
@@ -127,6 +130,7 @@ registries:
       id_type: UIN
       match:
         path: livestock_details.farmer_info.member_identifier[]
+        strip_prefixes: ["FAN-"]       # a Fayda FAN is the same number with or without it
     registers:
       LIVESTOCK:
         name: Livestock holding
@@ -186,6 +190,7 @@ registries:
       id_type: UIN
       match:
         path: crop_sown_details.farmer_info.member_identifier[]
+        strip_prefixes: ["FAN-"]       # a Fayda FAN is the same number with or without it
     registers:
       CROP_SOWN:
         name: Crop sown
