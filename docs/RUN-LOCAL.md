@@ -5,7 +5,7 @@
 | Service | URL | Container |
 |---|---|---|
 | Aggregation Layer | http://localhost:8110 (`/docs`) | `aggregation-layer` (+ `aggregation-db`) |
-| Consent Manager (branch `feature/aggregation-layer-apis`) | http://localhost:8000 | `consent-manager-backend-1` |
+| Consent Manager (`develop`, no aggregation code; `subject_consent_required=true`) | http://localhost:8000 | `consent-manager-backend-1` |
 | CM consent UI | http://localhost:3002 | `consent-manager-frontend-1` |
 | Partner callback receiver | http://localhost:9099/all | `agg-callback` |
 | Kafka / Kafka UI | localhost:9092 / http://localhost:8085 | `agg-kafka`, `agg-kafka-ui` |
@@ -15,7 +15,7 @@ Port 8110, not 8100: `oan-kong` uses 8100 when it is running.
 ## One-time setup (already done on this machine, 2026-10-07)
 
 ```bash
-python scripts/register-aggregator.py      # Keycloak client + role, key, PM partner, CM bindings, .env files
+python scripts/register-aggregator.py      # Keycloak client + role, key, PM partner, CM bindings (legitimate_interest), deploy/.env
 bash ../../OPENG2P/coss-run/run-cm.sh       # rebuild the CM from the checked-out branch
 docker compose -p aggregation-layer -f deploy/docker-compose.yml up -d --build
 docker compose -p aggregation-kafka -f deploy/docker-compose.kafka.yml up -d   # optional (KAFKA_ENABLED=true in deploy/.env)
@@ -32,15 +32,20 @@ Postman: import `postman/OpenG2P-Aggregator.postman_collection.json` and the env
 `agg-prep.py` just wrote, then run folders 0 → 4. Re-run `agg-prep.py` if a seek returns `replay`.
 
 Manual "farmer never asked" flow: sign a consent object for a subject with no consent; the
-seek ack carries `consent_url` (CM UI :3002). Approve there with the OTP; the partner's
-on-search arrives at :9099 without another call.
+seek ack carries `consent_url` (CM UI :3002). Approve there with the OTP **within 300s of
+the object's `issued_at`** (the CM's replay window: the aggregation layer re-validates the
+partner's object to learn the granted scopes). The poll picks it up within
+`AGGREGATION_LAYER_CM_POLL_INTERVAL_SEC` and the partner's on-search arrives at :9099
+without another call. Approved later, the row is rejected with
+`consent_approved_after_replay_window` and the partner seeks again.
 
 ## Switches
 
 - Kafka off: `AGGREGATION_LAYER_KAFKA_ENABLED=false` in `deploy/.env`, then
   `docker compose -p aggregation-layer -f deploy/docker-compose.yml up -d aggregation-layer`.
 - Logs: `docker logs -f aggregation-layer`, `docker logs -f consent-manager-backend-1`.
-- CM → aggregation layer events: look for `Aggregation Layer event ... delivered` in the CM log.
+- Consent decisions: the aggregation layer polls the CM; look for `CM poll:` / `released by consent
+  request` / `is no longer active` in `docker logs aggregation-layer`. Nothing is logged on the CM side.
 
 ## Known data gap
 

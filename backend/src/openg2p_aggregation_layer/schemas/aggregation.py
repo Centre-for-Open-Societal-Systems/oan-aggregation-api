@@ -177,6 +177,12 @@ class AggregationStatusResponse(BaseModel):
     # rather than a policy decision.
     otp_required: bool = True
     otp_verified_at: Optional[datetime] = None
+    lawful_basis: Optional[str] = None
+    # The consent request raised for the subject (if any), the CM consent
+    # record this fetch stands on, and the grant spent at each registry.
+    consent_request_id: Optional[str] = None
+    cm_consent_id: Optional[str] = None
+    grant_ids: Dict[str, str] = Field(default_factory=dict)
     registry_results: Dict[str, Any] = Field(default_factory=dict)
     callback_status: Optional[int] = None
     callback_attempts: int = 0

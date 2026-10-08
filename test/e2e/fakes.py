@@ -6,8 +6,10 @@
     GET  /received                    what the callback has been sent
 
 The registry is the part that matters: it validates the aggregator's consent
-JWS with the CM's /validate exactly as a real registry does, so a fetch only
-succeeds if the grant recorded through POST /consent/v1/grants is really there.
+JWS with the CM's /validate exactly as a real registry does. The aggregator's
+binding is legitimate_interest, so the CM permits the hop on the binding's
+policy ceiling; the subject's consent is enforced by the aggregation layer
+before it calls.
 
     E2E_KEYS=<dir of *.pub.pem> E2E_CM=http://127.0.0.1:18000 \
         uvicorn fakes:app --port 18090

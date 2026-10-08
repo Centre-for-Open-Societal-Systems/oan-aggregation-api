@@ -9,10 +9,12 @@ registry is modified, and consent enforcement stays on for every internal hop.
 Two signatures per call, as in the sync path:
 
 1. a **consent JWS** — the partner-signed consent object. Here the aggregator
-   signs it with the CM key, because on this hop the aggregator *is* the
+   signs it with its own key, because on this hop the aggregator *is* the
    partner. Its public half must be registered in Partner Management and it
-   needs a CM binding per registry, exactly as any partner does. See
-   ``scripts/register-aggregator.py``.
+   needs a CM binding per registry, exactly as any partner does — on lawful
+   basis ``legitimate_interest``, so the CM caps the hop at the binding's
+   ceiling and the subject's consent is enforced by the aggregator before it
+   calls. See ``scripts/register-aggregator.py``.
 2. a **detached envelope signature** over the canonical ``header`` + ``message``.
 
 So the registry validates the aggregator's consent by calling CM's own

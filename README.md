@@ -9,12 +9,17 @@ ran inside the Consent Manager. See [docs/SPLIT-PLAN.md](docs/SPLIT-PLAN.md).
 ## How it relates to the Consent Manager
 
 The Consent Manager (CM) keeps every consent decision: validate, consent requests,
-approve / withdraw, lawful basis, My consents. This service owns only the aggregation:
-the request row, the OTP for the release, the registry fan-out, the callback and its retries.
+approve / withdraw, lawful basis, My consents. It carries no code for this service. This
+service owns the aggregation and all of its state, in its own database: the request row,
+the per-registry grant (`aggregation_grants`), the OTP for the release, the registry
+fan-out, the callback and its retries.
 
-It talks to the CM **only over HTTP** (`backend/src/openg2p_aggregation_layer/services/cm_client.py`)
-and receives consent events on `POST /aggregation/v1/cm-events`.
-The CM APIs it needs are listed in [docs/CM-API-CONTRACT.md](docs/CM-API-CONTRACT.md).
+It talks to the CM **only over the CM's generic HTTP APIs**
+(`backend/src/openg2p_aggregation_layer/services/cm_client.py`) and **polls** them for
+consent approval / denial / withdrawal; nothing is pushed by the CM. The registry hops are
+validated by the CM against bindings on lawful basis `legitimate_interest`; the farmer's
+consent and OTP are enforced here before any registry is called.
+See [docs/CM-API-CONTRACT.md](docs/CM-API-CONTRACT.md).
 
 ## API
 
@@ -26,20 +31,20 @@ The CM APIs it needs are listed in [docs/CM-API-CONTRACT.md](docs/CM-API-CONTRAC
 | `GET /consent/v1/aggregation/{id}` | Status (subject's own) |
 | `GET /consent/v1/aggregation/fields` | Field catalog |
 | `GET /consent/v1/aggregation/queue` | Queue health |
-| `POST /aggregation/v1/cm-events` | CM → consent approved / withdrawn |
 
 Routes are unchanged from the CM version, so the Postman collection only needs `agg_url`.
 
 ## Layout
 
 ```
-backend/   FastAPI service + Kafka worker (python -m openg2p_aggregation_layer.worker)
-           and reaper (python -m openg2p_aggregation_layer.reap)
+backend/   FastAPI service + worker (Kafka consumers + CM poll,
+           python -m openg2p_aggregation_layer.worker) and reaper
+           (CM poll + stale claims, python -m openg2p_aggregation_layer.reap)
 deploy/    Dockerfile, docker-compose (service + own Postgres), Kafka compose, .env.example
 postman/   Collection + environment for the end-to-end flow, callback receiver
 scripts/   register-aggregator.py (PM partner + CM bindings), queue-status.sh
 docs/      Split plan, CM API contract, Kafka design
-test/      Kafka consumer flow test
+test/      OTP + Kafka consumer unit tests, end-to-end run against a real CM (test/e2e)
 ```
 
 ## Run
@@ -58,11 +63,14 @@ python postman/agg-prep.py && python scripts/stack-check.py
 - [x] Code moved, CM table access replaced by `cm_client.py`, own DB, own signing key
 - [x] App boots and mounts all routes; Kafka worker / reaper / consumers load
 - [x] OTP validation: `test/otp/test_otp_flow.py` (Fayda + internal providers) passes
-- [x] CM side: the 5 additions in `docs/CM-API-CONTRACT.md` (consent-management branch `feature/aggregation-layer-apis`)
-- [x] End-to-end against the CM over HTTP: `CM_SRC=../consent-management bash test/e2e/run.sh` — 19/19
-      (validate, by-audience, grants, granted-scopes, approve/withdraw events, OTP, My consents grouping)
-- [x] `scripts/register-aggregator.py`: own key `PARTNER_AGGREGATION_LAYER`, Keycloak client, CM bindings
-- [x] Real local stack (farmer, livestock, cropsown registries), in-process and Kafka mode:
-      `scripts/stack-check.py` 11/11
+- [x] Generic CM APIs only (no CM change), own `aggregation_grants`, consent state polled
+      (branch `feature/standalone-db`)
+- [x] End-to-end against CM `develop` without its aggregator
+      (consent-management `feature/remove-aggregator`):
+      `CM_SRC=../consent-management bash test/e2e/run.sh` — 18/18
+      (no aggregation API on the CM, consent held + OTP, raise + approve, withdraw, deny,
+      approval after the replay window)
+- [x] `scripts/register-aggregator.py`: own key `PARTNER_AGGREGATION_LAYER`, Keycloak client,
+      CM bindings on `legitimate_interest`
+- [ ] Re-run `scripts/register-aggregator.py` + `scripts/stack-check.py` on the real stack
 - [ ] Manual Postman run
-- [ ] Then remove the aggregator code from consent-management (separate PR)

@@ -33,8 +33,15 @@ walked, just by an in-process task — so a row's history reads the same either
 way.
 
 Whether the OTP leg is walked at all is the partner's policy: ``seek`` reads
-``partner_policies.required_auth_method`` once and records the answer on
+``required_auth_method`` from the CM once and records the answer on
 ``otp_required``. NULL skips straight to ``verified``.
+
+A row parked at ``pending_consent`` waits on a consent request raised in the
+CM. Nothing pushes the answer here: the poller (``AggregatorService.sync_with_cm``)
+reads the request's status from the CM's generic API and releases or rejects
+the row. The same poll, and a check right before the fan-out and before the
+callback, read the status of ``cm_consent_id`` so a withdrawal in the CM stops
+the fetch.
 """
 from datetime import datetime
 from enum import Enum
@@ -51,7 +58,7 @@ class AggregationStatus(str, Enum):
     received = "received"        # ack sent, nothing else has happened yet
     # The subject had no consent for this partner, so one was raised on their
     # behalf and is waiting on the consent screen. The OTP belongs to THAT
-    # request, not to this one — see ConsentRequest.otp_*.
+    # request, not to this one — the CM reports it as otp_verified_at.
     pending_consent = "pending_consent"
     pending_otp = "pending_otp"  # OTP issued to the subject, awaiting the code
     verified = "verified"        # subject proved the OTP; fan-out may proceed
@@ -63,7 +70,7 @@ class AggregationStatus(str, Enum):
     delivering = "delivering"    # a worker is POSTing to the partner
     delivered = "delivered"      # callback accepted the aggregated payload
     failed = "failed"            # fan-out or callback failed; see failure_reason
-    rejected = "rejected"        # OTP expired or too many wrong attempts
+    rejected = "rejected"        # OTP failed, consent denied or withdrawn
 
 
 class AggregationRequest(BaseORMModelWithId):
@@ -88,6 +95,19 @@ class AggregationRequest(BaseORMModelWithId):
     # that request is what releases this aggregation.
     consent_request_id: Mapped[Optional[str]] = mapped_column(
         String, nullable=True, index=True)
+    # The partner's consent object, kept ONLY while the row is parked on a
+    # raised consent request. On approval the poller asks the CM's /validate
+    # again with it, which is how the subject's granted scopes are learnt (the
+    # CM narrows to them). Cleared as soon as the row leaves pending_consent.
+    consent_jws: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # The CM consent record this fetch stands on: the consent_id /validate
+    # returned for the partner's object. Its status (GET
+    # /consent/v1/consents/{id}/status) is what tells this service that the
+    # subject withdrew - the CM revokes it with the consent it hangs off.
+    cm_consent_id: Mapped[Optional[str]] = mapped_column(
+        String, nullable=True, index=True)
+    # Per registry, the AggregationGrant this fetch spends: {"farmer": "<id>"}.
+    grant_ids: Mapped[dict] = mapped_column(JSONB, default=dict)
 
     # ── DCI correlation. transaction_id is the partner's; correlation_id is
     # ours and is what comes back on the callback. ───────────────────────────

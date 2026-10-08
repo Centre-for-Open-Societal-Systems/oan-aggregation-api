@@ -6,7 +6,7 @@ subject "staff" and writes the Postman environment); this reads that file.
   A  consent held (komal-aggregator, OTP policy): seek -> OTP ->
      farmer-consent-validate -> three registries -> on-search at :9099
   B  never asked: seek for a subject with no consent -> CM raises a consent
-     request -> approve it on the CM (OTP) -> CM event -> released -> on-search
+     request -> approve it on the CM (OTP) -> AL polls the CM -> released -> on-search
 
     python scripts/stack-check.py
 """
@@ -107,7 +107,7 @@ def main():
                   "the demo clean-up; approve an intake in the Cropsown UI (:3004)"
                   % regs.get("cropsown", {}).get("queried"))
 
-    print("\nB  never asked: raise on the CM -> approve -> event -> callback")
+    print("\nB  never asked: raise on the CM -> approve -> poll -> callback")
     claims = json.loads(PyJWS().decode_complete(V["consent_jws"],
                                                 options={"verify_signature": False})["payload"])
     print("  (needs the partner key agg-prep registered; signing a new object for a fresh subject)")
@@ -140,7 +140,7 @@ def main():
                            json={"granted_scopes": ["farmer.firstname"]})
             check("approved on the CM (first name only)", a.status_code == 201, a.text[:150])
             body = wait_callback(ack["correlation_id"])
-            check("CM event released it; on-search delivered", body is not None)
+            check("poll saw the approval; on-search delivered", body is not None)
             if body:
                 rec = ((body["message"]["search_response"][0]["data"]["reg_records"]) or [{}])[0]
                 check("only the granted field", sorted(rec) == ["farmer.firstname"], rec)

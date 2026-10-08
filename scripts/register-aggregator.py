@@ -2,18 +2,32 @@
 
 The Aggregation Layer is a partner like any other, with its own identity:
 
-1. Keycloak (staff realm): realm role CONSENT_MANAGER_SERVICE and a confidential
-   client ``aggregation-layer`` whose service account holds it. That token is
-   what the aggregation layer sends on its calls to the Consent Manager.
+1. Keycloak (staff realm): a confidential client ``aggregation-layer`` whose
+   service account holds CONSENT_MANAGER_ADMIN. That token is what the
+   aggregation layer sends on its calls to the Consent Manager; the CM's
+   policy read and partner list accept only the admin role (the CM has no
+   narrower service role), so the client must be held as tightly as an admin.
 2. Its own Ed25519 signing key, written to deploy/keys/aggregation-layer.p12
    (generated once, never overwritten).
 3. Partner Management: partner PARTNER_AGGREGATION_LAYER with that key, kid
    ``agg-2026-01``. A registry derives the envelope signer from the DCI header
    as PARTNER_{sender_id.upper()}, so sender_id "aggregation-layer" lands here.
 4. CM bindings aggregation layer -> registry (agg-layer-farmer / -livestock /
-   -cropsown), policy ceilings in registry block names, approved through AWE
-   (only the tasks for these policies; nothing else in the inbox is touched).
-5. deploy/.env: the client secret and the CM events HMAC secret filled in.
+   -cropsown), policy ceilings in registry block names, lawful basis
+   ``legitimate_interest``, approved through AWE (only the tasks for these
+   policies; nothing else in the inbox is touched).
+
+   legitimate_interest means the CM asks for no subject grant on the hop and
+   caps it at the binding's ceiling. The subject's consent and OTP are
+   enforced by the aggregation layer before it calls a registry (its own
+   aggregation_grants table), so these ceilings are the most any single hop
+   can ever release - keep them to the blocks the field catalog needs.
+   Moving a binding from consent to legitimate_interest is a WIDENING: with
+   AWE on it lands ``pending`` and only takes effect once approved (this
+   script approves its own tasks). The CM caches a partner's policy for
+   partner_cache_ttl_sec (60s by default), so a change can take up to a
+   minute to reach /validate.
+5. deploy/.env: the client secret filled in.
 
 The partner -> aggregator binding (komal-aggregator, field-alias scopes) is the
 same one the in-CM aggregator used and is not changed.
@@ -22,7 +36,6 @@ same one the in-CM aggregator used and is not changed.
 """
 import os
 import pathlib
-import secrets
 import sys
 import time
 
@@ -41,13 +54,13 @@ KEY_DIR = REPO / "deploy" / "keys"
 P12 = KEY_DIR / "aggregation-layer.p12"
 ENV_FILE = REPO / "deploy" / ".env"
 ENV_EXAMPLE = REPO / "deploy" / ".env.example"
-CM_ENV = pathlib.Path(os.environ.get(
-    "G2P_CM_ENV", REPO.parent / "consent-management" / "backend" / ".env"))
 
 AGG_PM_ID = "PARTNER_AGGREGATION_LAYER"
 KID = "agg-2026-01"
 CLIENT_ID = "aggregation-layer"
-SERVICE_ROLE = "CONSENT_MANAGER_SERVICE"
+# The CM role its policy read and partner list require. There is no
+# narrower one; see the module docstring.
+SERVICE_ROLE = "CONSENT_MANAGER_ADMIN"
 
 BINDINGS = [
     # audience, controller_id, scopes (registry block names), label
@@ -83,7 +96,7 @@ def keycloak():
     if httpx.get(base + "/roles/" + SERVICE_ROLE, headers=H).status_code == 404:
         httpx.post(base + "/roles", headers=H, json={
             "name": SERVICE_ROLE,
-            "description": "Platform services calling the Consent Manager's service APIs"
+            "description": "Consent Manager administration"
         }).raise_for_status()
         print("  realm role %s created" % SERVICE_ROLE)
     role = httpx.get(base + "/roles/" + SERVICE_ROLE, headers=H).json()
@@ -198,7 +211,9 @@ def binding(H, audience, controller, scopes, label):
 
     cur = httpx.get(CM + "/consent/v1/partners/%s/policy" % pid, headers=H, timeout=30)
     cur = cur.json() if cur.status_code == 200 else {}
-    if cur.get("status") == "active" and sorted(cur.get("allowed_data_scopes") or []) == sorted(scopes):
+    if (cur.get("status") == "active"
+            and sorted(cur.get("allowed_data_scopes") or []) == sorted(scopes)
+            and cur.get("lawful_basis") == "legitimate_interest"):
         print("  %-22s active v%s" % (audience, cur.get("version")))
         return pid
     p = httpx.put(CM + "/consent/v1/partners/%s/policy" % pid, headers=H, timeout=30, json={
@@ -207,9 +222,10 @@ def binding(H, audience, controller, scopes, label):
         "allowed_subject_id_types": ["national_id"],
         "allowed_signing_algs": ["EdDSA"],
         "max_validity_duration": "P1Y", "fetch_type": "oneshot",
-        # The subject never meets this binding: its grant is recorded by the CM
-        # from what they did on the partner's request (POST /consent/v1/grants).
-        "required_auth_method": None, "lawful_basis": "consent"})
+        # The subject never meets this binding. The CM seeks no grant on the
+        # hop; the aggregation layer enforces the subject's consent + OTP
+        # before calling (no auth method may be set under this basis).
+        "required_auth_method": None, "lawful_basis": "legitimate_interest"})
     body = p.json() if p.status_code < 300 else {}
     if p.status_code >= 400:
         raise SystemExit("policy %s failed: %s %s" % (audience, p.status_code, p.text[:300]))
@@ -270,24 +286,15 @@ def main():
     for audience, controller, scopes, label in BINDINGS:
         binding(H, audience, controller, scopes, label)
 
-    step(5, "deploy/.env and the CM's backend/.env")
+    step(5, "deploy/.env")
     if not ENV_FILE.exists():
         ENV_FILE.write_text(ENV_EXAMPLE.read_text())
-    hmac_secret = (current(ENV_FILE, "AGGREGATION_LAYER_CM_EVENTS_HMAC_SECRET")
-                   or secrets.token_hex(24))
-    set_env(ENV_FILE, {"AGGREGATION_LAYER_CM_CLIENT_SECRET": client_secret,
-                       "AGGREGATION_LAYER_CM_EVENTS_HMAC_SECRET": hmac_secret})
+    set_env(ENV_FILE, {"AGGREGATION_LAYER_CM_CLIENT_SECRET": client_secret})
     print("  %s updated" % ENV_FILE)
-    if CM_ENV.exists():
-        set_env(CM_ENV, {
-            "CONSENT_MANAGER_AUTH_SERVICE_ROLE": SERVICE_ROLE,
-            "CONSENT_MANAGER_AGGREGATION_LAYER_EVENTS_URL":
-                "http://aggregation-layer:8100/aggregation/v1/cm-events",
-            "CONSENT_MANAGER_AGGREGATION_LAYER_EVENTS_HMAC_SECRET": hmac_secret})
-        print("  %s updated (recreate the CM backend to load it)" % CM_ENV)
-    else:
-        print("  CM env not found at %s - set the events URL + secret by hand" % CM_ENV)
-    print("\nDone.")
+    # Nothing is written to the CM's configuration: it needs none for this
+    # service. It does need subject_consent_required=true for the
+    # raise-a-consent path (see docs/CM-API-CONTRACT.md).
+    print("\nDone. The CM caches policies for up to 60s; allow that before the first seek.")
     return 0
 
 

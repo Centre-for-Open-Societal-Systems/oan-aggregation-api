@@ -45,21 +45,37 @@ class Settings(BaseSettings):
 
     # ── Consent Manager (reached over HTTP only) ────────────────────────────
     # Every consent decision is the CM's: validate, raise a consent request,
-    # record the subject's grant, read what was granted. See
-    # docs/CM-API-CONTRACT.md for the five calls this service depends on.
+    # read its status, read a consent's status. Only the CM's generic APIs are
+    # used - see docs/CM-API-CONTRACT.md. The CM holds nothing for this
+    # service; what the subject authorised per registry hop is kept here
+    # (models/grant.py).
     cm_base_url: str = "http://localhost:8000"
     cm_timeout: float = 15.0
     # Service-to-service auth: Keycloak client-credentials for the
-    # `aggregation-layer` client, which holds the CM service role. A static
-    # token, when set, is sent verbatim instead (dev).
+    # `aggregation-layer` client. Its service account needs the CM admin role
+    # (CONSENT_MANAGER_ADMIN): that is what the CM's policy read and partner
+    # list require today. A static token, when set, is sent verbatim (dev).
     cm_token_url: str = ""
     cm_client_id: str = "aggregation-layer"
     cm_client_secret: str = ""
     cm_static_token: str = ""
-    # Shared secret the CM signs its consent events with (HMAC-SHA256 over
-    # "<timestamp>.<body>"). Empty disables the check - dev only.
-    cm_events_hmac_secret: str = ""
-    cm_events_max_skew_sec: int = 300
+    # CM partner id per partner audience, as JSON: {"komal-aggregator": "<uuid>"}.
+    # The CM's /validate answers with the consent, not the partner, so the
+    # partner is read from the (CM-verified) object's ``aud`` and mapped to its
+    # CM id here. An audience missing from the map is looked up once in the
+    # CM's partner list (GET /consent/v1/partners) and cached.
+    cm_partner_ids: str = ""
+    # How often consent state is read back from the CM: raised consent
+    # requests (approved / denied / expired) and the consent each in-flight
+    # aggregation stands on (withdrawn / expired). Nothing is pushed by the
+    # CM, so this is the delay between a decision there and its effect here.
+    # 0 disables the loop; the reaper still runs one pass per invocation.
+    cm_poll_interval_sec: int = 15
+    # Run the poll loop inside the API process (dev). In production set it
+    # false and let `python -m openg2p_aggregation_layer.worker` poll.
+    cm_poll_in_app: bool = True
+    # A poller that dies holding a row releases it after this long.
+    cm_poll_claim_timeout_sec: int = 120
 
     # ── Caller authentication (Keycloak / OIDC bearer) ──────────────────────
     # Used by the subject-facing routes (verify-otp, status). Same realm the
@@ -79,7 +95,8 @@ class Settings(BaseSettings):
     # as an ordinary partner, so consent enforcement still applies per hop.
     # Identity the aggregator signs its internal consent objects with. Its
     # public key must be registered in Partner Management and it needs a CM
-    # binding per registry — see scripts/register-aggregator.py.
+    # binding per registry on lawful_basis legitimate_interest — see
+    # scripts/register-aggregator.py.
     aggregator_issuer: str = "aggregation-layer"
     # MUST map to the Partner Management partner holding the aggregator's public
     # key. The registry derives that reference from the DCI header as
@@ -89,6 +106,8 @@ class Settings(BaseSettings):
     # fails with signature_invalid / REQUEST_VALIDATION_ERROR.
     aggregator_sender_id: str = "aggregation-layer"
     aggregator_purpose_code: str = "loan_origination"
+    # Validity of each hop's consent object AND of the per-registry grant
+    # this service records (models/grant.py).
     aggregator_consent_validity_sec: int = 300
     # A per-registry grant is reused, rather than minted again, only while at
     # least this much of its validity is left. A fan-out that retries must not
@@ -98,6 +117,13 @@ class Settings(BaseSettings):
     # park the aggregation until it is approved, instead of refusing the seek
     # with no_subject_consent. False restores the two-step behaviour where the
     # partner must obtain consent out of band before it may call.
+    #
+    # Only reachable when the CM runs with subject_consent_required=true -
+    # otherwise /validate permits on the policy ceiling and never answers
+    # no_subject_consent. On approval the partner's object is validated again
+    # to learn what was granted, so the approval must land within the CM's
+    # replay window (replay_freshness_window_sec, 300s by default) of the
+    # object's issued_at; later, the row is rejected and the partner re-seeks.
     aggregator_raise_consent: bool = True
     # Where the subject's consent screen lives, used to build the consent_url
     # the partner redirects them to. Empty omits the field rather than guessing.
@@ -254,6 +280,24 @@ class Settings(BaseSettings):
             return {}
         return parsed if isinstance(parsed, dict) else {}
 
+
+    @property
+    def cm_partner_id_map(self) -> dict:
+        """``cm_partner_ids`` parsed; a bad value logs and yields {}."""
+        import json
+        import logging
+
+        raw = (self.cm_partner_ids or "").strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(self.logging_default_logger_name).error(
+                "aggregation_layer_cm_partner_ids is not valid JSON (%s); partners "
+                "will be looked up in the CM", exc)
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
 
     @property
     def aggregator_registry_map(self) -> dict:
