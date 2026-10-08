@@ -10,6 +10,7 @@ from openg2p_fastapi_common.app import Initializer as BaseInitializer
 
 from .controllers import AggregatorController
 from .models import AggregationGrant, AggregationRequest
+from .registry_catalog import CatalogError, get_catalog
 from .services import (
     AggregatorService,
     CMClient,
@@ -25,6 +26,17 @@ _logger = logging.getLogger(_config.logging_default_logger_name)
 class Initializer(BaseInitializer):
     def initialize(self, **kwargs):
         super().initialize(**kwargs)
+
+        # The registry catalog first, and fatally: a service that starts with
+        # a broken catalog fails on the first partner call instead, far from
+        # the cause. The message lists every problem in the file.
+        try:
+            catalog = get_catalog()
+        except CatalogError as exc:
+            _logger.critical("%s", exc)
+            raise
+        _logger.info("Registry catalog %s: %s", _config.registry_catalog_path,
+                     ", ".join(catalog.codes()))
 
         # Services — order matters: a service that calls get_component() in its
         # __init__ must be constructed after its dependencies.
@@ -113,14 +125,30 @@ class Initializer(BaseInitializer):
                         "ON aggregation_requests (consent_request_id)"
                     )
                 )
-                # Columns added when the CM stopped pushing events and holding
-                # grants for this service. create_migrate() does not ALTER an
-                # existing table, so a database created before carries them
-                # here; idempotent on every start.
+                # The Beneficiary-360 contract replaced field aliases with
+                # scope ids: the column is renamed rather than re-created, so
+                # history keeps what was asked. Idempotent.
+                await conn.execute(
+                    text(
+                        "DO $$ BEGIN IF EXISTS (SELECT 1 FROM "
+                        "information_schema.columns WHERE table_name = "
+                        "'aggregation_requests' AND column_name = "
+                        "'requested_fields') AND NOT EXISTS (SELECT 1 FROM "
+                        "information_schema.columns WHERE table_name = "
+                        "'aggregation_requests' AND column_name = "
+                        "'requested_scopes') THEN ALTER TABLE "
+                        "aggregation_requests RENAME COLUMN requested_fields "
+                        "TO requested_scopes; END IF; END $$"
+                    )
+                )
+                # Columns added after the first release. create_migrate() does
+                # not ALTER an existing table, so a database created before
+                # carries them here; idempotent on every start.
                 for column, ddl in (
                     ("consent_jws", "TEXT"),
                     ("cm_consent_id", "VARCHAR"),
                     ("grant_ids", "JSONB DEFAULT '{}'::jsonb"),
+                    ("query", "JSONB DEFAULT '{}'::jsonb"),
                 ):
                     await conn.execute(
                         text(

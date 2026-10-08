@@ -18,21 +18,21 @@ Partner ──► Aggregation Layer ──► Consent Manager (generic APIs only
              │   aggregation_requests, partner policy / list
              │   aggregation_grants ◄── poll: request approved/denied, consent withdrawn
              │
-             ├──► Farmer / Livestock / Cropsown registries
+             ├──► every registry in the registry catalog (deploy/registries.yaml)
              │      POST /dci/registry/sync/search (unchanged; each hop validated by the
              │      CM against an AL binding on lawful_basis legitimate_interest)
-             └──► Partner callback (DCI on-search)
+             └──► Partner callback (DCI on-search carrying a Beneficiary-360 response)
 ```
 
 ## 2. What lives in this repo
 
 | Piece | Notes |
 |---|---|
-| `services/aggregator_service.py`, `controllers/aggregator_controller.py` | Same routes as the in-CM aggregator (`/dci/registry/async/search`, `/consent/v1/aggregation/...`, `/consent/v1/farmer-consent-validate`) |
+| `services/aggregator_service.py`, `controllers/aggregator_controller.py` | `POST /dci/registry/async/search` (Beneficiary-360 query) and the service's own `/aggregation/v1/...` routes (see README) |
 | `services/cm_client.py` | The only place that talks to the CM |
 | `services/cm_poller.py`, `AggregatorService.sync_with_cm` | Reads approval / denial / withdrawal back from the CM |
 | `models/aggregation.py` (`aggregation_requests`), `models/grant.py` (`aggregation_grants`) | Own DB. The grant table replaces the per-registry grant the CM used to record |
-| `services/field_catalog.py`, `services/registry_client.py` | Registry hops, signed with the aggregator's own key |
+| `registry_catalog.py`, `bene360.py`, `services/registry_client.py` | The registry catalog (YAML, config only), the bene-360 mapping + field-level filter, and the registry hops, signed with the aggregator's own key |
 | `kafka_bus/`, `worker.py`, `reap.py` | Fan-out + callback retry queue; worker and reaper also poll the CM |
 | `services/otp_*.py`, `utils/fayda_otp.py` | Copied from the CM (the CM keeps its own copy for the consent screen) |
 
@@ -48,7 +48,7 @@ Partner ──► Aggregation Layer ──► Consent Manager (generic APIs only
 
 1. **Registry hops run on `legitimate_interest`.** The CM no longer records a grant per
    registry for the aggregator; the AL→registry bindings skip B8 and are capped at their
-   policy ceiling. The farmer's consent + OTP are enforced by the Aggregation Layer before
+   policy ceiling. The subject's consent + OTP are enforced by the Aggregation Layer before
    any registry call (`aggregation_grants`, consent status check).
 2. **Approval / withdrawal are polled**, not pushed. Effect within
    `AGGREGATION_LAYER_CM_POLL_INTERVAL_SEC`; a withdrawal is also checked right before the
@@ -60,6 +60,12 @@ Partner ──► Aggregation Layer ──► Consent Manager (generic APIs only
    the CM); each hop's embedded artefact on the AL binding is a separate row.
 5. **Service account role.** The `aggregation-layer` Keycloak client needs
    `CONSENT_MANAGER_ADMIN` (the CM's policy read and partner list require it).
+6. **Beneficiary-360 contract, config-only registries** (2026-10-08). The partner's
+   query is an OpenG2P bene-360 request and the callback carries a bene-360 response.
+   Partners consent to scope ids `<registryCode>.<block>` instead of field aliases;
+   the per-field filter moved from code (`field_catalog.py`, removed) to the registry
+   catalog. Every registry, binding and path now lives in `deploy/registries.yaml`:
+   adding one is configuration plus `scripts/register-aggregator.py`.
 
 ## 5. Steps
 
@@ -71,3 +77,5 @@ Partner ──► Aggregation Layer ──► Consent Manager (generic APIs only
 4. Remove the in-CM aggregator (consent-management branch `feature/remove-aggregator`).
 5. Re-run `scripts/register-aggregator.py` (bindings → `legitimate_interest`, AWE approval,
    60s policy cache), then `scripts/stack-check.py` and the Postman collection on the stack.
+6. Beneficiary-360 request/response + registry catalog (this repo, `develop`). Partner
+   bindings must allow the new scope ids: `scripts/register-aggregator.py --partner <aud>`.

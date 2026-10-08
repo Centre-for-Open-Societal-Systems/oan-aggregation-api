@@ -1,0 +1,115 @@
+# Test catalog: three registries, exercising every placement the catalog supports
+# (register, table under a register, nested table read from inside a row, table
+# under a table via join).
+version: 1
+registries:
+
+  FARMER_REGISTRY:
+    name: Farmer-Registry
+    partner_api:
+      base_url: http://farmer.registry.test
+      receiver_id: farmer-registry
+    binding:
+      audience: agg-farmer
+      controller_id: farmer_registry
+    search:
+      reg_type: Farmer
+      reg_record_type: FarmerRecord
+      id_type: UIN
+      match:
+        path: person.ids[]
+        value_key: value
+        type_key: type
+    registers:
+      FARMER:
+        name: Farmer
+        internal_record_id: person.record_id
+        functional_record_id: person.ids[].value
+        record_status: person.status
+        last_approved_at: person.approved_at
+    scopes:
+      person:
+        register: FARMER
+        fields:
+          - name.given
+          - name.family
+          - ids[].value
+          - phone
+      land:
+        table: LAND
+        name: Land
+        parent: FARMER
+        internal_record_id: land_id
+        fields: [land_id, size, unit]
+        tables:
+          - path: crops
+            table: CROP
+            name: Crop
+            internal_record_id: crop_id
+            fields: [commodity, season]
+      household:
+        table: HOUSEHOLD
+        name: Household
+        parent: FARMER
+        fields: [size]
+
+  DISABILITY_REGISTRY:
+    name: Disability-Registry
+    partner_api:
+      base_url: http://disability.registry.test
+      receiver_id: disability-registry
+    binding:
+      audience: agg-disability
+      controller_id: disability_registry
+    search:
+      reg_type: Disability
+      reg_record_type: DisabilityRecord
+      id_type: foundational_id
+      match:                  # no type on the identifier: value only
+        path: case.ids[]
+        value_key: value
+        type_key: null
+    registers:
+      DISABILITY_CASE:
+        name: Disability Case
+        default_record_status: ACTIVE
+    scopes:
+      case:
+        register: DISABILITY_CASE
+        fields: [disability_type]
+
+  NATIONAL_SOCIAL_REGISTRY:
+    name: National Social Registry
+    partner_api:
+      base_url: http://nsr.registry.test
+      receiver_id: nsr
+      timeout_sec: 5
+    binding:
+      audience: agg-nsr
+      controller_id: nsr
+    search:
+      reg_type: SocialRegistry
+      reg_record_type: SocialRecord
+      id_type: foundational_id
+      match:
+        path: socio.member_identifier[]
+      page_size: 5
+    registers:
+      SOCIAL_BENEFICIARY:
+        name: Social Beneficiary
+    scopes:
+      socio:
+        register: SOCIAL_BENEFICIARY
+        fields: ["*"]
+      assets:
+        table: ASSET
+        parent: SOCIAL_BENEFICIARY
+        internal_record_id: asset_id
+        fields: [asset_id, kind]
+      valuations:
+        table: VALUATION
+        parent: ASSET
+        join:
+          field: asset_ref
+          parent_field: asset_id
+        fields: [amount]

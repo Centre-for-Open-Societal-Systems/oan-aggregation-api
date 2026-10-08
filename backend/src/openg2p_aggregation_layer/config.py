@@ -13,10 +13,11 @@ class Settings(BaseSettings):
     openapi_description: str = """
         Aggregation Layer for OpenG2P.
 
-        One partner call naming fields from several registries, gated on the
-        subject's consent (held by the Consent Manager) and, where the
-        partner's policy asks for it, an OTP. The aggregated record is POSTed
-        to the partner's callback as a signed DCI on-search.
+        One partner call for a beneficiary's data across several registries
+        (an OpenG2P Beneficiary-360 request), gated on the subject's consent
+        (held by the Consent Manager) and, where the partner's policy asks for
+        it, an OTP. The Beneficiary-360 response is POSTed to the partner's
+        callback inside a signed DCI on-search.
         """
     openapi_version: str = __version__
 
@@ -59,7 +60,7 @@ class Settings(BaseSettings):
     cm_client_id: str = "aggregation-layer"
     cm_client_secret: str = ""
     cm_static_token: str = ""
-    # CM partner id per partner audience, as JSON: {"komal-aggregator": "<uuid>"}.
+    # CM partner id per partner audience, as JSON: {"partner-x": "<uuid>"}.
     # The CM's /validate answers with the consent, not the partner, so the
     # partner is read from the (CM-verified) object's ``aud`` and mapped to its
     # CM id here. An audience missing from the map is looked up once in the
@@ -79,18 +80,26 @@ class Settings(BaseSettings):
 
     # ── Caller authentication (Keycloak / OIDC bearer) ──────────────────────
     # Used by the subject-facing routes (verify-otp, status). Same realm the
-    # CM's beneficiary API uses, so a farmer's token works on both.
+    # CM's beneficiary API uses, so a subject's token works on both.
     auth_enabled: bool = True
     auth_issuer: str = ""
     auth_jwks_url: str = ""
     auth_audience: str = ""
     auth_algorithms: list[str] = ["RS256", "ES256", "EdDSA"]
-    auth_admin_role: str = "AGGREGATION_LAYER_ADMIN"
     subject_default_id_type: str = "national_id"
 
+    # ── Registry catalog ────────────────────────────────────────────────────
+    # The YAML file that lists every registry this service may query: where
+    # it is, which CM binding each hop spends, how its record maps onto the
+    # Beneficiary-360 response and which fields may leave this service. Loaded
+    # and validated at startup; an invalid file stops the service. Adding a
+    # registry is an entry there, never a code change. See registry_catalog.py
+    # and deploy/registries.yaml.
+    registry_catalog_path: str = ""
+
     # ── Aggregator: async, OTP-gated, cross-registry fetch ──────────────────
-    # One partner call naming fields from several registries, answered on a
-    # callback once the subject has entered an OTP. The registries' own
+    # One partner call for a beneficiary across several registries, answered
+    # on a callback once the subject has authorised it. The registries' own
     # /dci/registry/sync/search is untouched; the aggregator calls each of them
     # as an ordinary partner, so consent enforcement still applies per hop.
     # Identity the aggregator signs its internal consent objects with. Its
@@ -128,19 +137,10 @@ class Settings(BaseSettings):
     # Where the subject's consent screen lives, used to build the consent_url
     # the partner redirects them to. Empty omits the field rather than guessing.
     consent_ui_base_url: str = "http://localhost:3002"
+    # Defaults for a registry hop; a catalog entry may override both.
     aggregator_page_size: int = 10
     aggregator_registry_timeout: float = 30.0
     aggregator_callback_timeout: float = 30.0
-    # reg_type/reg_record_type on the aggregated on-search. The record spans
-    # registries, so neither can honestly be one registry's value.
-    aggregator_reg_type: str = "spdci-extensions-dci:AggregatedRecord"
-    aggregator_reg_record_type: str = "spdci-extensions-dci:AggregatedRecord"
-    # Where each registry lives and which CM binding to spend there, as JSON:
-    #   {"farmer": {"url": "...", "audience": "...", "controller_id": "...",
-    #               "reg_type": "...", "reg_record_type": "...",
-    #               "receiver_id": "...", "id_type": "functional_id"}}
-    # Keys must match the registry prefixes used in services/field_catalog.py.
-    aggregator_registries: str = ""
 
     # ── Kafka (the fan-out and delivery queues) ────────────────────────────
     #
@@ -218,7 +218,7 @@ class Settings(BaseSettings):
     # Mixed into the OTP hash so a stolen database row cannot be brute-forced
     # against a 6-digit space offline. Set this per environment.
     otp_salt: str = "change-me-per-environment"
-    # DEV ONLY. Exposes GET /consent/v1/aggregation/{id}/otp. There is no SMS or
+    # DEV ONLY. Exposes GET /aggregation/v1/requests/{id}/otp. There is no SMS or
     # email gateway in this stack, so the default sender logs the code; this
     # endpoint reports the OTP state alongside it.
     otp_debug_enabled: bool = False
@@ -242,22 +242,13 @@ class Settings(BaseSettings):
     otp_publish_access_key: str = ""
     otp_publish_secret_key: str = ""
 
-    # ── Fayda (OAN mock, g2p_ati_consent_mgt/utils/mock_fayda_otp_api.py) ───
-    # Base URL with no path: the endpoints are /requestData and /getDataAuth.
-    fayda_base_url: str = ""
-    fayda_client_id: str = "demo-client"
-    fayda_client_secret: str = "demo-secret"
-    fayda_version: str = "1.0"
-    # env and domain_uri must match the server's own MOCK_FAYDA_ENV and
-    # MOCK_FAYDA_DOMAIN_URI exactly, or it answers 400 before anything else.
-    fayda_env: str = "prod"
-    fayda_domain_uri: str = "fayda.et"
+    # ── Fayda OTP rules, applied in-process (utils/fayda_otp.py) ────────────
+    # There is no HTTP call to a Fayda service, so no URL or client secret.
     fayda_identifier_type: str = "FIN"
     fayda_otp_channel: str = "PHONE"
     # Only used to render the masked-mobile line in the log, so an
     # operator can see WHERE a real Fayda would have sent the code.
     fayda_demo_phone: str = "0911000055"
-    fayda_timeout: float = 20.0
     # Fayda keys on the individual's Fayda/FIN number, not a Keycloak username,
     # so a demo subject has to be mapped onto one.
     # JSON: {"staff": "6140798523698702"}
@@ -296,29 +287,6 @@ class Settings(BaseSettings):
             logging.getLogger(self.logging_default_logger_name).error(
                 "aggregation_layer_cm_partner_ids is not valid JSON (%s); partners "
                 "will be looked up in the CM", exc)
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
-
-    @property
-    def aggregator_registry_map(self) -> dict:
-        """``aggregator_registries`` parsed, with a safe empty default.
-
-        A bad value must not take the whole service down at import time, so a
-        parse failure logs and yields {} — the aggregator then reports
-        'not_configured' per registry instead of 500ing.
-        """
-        import json
-        import logging
-
-        raw = (self.aggregator_registries or "").strip()
-        if not raw:
-            return {}
-        try:
-            parsed = json.loads(raw)
-        except Exception as exc:  # noqa: BLE001
-            logging.getLogger(self.logging_default_logger_name).error(
-                "aggregation_layer_aggregator_registries is not valid JSON (%s); "
-                "the aggregator will report every registry as not_configured", exc)
             return {}
         return parsed if isinstance(parsed, dict) else {}
 

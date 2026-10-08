@@ -2,7 +2,7 @@
 
 This is the state machine behind the async ``seek`` flow. The partner's call
 returns an ack immediately, so everything about the request has to survive the
-response: which fields were asked for, where to call back, whether the subject
+response: what was asked for, where to call back, whether the subject
 has proved possession of the OTP yet, and what happened when the callback was
 attempted.
 
@@ -76,10 +76,12 @@ class AggregationStatus(str, Enum):
 class AggregationRequest(BaseORMModelWithId):
     """One ``POST /dci/registry/async/search``.
 
-    ``requested_fields`` holds the partner's aliases verbatim (``farmer.firstname``
-    …) rather than resolved paths, so the record still makes sense if the field
-    catalog changes later — and so an audit shows what was *asked*, not what we
-    decided it meant.
+    ``query`` is the partner's Beneficiary-360 request verbatim and
+    ``requested_scopes`` the scope ids (``<registryCode>.<scope>``) it stands
+    on - at seek what was permitted or asked for, after a raised consent is
+    approved what the subject granted. Both are kept as sent rather than
+    resolved against the registry catalog, so an audit shows what was *asked*
+    even if the catalog changes later.
     """
 
     __tablename__ = "aggregation_requests"
@@ -89,7 +91,8 @@ class AggregationRequest(BaseORMModelWithId):
     partner_audience: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     subject_id_type: Mapped[str] = mapped_column(String(50), index=True)
     subject_id_value: Mapped[str] = mapped_column(String(255), index=True)
-    requested_fields: Mapped[list] = mapped_column(JSONB, default=list)
+    requested_scopes: Mapped[list] = mapped_column(JSONB, default=list)
+    query: Mapped[dict] = mapped_column(JSONB, default=dict)
     purpose: Mapped[dict] = mapped_column(JSONB, default=dict)
     # Set only when the seek had to raise a consent request itself. Approving
     # that request is what releases this aggregation.
@@ -106,7 +109,7 @@ class AggregationRequest(BaseORMModelWithId):
     # subject withdrew - the CM revokes it with the consent it hangs off.
     cm_consent_id: Mapped[Optional[str]] = mapped_column(
         String, nullable=True, index=True)
-    # Per registry, the AggregationGrant this fetch spends: {"farmer": "<id>"}.
+    # Per registry, the AggregationGrant this fetch spends: {"<registryCode>": "<id>"}.
     grant_ids: Mapped[dict] = mapped_column(JSONB, default=dict)
 
     # ── DCI correlation. transaction_id is the partner's; correlation_id is

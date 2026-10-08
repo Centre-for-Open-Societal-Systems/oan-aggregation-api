@@ -223,3 +223,6 @@ __marimo__/
 deploy/keys/*.p12
 postman/.agg-prep-key.pem
 deploy/.env
+
+# Generated Postman environment (live token + consent object) - postman/agg-prep.py
+postman/*.local.postman_environment.json

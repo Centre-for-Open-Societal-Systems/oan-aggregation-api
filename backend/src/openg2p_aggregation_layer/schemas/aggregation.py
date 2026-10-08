@@ -1,17 +1,31 @@
 """Wire shapes for the aggregated async flow.
 
-The seek envelope is deliberately the **same shape** as a DCI search request:
-``{signature, header, message}``, with ``header.sender_uri`` carrying the
-callback and ``search_criteria`` carrying the field list. A partner that already
-speaks ``/dci/registry/sync/search`` changes two things — the URL, and
-``fields`` instead of a per-registry ``reg_type``. Nothing else in its client
-has to move.
+The partner's call is a **DCI search envelope** carrying a **Beneficiary-360
+request**:
+
+``{signature, header, message}``
+    The DCI transport, as on a registry's own ``/dci/registry/sync/search``.
+    ``header.sender_uri`` is the callback (DCI's own field for "where to send
+    the response"), ``message.transaction_id`` / ``reference_id`` are echoed on
+    the on-search.
+``search_criteria.query_type = "beneficiary360"`` + ``search_criteria.query``
+    The bene-360 request, exactly as ``request.schema.json`` defines it. That
+    schema forbids extra properties, so nothing of this service's own goes in
+    it.
+``search_criteria.authorize.consent_jws`` / ``search_criteria.purpose``
+    What this service needs besides the query - the partner's signed consent
+    object, and optionally the purpose - in the places DCI already has for
+    them.
+
+The answer comes back the same way: a signed DCI ``on-search`` whose
+``reg_records[0]`` is a bene-360 response.
 """
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..bene360 import QUERY_TYPE, Beneficiary360Request
 from .common import SubjectId
 
 
@@ -26,8 +40,6 @@ class SeekHeader(BaseModel):
     action: str = "search"
     sender_id: Optional[str] = None
     receiver_id: Optional[str] = None
-    # The DCI spec's own field for "where to send the response". Reused rather
-    # than inventing a callback_url, so the envelope stays standard.
     sender_uri: Optional[str] = Field(
         default=None, description="Callback URL the on-search is POSTed to")
     total_count: Optional[int] = None
@@ -35,43 +47,24 @@ class SeekHeader(BaseModel):
     meta: Dict[str, Any] = Field(default_factory=dict)
 
 
-class SeekQueryValue(BaseModel):
-    model_config = ConfigDict(extra="allow")
-    id_type: str = "functional_id"
-    id_value: str
-
-
-class SeekQuery(BaseModel):
-    model_config = ConfigDict(extra="allow")
-    type: str = "idtype-value"
-    value: SeekQueryValue
-
-
 class SeekAuthorize(BaseModel):
     model_config = ConfigDict(extra="allow")
     consent_jws: str = Field(
-        description="The partner's consent object for the AGGREGATOR binding. "
-                    "Its data scopes are field aliases, not registry blocks.")
+        description="The partner's consent object for its binding with this "
+                    "service. Its data_scopes are scope ids "
+                    "(<registryCode>.<scope>, see GET /aggregation/v1/registries).")
 
 
 class SeekCriteria(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     version: str = "1.0.0"
-    query_type: str = "idtype-value"
-    query: SeekQuery
-    # The whole point of the endpoint: fields from any registry, one list.
-    fields: List[str] = Field(
-        min_length=1,
-        description="Catalog aliases, e.g. farmer.firstname, livestock.UIN")
+    query_type: Literal["beneficiary360"] = Field(
+        description="Always '%s': query is a Beneficiary-360 request" % QUERY_TYPE)
+    query: Beneficiary360Request
     authorize: SeekAuthorize
-    purpose: Optional[Dict[str, Any]] = None
-    # Each registry keys on its own functional id, so one id_value cannot match
-    # all of them. Name the exceptions here; query.value.id_value is the default
-    # for any registry not listed.
-    registry_queries: Optional[Dict[str, str]] = Field(
-        default=None,
-        description='Per-registry query id, e.g. {"livestock": "LS-000000000001"}')
+    purpose: Optional[Dict[str, Any]] = Field(
+        default=None, description="Defaults to the consent object's purpose")
 
 
 class SeekRequestItem(BaseModel):
@@ -84,7 +77,8 @@ class SeekRequestItem(BaseModel):
 class SeekMessage(BaseModel):
     model_config = ConfigDict(extra="allow")
     transaction_id: Optional[str] = Field(default=None, max_length=99)
-    search_request: List[SeekRequestItem] = Field(min_length=1)
+    # One beneficiary per call: each one has its own consent, OTP and callback.
+    search_request: List[SeekRequestItem] = Field(min_length=1, max_length=1)
 
 
 class SeekEnvelope(BaseModel):
@@ -105,11 +99,11 @@ class SeekAck(BaseModel):
     aggregation_id: str
     correlation_id: str
     transaction_id: Optional[str] = None
-    status: str = Field(description="rcvd | pdng")
+    status: str = Field(description="pdng")
     otp_required: bool = True
     otp_channel: Optional[str] = None
     otp_expires_at: Optional[datetime] = None
-    accepted_fields: List[str] = Field(default_factory=list)
+    accepted_scopes: List[str] = Field(default_factory=list)
     registries: List[str] = Field(default_factory=list)
     callback_url: Optional[str] = None
     message: Optional[str] = None
@@ -119,46 +113,28 @@ class SeekAck(BaseModel):
     consent_url: Optional[str] = None
 
 
+# ── subject ─────────────────────────────────────────────────────────────────
+
 class VerifyOtpRequest(BaseModel):
-    otp: str = Field(min_length=4, max_length=10)
+    """The subject releasing their own data.
 
-
-class FarmerConsentValidateRequest(BaseModel):
-    """The farmer releasing their own data, in one flat body.
-
-    Either identifier works: ``aggregation_id`` is what the ack returned, and
-    ``correlation_id`` is what travels on the DCI envelope, so whichever the
-    caller happens to be holding is accepted.
+    The subject is taken from the bearer token. ``subject_id`` is an optional
+    cross-check that must agree with it; it cannot establish identity alone.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    aggregation_id: Optional[str] = Field(
-        default=None, description="From the seek ack. Either this or correlation_id.")
-    correlation_id: Optional[str] = Field(
-        default=None, description="From the DCI envelope. Either this or aggregation_id.")
-    subject_id: Optional[SubjectId] = Field(
-        default=None,
-        description="Optional cross-check. The farmer is taken from the bearer "
-                    "token; if this is supplied it must agree with it. It cannot "
-                    "establish identity on its own.")
     otp: str = Field(min_length=4, max_length=10)
-
-
-class FarmerConsentValidateResponse(BaseModel):
-    aggregation_id: str
-    status: str
-    subject_id: SubjectId
-    released_fields: List[str]
-    released_to: Optional[str] = Field(
-        default=None, description="The partner the data is being sent to")
-    callback_url: Optional[str] = None
-    message: str
+    subject_id: Optional[SubjectId] = None
 
 
 class VerifyOtpResponse(BaseModel):
     aggregation_id: str
     status: str
+    subject_id: SubjectId
+    released_scopes: List[str]
+    released_to: Optional[str] = Field(
+        default=None, description="The partner the data is being sent to")
     message: str
 
 
@@ -169,7 +145,9 @@ class AggregationStatusResponse(BaseModel):
     status: str
     subject_id_type: str
     subject_id_value: str
-    requested_fields: List[str]
+    requested_scopes: List[str]
+    # The bene-360 request as the partner sent it.
+    query: Dict[str, Any] = Field(default_factory=dict)
     correlation_id: str
     callback_url: str
     # Whether the partner's policy demanded a code for this fetch. Without it a

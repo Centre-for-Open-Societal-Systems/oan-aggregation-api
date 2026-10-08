@@ -19,11 +19,13 @@ ALG_RS256 = "RS256"
 
 
 class CryptoService(BaseService):
-    """Signs CM consent receipts and verifies partner-signed consent objects.
+    """Holds this service's own signing key and signs with it.
 
-    Asymmetric only — the CM's private key signs receipts; partner public keys
-    verify consent objects. The CM's public key is published via JWKS so any
-    party can verify a receipt without being able to forge one.
+    Everything this service signs - the consent object and DCI envelope on
+    every registry hop, and the on-search it POSTs to the partner - is signed
+    here. The public half is registered in Partner Management
+    (scripts/register-aggregator.py), which is where registries and partners
+    verify it; nothing is verified with this key.
     """
 
     def __init__(self, name="", **kwargs):
@@ -81,7 +83,7 @@ class CryptoService(BaseService):
         _logger.warning(
             "No aggregation-layer signing key configured (signing_p12_path / "
             "signing_private_key_pem) — generating an EPHEMERAL Ed25519 key. "
-            "Receipts will not verify across restarts or pods. Configure a "
+            "Registries and partners will reject what it signs. Configure a "
             "persistent key for production."
         )
         return ed25519.Ed25519PrivateKey.generate()
@@ -97,7 +99,7 @@ class CryptoService(BaseService):
         return _config.signing_algorithm
 
     def sign(self, message: bytes) -> str:
-        """Sign bytes with the CM private key; return base64url signature."""
+        """Sign bytes with this service's private key; return base64url signature."""
         key = self._private_key
         if isinstance(key, ed25519.Ed25519PrivateKey):
             sig = key.sign(message)
@@ -108,52 +110,3 @@ class CryptoService(BaseService):
         else:
             raise ValueError(f"Unsupported aggregation-layer signing key type: {type(key)}")
         return b64url_encode(sig)
-
-    def public_jwks(self) -> dict:
-        """Publish the CM public key as a JWKS document."""
-        pub = self._private_key.public_key()
-        if isinstance(pub, ed25519.Ed25519PublicKey):
-            raw = pub.public_bytes(
-                serialization.Encoding.Raw, serialization.PublicFormat.Raw
-            )
-            jwk = {
-                "kty": "OKP",
-                "crv": "Ed25519",
-                "x": b64url_encode(raw),
-                "use": "sig",
-                "alg": "EdDSA",
-                "kid": self.kid,
-            }
-        elif isinstance(pub, ec.EllipticCurvePublicKey):
-            numbers = pub.public_numbers()
-            size = (pub.curve.key_size + 7) // 8
-            jwk = {
-                "kty": "EC",
-                "crv": "P-256",
-                "x": b64url_encode(numbers.x.to_bytes(size, "big")),
-                "y": b64url_encode(numbers.y.to_bytes(size, "big")),
-                "use": "sig",
-                "alg": "ES256",
-                "kid": self.kid,
-            }
-        elif isinstance(pub, rsa.RSAPublicKey):
-            numbers = pub.public_numbers()
-            jwk = {
-                "kty": "RSA",
-                "n": b64url_encode(
-                    numbers.n.to_bytes((numbers.n.bit_length() + 7) // 8, "big")
-                ),
-                "e": b64url_encode(
-                    numbers.e.to_bytes((numbers.e.bit_length() + 7) // 8, "big")
-                ),
-                "use": "sig",
-                "alg": "RS256",
-                "kid": self.kid,
-            }
-        else:
-            raise ValueError("Unsupported CM public key type")
-        return {"keys": [jwk]}
-
-    # Partner consent-object verification now lives in the shared
-    # openg2p-fastapi-common CryptoHelper (partner-mgmt backend); see
-    # VerificationService. This service only signs CM receipts + publishes JWKS.

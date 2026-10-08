@@ -12,9 +12,9 @@ now this service's own table, `aggregation_grants` (`models/grant.py`).
 
 | Call | CM API audience / auth | Used for |
 |---|---|---|
-| `POST /consent/v1/validate` | partner, none | The partner's consent object at seek (signature, policy ceiling, replay window, B8). A permit gives `consent_id`, `subject_id`, `effective_data_scopes`, `lawful_basis`. Called again with the same object when a raised consent request is approved, to learn what was granted. |
+| `POST /consent/v1/validate` | partner, none | The partner's consent object at seek (signature, policy ceiling, replay window, B8), with `requested_scopes` = the scope ids of the registries the query covers. A permit gives `consent_id`, `subject_id`, `effective_data_scopes`, `lawful_basis`. Called again with the same object when a raised consent request is approved, to learn what was granted. |
 | `GET /consent/v1/consents/{consent_id}/status` | partner, none | `active` / `revoked` / `expired` of the `consent_id` above. The CM revokes it with the subject's consent (cascade on withdraw), so this is how a withdrawal is seen. |
-| `POST /consent/v1/consent-requests` | beneficiary, any valid token | Raise the consent the farmer was never asked for. Response carries `id`. |
+| `POST /consent/v1/consent-requests` | beneficiary, any valid token | Raise the consent the subject was never asked for, for the scope ids the partner's object names. Response carries `id`. |
 | `GET /consent/v1/consent-requests/{id}` | beneficiary, any valid token | `status` (pending / approved / denied / expired), `otp_verified_at`, `otp_channel` of a raised request. |
 | `GET /consent/v1/partners/{partner_id}/policy` | staff, **CONSENT_MANAGER_ADMIN** | `required_auth_method` (is an OTP needed). 404 = no policy, the OTP is kept. |
 | `GET /consent/v1/partners` | staff, **CONSENT_MANAGER_ADMIN** | Partner audience → CM partner id, only when `AGGREGATION_LAYER_CM_PARTNER_IDS` does not have it. Cached per process. |
@@ -43,14 +43,31 @@ The poll runs every `AGGREGATION_LAYER_CM_POLL_INTERVAL_SEC` (default 15s) in th
 `python -m openg2p_aggregation_layer.reap` run. Parked rows are claimed before they are
 worked on, so several pollers are safe.
 
+## Scopes
+
+The CM treats data scopes as opaque strings, so two vocabularies coexist without any CM
+change:
+
+- **Partner → Aggregation Layer bindings** carry scope ids `<registryCode>.<block>`
+  (e.g. `FARMER_REGISTRY.farmer_personal_details`), one per top-level block of a
+  registry's outgest template, as listed by `GET /aggregation/v1/registries`. This is what
+  the subject consents to and what the partner's consent object names.
+- **Aggregation Layer → registry bindings** carry the registry's own block names
+  (`farmer_personal_details`), which is what the registry clamps its record on.
+
+The mapping between the two, and the per-field filter inside each block, is the registry
+catalog (`deploy/registries.yaml`).
+
 ## The registry hop
 
 The registries still validate every hop through CM `/validate`. The aggregation layer's
-registry bindings (`agg-layer-farmer` / `-livestock` / `-cropsown`) are on lawful basis
-**`legitimate_interest`**: the CM skips the subject-grant (B8) check for them and caps each
-hop at the binding's policy ceiling. The farmer's consent and OTP are enforced here, before
+registry bindings (one per catalog entry, `binding.audience` / `binding.controller_id`)
+are on lawful basis **`legitimate_interest`**: the CM skips the subject-grant (B8) check for them and caps each
+hop at the binding's policy ceiling. The subject's consent and OTP are enforced here, before
 the call: no registry is called without an active `aggregation_grants` row, and not while
-the CM reports the partner's consent as anything but `active`.
+the CM reports the partner's consent as anything but `active`. The query's
+`foundationalId` must equal the consent's `subject_id.value`, because the hop's CM check is
+on the aggregator's binding, not on the subject.
 
 - Moving a binding from `consent` to `legitimate_interest` is a widening: with AWE enabled
   the new policy version is `pending` until approved (`scripts/register-aggregator.py`
@@ -62,7 +79,7 @@ the CM reports the partner's consent as anything but `active`.
 
 | Setting | Why |
 |---|---|
-| `subject_consent_required=true` | Only then does `/validate` answer `no_subject_consent` for a partner without a grant, which is what triggers the raise-a-consent path. With `false` the CM permits on the policy ceiling and the farmer is never asked. |
+| `subject_consent_required=true` | Only then does `/validate` answer `no_subject_consent` for a partner without a grant, which is what triggers the raise-a-consent path. With `false` the CM permits on the policy ceiling and the subject is never asked. |
 | `subject_consent_enabled=true` (default) | The B8 narrowing that turns the re-validate into "what was granted", and the cascade that makes `/consents/{id}/status` report a withdrawal. |
 | `replay_freshness_window_sec` (default 300) | A raised consent must be approved within this window of the partner object's `issued_at`, or the re-validate is refused: the row is rejected with `consent_approved_after_replay_window` and the partner seeks again (the CM then permits directly on the new grant). |
 
@@ -83,5 +100,5 @@ the CM reports the partner's consent as anything but `active`.
    decisions take up to one poll interval to take effect here (a withdrawal still stops any
    fan-out or callback that has not started, via the pre-fan-out / pre-callback checks).
 4. **My consents.** The CM no longer holds grants for the aggregator, so the per-registry
-   grants are not listed under the farmer's consent; each registry hop leaves an embedded
+   grants are not listed under the subject's consent; each registry hop leaves an embedded
    artefact on the aggregator's `legitimate_interest` binding, shown as its own top-level row.

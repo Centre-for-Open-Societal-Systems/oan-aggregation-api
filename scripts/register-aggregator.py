@@ -1,5 +1,9 @@
 """Onboard the Aggregation Layer on a running stack. Idempotent, re-runnable.
 
+Every registry comes from the registry catalog (deploy/registries.yaml by
+default) - this script holds no registry of its own, so onboarding a new
+registry is: add it to the catalog, run this again.
+
 The Aggregation Layer is a partner like any other, with its own identity:
 
 1. Keycloak (staff realm): a confidential client ``aggregation-layer`` whose
@@ -12,8 +16,9 @@ The Aggregation Layer is a partner like any other, with its own identity:
 3. Partner Management: partner PARTNER_AGGREGATION_LAYER with that key, kid
    ``agg-2026-01``. A registry derives the envelope signer from the DCI header
    as PARTNER_{sender_id.upper()}, so sender_id "aggregation-layer" lands here.
-4. CM bindings aggregation layer -> registry (agg-layer-farmer / -livestock /
-   -cropsown), policy ceilings in registry block names, lawful basis
+4. One CM binding aggregation layer -> registry per catalog entry
+   (``binding.audience`` / ``binding.controller_id``), policy ceiling = the
+   entry's scopes (registry block names), lawful basis
    ``legitimate_interest``, approved through AWE (only the tasks for these
    policies; nothing else in the inbox is touched).
 
@@ -21,19 +26,24 @@ The Aggregation Layer is a partner like any other, with its own identity:
    caps it at the binding's ceiling. The subject's consent and OTP are
    enforced by the aggregation layer before it calls a registry (its own
    aggregation_grants table), so these ceilings are the most any single hop
-   can ever release - keep them to the blocks the field catalog needs.
+   can ever release - keep the catalog's scopes to the blocks partners need.
    Moving a binding from consent to legitimate_interest is a WIDENING: with
    AWE on it lands ``pending`` and only takes effect once approved (this
    script approves its own tasks). The CM caches a partner's policy for
    partner_cache_ttl_sec (60s by default), so a change can take up to a
    minute to reach /validate.
-5. deploy/.env: the client secret filled in.
+5. Optional, ``--partner AUDIENCE``: extend an existing partner -> aggregation
+   layer binding so its policy also allows the catalog's scope ids
+   (``<registryCode>.<scope>``). Scopes are only ever added, never removed,
+   and the rest of the policy is kept as it is.
+6. deploy/.env: the client secret filled in.
 
-The partner -> aggregator binding (komal-aggregator, field-alias scopes) is the
-same one the in-CM aggregator used and is not changed.
+    python scripts/register-aggregator.py                       # every registry
+    python scripts/register-aggregator.py --registry NEW_REGISTRY --partner partner-x
 
-    python scripts/register-aggregator.py         # from a venv with httpx + cryptography
+Needs a venv with httpx, cryptography, pydantic and pyyaml.
 """
+import argparse
 import os
 import pathlib
 import sys
@@ -44,16 +54,20 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives.serialization import pkcs12
 
+REPO = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "backend" / "src"))
+from openg2p_aggregation_layer.registry_catalog import CatalogError, load_catalog  # noqa: E402
+
 KC = os.environ.get("G2P_KEYCLOAK", "http://localhost:8080")
 CM = os.environ.get("G2P_CM", "http://localhost:8000")
 PM_ADMIN = os.environ.get("G2P_PM_ADMIN", "http://localhost:8051")
 PM_KEYS = os.environ.get("G2P_PM_KEYS", "http://localhost:8050")
 
-REPO = pathlib.Path(__file__).resolve().parent.parent
 KEY_DIR = REPO / "deploy" / "keys"
 P12 = KEY_DIR / "aggregation-layer.p12"
 ENV_FILE = REPO / "deploy" / ".env"
 ENV_EXAMPLE = REPO / "deploy" / ".env.example"
+CATALOG = REPO / "deploy" / "registries.yaml"
 
 AGG_PM_ID = "PARTNER_AGGREGATION_LAYER"
 KID = "agg-2026-01"
@@ -61,21 +75,12 @@ CLIENT_ID = "aggregation-layer"
 # The CM role its policy read and partner list require. There is no
 # narrower one; see the module docstring.
 SERVICE_ROLE = "CONSENT_MANAGER_ADMIN"
-
-BINDINGS = [
-    # audience, controller_id, scopes (registry block names), label
-    ("agg-layer-farmer", "farmer_registry",
-     ["farmer_personal_details", "family_details", "farm_details"],
-     "Aggregation Layer -> Farmer registry"),
-    ("agg-layer-livestock", "livestock_registry",
-     ["livestock_details", "animal_details", "health_event_details",
-      "vaccination_details", "vital_event_details", "breeding_details"],
-     "Aggregation Layer -> Livestock registry"),
-    ("agg-layer-cropsown", "cropsown_registry",
-     ["crop_sown_details", "crop_production_details", "farm_details",
-      "infestation_details", "cluster_details"],
-     "Aggregation Layer -> Crop Sown registry"),
-]
+# Written on a registry binding whose catalog entry names no purposes.
+DEFAULT_PURPOSES = ["loan_origination"]
+# The policy fields carried over unchanged when a partner binding is extended.
+POLICY_FIELDS = ("allowed_data_scopes", "allowed_purposes", "allowed_subject_id_types",
+                 "allowed_signing_algs", "max_validity_duration", "fetch_type",
+                 "required_auth_method", "lawful_basis")
 
 
 def step(n, text):
@@ -151,7 +156,8 @@ def signing_key():
 def staff_headers():
     r = httpx.post(KC + "/realms/staff/protocol/openid-connect/token", timeout=20, data={
         "grant_type": "password", "client_id": "consent-manager-ui",
-        "username": "staff", "password": "staff", "scope": "openid"})
+        "username": os.environ.get("G2P_STAFF_USER", "staff"),
+        "password": os.environ.get("G2P_STAFF_PASSWORD", "staff"), "scope": "openid"})
     r.raise_for_status()
     return {"Authorization": "Bearer " + r.json()["access_token"]}
 
@@ -186,7 +192,7 @@ def pm_register(H, pub_pem):
         raise SystemExit("registries would reject every hop with signature_invalid")
 
 
-# ── 4. CM bindings ──────────────────────────────────────────────────────────
+# ── 4/5. CM bindings ────────────────────────────────────────────────────────
 
 def our_tasks(H, policy_id):
     tasks = httpx.get(CM + "/consent/v1/awe/tasks", headers=H, timeout=30).json()
@@ -195,41 +201,27 @@ def our_tasks(H, policy_id):
             and t.get("status") in ("open", "claimed")]
 
 
-def binding(H, audience, controller, scopes, label):
+def partner_by_audience(H, audience):
     rows = httpx.get(CM + "/consent/v1/partners", headers=H, timeout=30).json()
+    rows = rows if isinstance(rows, list) else rows.get("items", rows.get("data", []))
     match = [p for p in rows if p.get("audience") == audience]
-    if match:
-        pid = match[0]["id"]
-    else:
-        r = httpx.post(CM + "/consent/v1/partners", headers=H, timeout=30, json={
-            "name": label, "audience": audience, "controller_id": controller,
-            "partner_mgmt_id": AGG_PM_ID})
-        if r.status_code >= 400:
-            raise SystemExit("create %s failed: %s %s" % (audience, r.status_code, r.text[:300]))
-        pid = r.json()["id"]
-        print("  created %-22s %s" % (audience, pid))
+    return match[0]["id"] if match else None
 
+
+def current_policy(H, pid):
     cur = httpx.get(CM + "/consent/v1/partners/%s/policy" % pid, headers=H, timeout=30)
-    cur = cur.json() if cur.status_code == 200 else {}
-    if (cur.get("status") == "active"
-            and sorted(cur.get("allowed_data_scopes") or []) == sorted(scopes)
-            and cur.get("lawful_basis") == "legitimate_interest"):
-        print("  %-22s active v%s" % (audience, cur.get("version")))
-        return pid
-    p = httpx.put(CM + "/consent/v1/partners/%s/policy" % pid, headers=H, timeout=30, json={
-        "allowed_data_scopes": scopes,
-        "allowed_purposes": ["loan_origination", "subsidy_verification"],
-        "allowed_subject_id_types": ["national_id"],
-        "allowed_signing_algs": ["EdDSA"],
-        "max_validity_duration": "P1Y", "fetch_type": "oneshot",
-        # The subject never meets this binding. The CM seeks no grant on the
-        # hop; the aggregation layer enforces the subject's consent + OTP
-        # before calling (no auth method may be set under this basis).
-        "required_auth_method": None, "lawful_basis": "legitimate_interest"})
-    body = p.json() if p.status_code < 300 else {}
+    return cur.json() if cur.status_code == 200 else {}
+
+
+def put_policy(H, pid, audience, policy):
+    """Write a policy version and, if AWE parks it, approve this script's own tasks."""
+    p = httpx.put(CM + "/consent/v1/partners/%s/policy" % pid, headers=H, timeout=30,
+                  json=policy)
     if p.status_code >= 400:
         raise SystemExit("policy %s failed: %s %s" % (audience, p.status_code, p.text[:300]))
+    body = p.json()
     if body.get("status") == "pending":
+        mine = []
         for _ in range(15):
             mine = our_tasks(H, body["id"])
             if mine:
@@ -241,18 +233,67 @@ def binding(H, audience, controller, scopes, label):
                        timeout=30, json={"action": "approve",
                                          "comment": "aggregation layer onboarding"})
         for _ in range(30):
-            cur = httpx.get(CM + "/consent/v1/partners/%s/policy" % pid, headers=H).json()
+            cur = current_policy(H, pid)
             if cur.get("status") == "active" and cur.get("id") == body["id"]:
                 break
             time.sleep(1)
-    cur = httpx.get(CM + "/consent/v1/partners/%s/policy" % pid, headers=H).json()
-    print("  %-22s %s v%s" % (audience, cur.get("status"), cur.get("version")))
+    cur = current_policy(H, pid)
+    print("  %-26s %s v%s" % (audience, cur.get("status"), cur.get("version")))
     if cur.get("status") != "active":
         raise SystemExit("policy for %s is not active" % audience)
-    return pid
 
 
-# ── 5. env files ────────────────────────────────────────────────────────────
+def registry_binding(H, code, entry):
+    audience, scopes = entry.binding.audience, sorted(entry.scopes)
+    pid = partner_by_audience(H, audience)
+    if pid is None:
+        r = httpx.post(CM + "/consent/v1/partners", headers=H, timeout=30, json={
+            "name": "Aggregation Layer -> %s" % entry.name, "audience": audience,
+            "controller_id": entry.binding.controller_id, "partner_mgmt_id": AGG_PM_ID})
+        if r.status_code >= 400:
+            raise SystemExit("create %s failed: %s %s" % (audience, r.status_code, r.text[:300]))
+        pid = r.json()["id"]
+        print("  created %-26s %s (%s)" % (audience, pid, code))
+
+    cur = current_policy(H, pid)
+    if (cur.get("status") == "active"
+            and sorted(cur.get("allowed_data_scopes") or []) == scopes
+            and cur.get("lawful_basis") == "legitimate_interest"):
+        print("  %-26s active v%s (%s, unchanged)" % (audience, cur.get("version"), code))
+        return
+    put_policy(H, pid, audience, {
+        "allowed_data_scopes": scopes,
+        "allowed_purposes": entry.binding.allowed_purposes or DEFAULT_PURPOSES,
+        "allowed_subject_id_types": ["national_id"],
+        "allowed_signing_algs": ["EdDSA"],
+        "max_validity_duration": "P1Y", "fetch_type": "oneshot",
+        # The subject never meets this binding. The CM seeks no grant on the
+        # hop; the aggregation layer enforces the subject's consent + OTP
+        # before calling (no auth method may be set under this basis).
+        "required_auth_method": None, "lawful_basis": "legitimate_interest"})
+
+
+def partner_binding(H, audience, scope_ids):
+    """Let an existing partner -> aggregation layer binding ask for these scopes."""
+    pid = partner_by_audience(H, audience)
+    if pid is None:
+        raise SystemExit("no CM binding for partner audience '%s' - onboard the partner "
+                         "first" % audience)
+    cur = current_policy(H, pid)
+    if not cur:
+        raise SystemExit("partner '%s' has no policy to extend" % audience)
+    have = cur.get("allowed_data_scopes") or []
+    missing = [s for s in scope_ids if s not in have]
+    if not missing:
+        print("  %-26s already allows all %d scope id(s)" % (audience, len(scope_ids)))
+        return
+    policy = {k: cur.get(k) for k in POLICY_FIELDS if k in cur}
+    policy["allowed_data_scopes"] = have + missing
+    print("  %-26s + %s" % (audience, ", ".join(missing)))
+    put_policy(H, pid, audience, policy)
+
+
+# ── 6. env files ────────────────────────────────────────────────────────────
 
 def set_env(path, values):
     lines = path.read_text().splitlines() if path.exists() else []
@@ -266,15 +307,24 @@ def set_env(path, values):
     path.write_text("\n".join(lines) + "\n")
 
 
-def current(path, key):
-    if path.exists():
-        for line in path.read_text().splitlines():
-            if line.startswith(key + "="):
-                return line.split("=", 1)[1].strip()
-    return ""
-
-
 def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--catalog", default=str(CATALOG), help="registry catalog YAML")
+    ap.add_argument("--registry", action="append", default=[],
+                    help="only this registry code (repeatable; default: all)")
+    ap.add_argument("--partner", action="append", default=[],
+                    help="partner audience whose binding gets the scope ids (repeatable)")
+    args = ap.parse_args()
+
+    try:
+        catalog = load_catalog(args.catalog)
+    except CatalogError as exc:
+        raise SystemExit(str(exc))
+    unknown = [c for c in args.registry if catalog.get(c) is None]
+    if unknown:
+        raise SystemExit("not in %s: %s" % (args.catalog, ", ".join(unknown)))
+    codes = args.registry or catalog.codes()
+
     step(1, "Keycloak client %s with %s" % (CLIENT_ID, SERVICE_ROLE))
     client_secret = keycloak()
     step(2, "Signing key")
@@ -282,11 +332,16 @@ def main():
     H = staff_headers()
     step(3, "Partner Management: %s" % AGG_PM_ID)
     pm_register(H, pub)
-    step(4, "CM bindings aggregation layer -> registry")
-    for audience, controller, scopes, label in BINDINGS:
-        binding(H, audience, controller, scopes, label)
+    step(4, "CM bindings aggregation layer -> registry (%s)" % ", ".join(codes))
+    for code in codes:
+        registry_binding(H, code, catalog.get(code))
+    scope_ids = catalog.scope_ids(codes)
+    if args.partner:
+        step(5, "Partner bindings: allow the scope ids")
+        for audience in args.partner:
+            partner_binding(H, audience, scope_ids)
 
-    step(5, "deploy/.env")
+    step(6, "deploy/.env")
     if not ENV_FILE.exists():
         ENV_FILE.write_text(ENV_EXAMPLE.read_text())
     set_env(ENV_FILE, {"AGGREGATION_LAYER_CM_CLIENT_SECRET": client_secret})
@@ -294,6 +349,9 @@ def main():
     # Nothing is written to the CM's configuration: it needs none for this
     # service. It does need subject_consent_required=true for the
     # raise-a-consent path (see docs/CM-API-CONTRACT.md).
+    print("\nScope ids partners consent to for these registries:")
+    for scope_id in scope_ids:
+        print("  " + scope_id)
     print("\nDone. The CM caches policies for up to 60s; allow that before the first seek.")
     return 0
 

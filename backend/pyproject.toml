@@ -7,12 +7,12 @@ name = "openg2p-aggregation-layer"
 authors = [
   { name = "OpenG2P", email = "info@openg2p.org" },
 ]
-description = "OpenG2P Aggregation Layer — one consent-gated partner call across several registries, delivered as a DCI on-search."
+description = "OpenG2P Aggregation Layer — one consent-gated Beneficiary-360 call across several registries, delivered as a DCI on-search."
 readme = "README.md"
 requires-python = ">=3.10"
 classifiers = [
   "Programming Language :: Python :: 3",
-  "License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)",
+  "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
 ]
 dependencies = [
@@ -27,6 +27,8 @@ dependencies = [
   "httpx",
   # Only used when otp_publish_enabled (dev-only OTP drop box).
   "boto3",
+  # The registry catalog (registry_catalog.py).
+  "pyyaml >=6.0",
   # Fan-out and callback queues; imported lazily, only when kafka_enabled.
   "aiokafka >=0.10",
 ]
@@ -34,7 +36,7 @@ dynamic = ["version"]
 
 [project.urls]
 Homepage = "https://openg2p.org"
-Repository = "https://github.com/Centre-for-Open-Societal-Systems/aggregation-layer"
+Repository = "https://github.com/Centre-for-Open-Societal-Systems/oan-aggregation-api"
 
 [tool.hatch.version]
 path = "src/openg2p_aggregation_layer/__init__.py"

@@ -42,6 +42,8 @@ services:
       - "localhost:host-gateway"
     volumes:
       - ./keys:/keys:ro
+      # The registry catalog (AGGREGATION_LAYER_REGISTRY_CATALOG_PATH).
+      - ./registries.yaml:/config/registries.yaml:ro
     depends_on:
       aggregation-db:
         condition: service_healthy

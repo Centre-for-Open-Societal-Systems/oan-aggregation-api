@@ -35,28 +35,28 @@ being used properly — several subjects authorising at once:
 ## The shape now
 
 ```
-POST /consent/v1/aggregation/{id}/verify-otp
+POST /aggregation/v1/requests/{id}/verify-otp
         │
         │  checks the code, mints the grants, publishes. Returns in
         │  milliseconds — it does not touch a registry.
         ▼
- openg2p.consent.aggregation.fanout ──────▶ FanOutConsumer
+ openg2p.aggregation.fanout ──────▶ FanOutConsumer
                                                  │ queries each registry,
                                                  │ builds + signs the
                                                  │ on-search envelope
                                                  ▼
- openg2p.consent.aggregation.delivery ────▶ DeliveryConsumer ──▶ partner callback
+ openg2p.aggregation.delivery ────▶ DeliveryConsumer ──▶ partner callback
                                                  │ 5xx / timeout        │ 2xx
                                                  ▼                      ▼
- openg2p.consent.aggregation.delivery.retry.10s                    delivered
- openg2p.consent.aggregation.delivery.retry.60s
- openg2p.consent.aggregation.delivery.retry.300s
- openg2p.consent.aggregation.delivery.retry.900s
+ openg2p.aggregation.delivery.retry.10s                    delivered
+ openg2p.aggregation.delivery.retry.60s
+ openg2p.aggregation.delivery.retry.300s
+ openg2p.aggregation.delivery.retry.900s
             │ one RetryConsumer per tier, each holding for ITS delay
             └──────────────▶ back to .delivery
                                                  │ attempts exhausted
                                                  ▼
- openg2p.consent.aggregation.dlq
+ openg2p.aggregation.dlq
 ```
 
 The two stages are separate topics on purpose. They fail for unrelated reasons:
@@ -90,9 +90,8 @@ The cost is four consumers instead of one, and a topic per entry in
 `kafka_retry_backoff_seconds`. That is the price of not having a long hold block
 a short one, and it is worth paying.
 
-Regression test: `postman/verify-retry-tiers.py`. It parks one delivery on the
-300 s tier, queues another on the 10 s tier, and asserts the second retries in
-about ten seconds — the behaviour, not the topology.
+The tier arithmetic (one topic per backoff, a delay never rounded down) is
+covered by `test/kafka/test_consumer_flow.py`.
 
 ### Why these topic names
 
@@ -124,10 +123,12 @@ The ceiling on registry load is now a number you can state: consumers ×
 `kafka_fanout_concurrency`, never more than `kafka_topic_partitions`. That is
 the thing the old code never had.
 
-## Measured, on this stack
+## Measured
 
-40 subjects verifying their OTP in the same instant, against the three-registry
-demo stack. `postman/verify-concurrency.py`, `G2P_CONCURRENCY=40`.
+40 subjects verifying their OTP in the same instant, against a three-registry
+development stack. Measured while the aggregation still ran inside the Consent
+Manager (the queue design is unchanged since); the load scripts were not
+carried over to this repository.
 
 | | Kafka off | Kafka on, in-app | Kafka on, worker |
 |---|---|---|---|
@@ -139,7 +140,7 @@ demo stack. `postman/verify-concurrency.py`, `G2P_CONCURRENCY=40`.
 | all 40 delivered in | 7.5 s | 18.0 s | 14.2 s |
 
 The "portal GET" row is the symptom this work was asked for. It is an unrelated
-read (`/consent/v1/aggregation/fields`, which touches no registry) fired
+read (the catalog discovery endpoint, which touches no registry) fired
 repeatedly *while* the fan-outs run, so any latency on it is pure contention.
 Off, it degrades 26× — 12 ms idle to 313 ms median. On, with the consumers in
 their own process, it does not move at all.
@@ -163,20 +164,10 @@ Two things to read carefully:
 
 ## Verified
 
-Three runnable checks, all green on 2026-09-23:
-
 | | |
 |---|---|
-| `test/kafka/test_consumer_flow.py` | the handlers with a stubbed bus — retry arithmetic, stable message id, give-up at the last attempt, malformed → DLQ. No broker needed. |
-| `postman/verify-concurrency.py` | the table above. |
-| `postman/verify-retry.py` | kills the callback receiver, drives a real seek + OTP, and proves the delivery is *held* rather than abandoned, then arrives by itself when the partner returns — on attempt 2, with `fetch_attempts` still 1. |
-| `postman/verify-retry-tiers.py` | a short backoff does not queue behind a long one. Measured at 10 s against the ~300 s the single-topic version took. |
-
-The existing suites are unchanged and still green with the queue on:
-`demo-check.sh` steps 6/7/8 at 16/16, 11/11, 16/16, and folder 12 all green.
-
-After that lot: 101 fan-out messages, 103 deliveries (101 + 2 retries), 2
-retries, **0 dead-lettered**, spread over all 12 partitions, consumer lag 0.
+| `test/kafka/test_consumer_flow.py` | the handlers with a stubbed bus — retry arithmetic, stable message id, give-up at the last attempt, malformed → DLQ, one topic per backoff tier. No broker needed. |
+| `test/e2e` | the whole flow against a real Consent Manager and Postgres, with the in-process path (`kafka_enabled=false`), which walks the same statuses. |
 
 ## Duplicates, and why the same fetch never runs twice
 
@@ -212,7 +203,7 @@ What that gives up is automatic recovery from a worker that dies *after* the
 work and *before* the commit. That case is covered instead by:
 
 ```bash
-./run-local.sh --reap        # or: python -m openg2p_consent_manager.reap
+python -m openg2p_aggregation_layer.reap
 ```
 
 which releases rows claimed longer ago than `kafka_claim_timeout_sec` and
@@ -237,17 +228,14 @@ would produce a different signature for the same facts.
 ## Running it
 
 ```bash
-# 1. the broker (its own compose file — the demo stack is not touched)
-docker compose -f docker-compose.kafka.yml up -d
+# 1. the broker (its own compose file)
+docker compose -p aggregation-kafka -f deploy/docker-compose.kafka.yml up -d
 #    Kafka on localhost:9092, Kafka UI on http://localhost:8085
 
-# 2. the new columns
-./run-local.sh --migrate
-
-# 3. turn it on
-#    backend/.env:
-#      CONSENT_MANAGER_KAFKA_ENABLED=true
-./run-local.sh
+# 2. turn it on - deploy/.env:
+#      AGGREGATION_LAYER_KAFKA_ENABLED=true
+#      AGGREGATION_LAYER_KAFKA_BOOTSTRAP_SERVERS=agg-kafka:9094
+docker compose -p aggregation-layer -f deploy/docker-compose.yml up -d aggregation-layer
 ```
 
 The four topics are created on startup if they are missing, the same job the
@@ -263,9 +251,10 @@ But the point of moving the fan-out off the request path is lost if the registry
 queries still share an event loop with the portal. So:
 
 ```bash
-# backend/.env:  CONSENT_MANAGER_KAFKA_CONSUMERS_IN_APP=false
-./run-local.sh              # API — publishes only
-./run-local.sh --worker     # consumers — in another terminal, or ×N
+# deploy/.env:  AGGREGATION_LAYER_KAFKA_CONSUMERS_IN_APP=false
+#               AGGREGATION_LAYER_CM_POLL_IN_APP=false
+# API (publishes only), then the consumers + CM poll, in another process or ×N:
+python -m openg2p_aggregation_layer.worker
 ```
 
 Both processes joining the same consumer group is not wrong, it just puts the
@@ -293,9 +282,9 @@ Kafka UI from `commons` (it is already an Istio-fronted template, unlike the
 three environment variables:
 
 ```yaml
-CONSENT_MANAGER_KAFKA_ENABLED: "true"
-CONSENT_MANAGER_KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
-CONSENT_MANAGER_KAFKA_CONSUMERS_IN_APP: "false"   # + a worker Deployment
+AGGREGATION_LAYER_KAFKA_ENABLED: "true"
+AGGREGATION_LAYER_KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+AGGREGATION_LAYER_KAFKA_CONSUMERS_IN_APP: "false"   # + a worker Deployment
 ```
 
 Two things to change from the defaults when you do:
@@ -311,7 +300,7 @@ Two things to change from the defaults when you do:
   **per backoff step**, not one).
 
 The worker becomes its own Deployment running
-`python -m openg2p_consent_manager.worker`, and `-m openg2p_consent_manager.reap`
+`python -m openg2p_aggregation_layer.worker`, and `-m openg2p_aggregation_layer.reap`
 becomes a CronJob alongside the existing consent-expiry one.
 
 > For context on why none of this could be inherited: the upstream
@@ -336,15 +325,15 @@ unbounded, exactly as before, and the log says which mode served the request:
 Aggregation <id>: Kafka unavailable, running the fan-out in-process
 ```
 
-`kafka_enabled=false` is the same path, chosen deliberately. That is how the
-existing demo still runs with no broker at all.
+`kafka_enabled=false` is the same path, chosen deliberately. That is how a
+deployment without a broker runs unchanged.
 
 ## Watching it work
 
 - **Kafka UI** — <http://localhost:8085>, the four topics and their lag.
-- **The status endpoint** — `GET /consent/v1/aggregation/{id}` now returns
+- **The status endpoint** — `GET /aggregation/v1/requests/{id}` returns
   `fetch_attempts` and `next_retry_at`. A request sitting in `fetched` with a
   `next_retry_at` is backing off, not stuck; `fetch_attempts > 1` means a worker
   died mid-fetch and the registries were queried more than once.
-- **The DLQ** — `openg2p.consent.aggregation.dlq` holds everything that gave up,
+- **The DLQ** — `openg2p.aggregation.dlq` holds everything that gave up,
   with a `dead_letter_reason`.

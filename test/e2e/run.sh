@@ -4,8 +4,8 @@
 #
 #   CM_SRC=/path/to/consent-management bash test/e2e/run.sh
 #
-# Needs: PostgreSQL binaries (initdb, pg_ctl) and a venv with the CM's
-# dependencies (VENV, default ~/agg-venv).
+# Needs: PostgreSQL binaries (initdb, pg_ctl) and a venv with the CM's and
+# this service's dependencies plus jsonschema (VENV, default ~/agg-venv).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -66,16 +66,15 @@ CM_ENV="$(common_db consent_manager) consent_manager_auth_enabled=false
 ( cd "$WORK" && env PYTHONPATH="$CM_SRC/backend/src" $CM_ENV "$PY" -m openg2p_consent_manager.main migrate >"$WORK/cm-migrate.log" 2>&1 )
 start cm 18000 "$CM_SRC/backend/src" $CM_ENV "$PY" -m uvicorn openg2p_consent_manager.main:app --port 18000
 
-# ── Aggregation Layer ──
-REG='{"farmer":{"url":"http://127.0.0.1:18090","audience":"aggregation-layer-farmer","controller_id":"farmer-registry","reg_type":"ns:FarmerRecord","reg_record_type":"ns:Farmer","receiver_id":"farmer-registry","id_type":"functional_id"}}'
+# ── Aggregation Layer (registry catalog: test/e2e/registries.yaml) ──
 AGG_ENV="$(common_db aggregation_layer) aggregation_layer_auth_enabled=false
+  aggregation_layer_registry_catalog_path=$HERE/registries.yaml
   aggregation_layer_cm_base_url=http://127.0.0.1:18000
   aggregation_layer_cm_poll_interval_sec=1
   aggregation_layer_otp_debug_enabled=true"
 ( cd "$WORK" && env PYTHONPATH="$AGG_SRC/backend/src" $AGG_ENV "$PY" -m openg2p_aggregation_layer.main migrate >"$WORK/agg-migrate.log" 2>&1 )
 start agg 18100 "$AGG_SRC/backend/src" $AGG_ENV \
   aggregation_layer_signing_private_key_pem="$(cat "$WORK/keys/PARTNER_AGGREGATION_LAYER.pem")" \
-  aggregation_layer_aggregator_registries="$REG" \
   "$PY" -m uvicorn openg2p_aggregation_layer.main:app --port 18100
 
 # ── PM keys + registry + partner callback ──

@@ -43,9 +43,10 @@ class AggregationGrant(BaseORMModelWithId):
     partner_audience: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     subject_id_type: Mapped[str] = mapped_column(String(50), index=True)
     subject_id_value: Mapped[str] = mapped_column(String(255), index=True)
+    # The registry's code in the registry catalog.
     registry: Mapped[str] = mapped_column(String(50), index=True)
-    # The CM binding the hop is validated against (aggregator_registries[...]
-    # .audience) - legitimate_interest, so the CM itself grants nothing to it.
+    # The CM binding the hop is validated against (the catalog entry's
+    # binding.audience) - legitimate_interest, so the CM grants nothing to it.
     registry_audience: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     # Registry block names, exactly what the hop's consent object asks for.
     scopes: Mapped[list] = mapped_column(JSONB, default=list)

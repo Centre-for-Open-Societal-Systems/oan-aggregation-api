@@ -1,10 +1,10 @@
-"""Keycloak-based caller authentication and role authorization.
+"""Keycloak-based caller authentication.
 
 Mirrors the OpenG2P AWE service: bearer tokens are verified against the Keycloak
-JWKS, roles are read from both ``realm_access`` and every ``resource_access.*``
-client block, and ``require_role`` gates admin endpoints. Service-to-service
-callers (client-credentials tokens) authenticate the same way and are detected
-by the absence of an ``email`` claim.
+JWKS and roles are read from both ``realm_access`` and every
+``resource_access.*`` client block. Service-to-service callers
+(client-credentials tokens) authenticate the same way and are detected by the
+absence of an ``email`` claim.
 """
 import logging
 from dataclasses import dataclass, field
@@ -113,7 +113,7 @@ async def current_identity(
         return CallerIdentity(
             subject="dev", subject_id_type=_config.subject_default_id_type,
             subject_id_value="dev", name="dev",
-            roles=[_config.auth_admin_role], is_service_account=True, raw_claims={},
+            roles=[], is_service_account=True, raw_claims={},
         )
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
@@ -127,27 +127,10 @@ async def current_identity(
     return _identity_from_claims(claims)
 
 
-def require_role(role: str):
-    """Dependency factory — gate an endpoint on a single Keycloak role."""
-
-    async def _checker(
-        identity: CallerIdentity = Depends(current_identity),
-    ) -> CallerIdentity:
-        if not _config.auth_enabled:
-            return identity
-        if role not in identity.roles:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN, detail=f"Role '{role}' required"
-            )
-        return identity
-
-    return _checker
-
-
 async def get_current_subject(
     identity: CallerIdentity = Depends(current_identity),
 ) -> Dict[str, str]:
-    """Subject identity for the ``/my/*`` endpoints, scoped to the caller."""
+    """The subject behind the caller's token, for the subject-facing routes."""
     if not identity.subject_id_value:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

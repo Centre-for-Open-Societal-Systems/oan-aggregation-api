@@ -1,0 +1,216 @@
+# Registry catalog for the Aggregation Layer.
+#
+# Every registry the service may query, and nothing else: adding a registry is
+# a new entry here plus its Consent Manager binding (scripts/register-aggregator.py),
+# never a code change. Loaded and validated at startup from
+# AGGREGATION_LAYER_REGISTRY_CATALOG_PATH; an invalid file stops the service
+# with every problem listed. No secrets belong here.
+#
+# This file describes the three OpenG2P registries of the local developer
+# stack (Farmer, Livestock, Crop Sown). Block names and paths follow their
+# outgest templates (openg2p_*_to_dci.json.j2).
+#
+# Per registry (the key is the bene-360 registryCode - letters, digits, '_'
+# and '-', no '.'):
+#
+#   name                  bene-360 registryName
+#   partner_api.base_url  the registry's OpenG2P partner API; the service calls
+#                         <base_url>/dci/registry/sync/search
+#   partner_api.receiver_id   DCI header.receiver_id on the hop
+#   partner_api.timeout_sec   optional, overrides AGGREGATION_LAYER_AGGREGATOR_REGISTRY_TIMEOUT
+#   binding.audience      the CM binding (aggregation layer -> this registry,
+#   binding.controller_id lawful basis legitimate_interest) each hop spends
+#   binding.allowed_purposes  purposes register-aggregator.py writes on that binding
+#   search.reg_type / reg_record_type   DCI search_criteria on the hop
+#   search.id_type        DCI identifier type of the beneficiary's foundationalId:
+#                         sent as query.value.id_type and required on the matched
+#                         identifier (see search.match)
+#   search.match          exact identity check on every returned record. The
+#                         partner API searches by substring (search_text), so a
+#                         record that merely mentions the ID can come back; it is
+#                         kept only if an identifier entry at match.path has
+#                         <value_key> == foundationalId and <type_key> == id_type.
+#     path                list (a[]) or object of identifiers; its first segment
+#                         must be a scope - that block is always fetched for the
+#                         check and released only if the consent covers it
+#     value_key           default identifier_value
+#     type_key            default identifier_type; null skips the type check
+#   search.page_size      optional, overrides AGGREGATION_LAYER_AGGREGATOR_PAGE_SIZE
+#
+#   registers.<MNEMONIC>  a bene-360 register the record maps onto:
+#     name                    registerName
+#     internal_record_id      paths into the whole record (any block). Values
+#     functional_record_id    read here leave the service as identifiers, so
+#     record_status           point them only at data that may be released.
+#     last_approved_at        (ignored unless it is an ISO date-time)
+#     default_record_status   used when record_status finds nothing (default UNKNOWN)
+#
+#   scopes.<block>        one top-level block of the outgest template = one
+#                         consent scope. Partners consent to it as
+#                         "<registryCode>.<block>" (e.g. FARMER_REGISTRY.family_details).
+#     register: M             the block's allowed fields become attributes of
+#                             register M (grouped under the block name), or
+#     table: T + parent: P    each element of the block (a list) or the block
+#                             itself (an object) becomes a row of table T under
+#                             register/table P. A table parent needs
+#                             join: {field: <path in this row>, parent_field: <path in parent row>}.
+#       name                  tableName
+#       internal_record_id    row-relative paths (a positional id is used when absent)
+#       record_status
+#     fields                  the allow-list of paths that may leave the service.
+#                             "a.b" keeps one value, "a[].b" maps over a list,
+#                             ["*"] keeps the whole block/row (write it on purpose).
+#     tables                  optional nested tables read from inside each row:
+#                             [{path, table, name, fields, internal_record_id,
+#                               record_status, tables}]
+version: 1
+registries:
+
+  FARMER_REGISTRY:
+    name: Farmer Registry
+    partner_api:
+      base_url: http://openg2p-farmer-registry-partner-api:8000
+      receiver_id: farmer-registry
+    binding:
+      audience: agg-layer-farmer
+      controller_id: farmer_registry
+      allowed_purposes: [loan_origination, subsidy_verification]
+    search:
+      reg_type: Farmer
+      reg_record_type: spdci-extensions-dci:FarmerRecord
+      id_type: UIN
+      match:
+        path: farmer_personal_details.member_identifier[]
+    registers:
+      FARMER:
+        name: Farmer
+        functional_record_id: farmer_personal_details.member_identifier[].identifier_value
+        last_approved_at: farmer_personal_details.last_updated
+    scopes:
+      farmer_personal_details:
+        register: FARMER
+        fields:
+          - member_identifier[].identifier_value
+          - demographic_info.name.given_name
+          - demographic_info.name.second_name
+          - demographic_info.name.surname
+          - demographic_info.phone_number
+          - demographic_info.sex
+          - demographic_info.birth_date
+          - marital_status
+          - education_level
+          - registration_date
+      family_details:
+        table: HOUSEHOLD
+        name: Household
+        parent: FARMER
+        internal_record_id: group_identifier[].identifier_value
+        fields: ["*"]
+      farm_details:
+        table: FARM
+        name: Farm
+        parent: FARMER
+        fields: ["*"]
+
+  LIVESTOCK_REGISTRY:
+    name: Livestock Registry
+    partner_api:
+      base_url: http://livestock-registry-partner-api:8000
+      receiver_id: livestock-registry
+    binding:
+      audience: agg-layer-livestock
+      controller_id: livestock_registry
+      allowed_purposes: [loan_origination, subsidy_verification]
+    search:
+      reg_type: Livestock
+      reg_record_type: spdci-extensions-dci:LivestockRecord
+      id_type: UIN
+      match:
+        path: livestock_details.farmer_info.member_identifier[]
+    registers:
+      LIVESTOCK:
+        name: Livestock holding
+        functional_record_id: livestock_details.record_identifier[].identifier_value
+        record_status: livestock_details.status
+    scopes:
+      livestock_details:
+        register: LIVESTOCK
+        fields:
+          - record_identifier[].identifier_value
+          - oan_id
+          - status
+          - total_animals
+          - registration_date
+          - farmer_info.demographic_info.name.given_name
+          - farmer_info.demographic_info.name.surname
+          - farmer_info.phone_number
+          - place
+      animal_details:
+        table: ANIMAL
+        name: Animal
+        parent: LIVESTOCK
+        fields: ["*"]
+      health_event_details:
+        table: HEALTH_EVENT
+        name: Health event
+        parent: LIVESTOCK
+        fields: ["*"]
+      vaccination_details:
+        table: VACCINATION
+        name: Vaccination
+        parent: LIVESTOCK
+        fields: ["*"]
+      vital_event_details:
+        table: VITAL_EVENT
+        name: Vital event
+        parent: LIVESTOCK
+        fields: ["*"]
+      breeding_details:
+        table: BREEDING
+        name: Breeding
+        parent: LIVESTOCK
+        fields: ["*"]
+
+  CROPSOWN_REGISTRY:
+    name: Crop Sown Registry
+    partner_api:
+      base_url: http://cropsown-registry-partner-api:8000
+      receiver_id: cropsown-registry
+    binding:
+      audience: agg-layer-cropsown
+      controller_id: cropsown_registry
+      allowed_purposes: [loan_origination, subsidy_verification]
+    search:
+      reg_type: CropSown
+      reg_record_type: spdci-extensions-dci:CropSownRecord
+      id_type: UIN
+      match:
+        path: crop_sown_details.farmer_info.member_identifier[]
+    registers:
+      CROP_SOWN:
+        name: Crop sown
+        functional_record_id: crop_sown_details.record_identifier[].identifier_value
+    scopes:
+      crop_sown_details:
+        register: CROP_SOWN
+        fields: ["*"]
+      farm_details:
+        table: FARM
+        name: Farm
+        parent: CROP_SOWN
+        fields: ["*"]
+      crop_production_details:
+        table: CROP_PRODUCTION
+        name: Crop production
+        parent: CROP_SOWN
+        fields: ["*"]
+      infestation_details:
+        table: INFESTATION
+        name: Infestation
+        parent: CROP_SOWN
+        fields: ["*"]
+      cluster_details:
+        table: CLUSTER
+        name: Cluster
+        parent: CROP_SOWN
+        fields: ["*"]
