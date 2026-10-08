@@ -1,0 +1,676 @@
+{
+  "info": {
+    "name": "OpenG2P Consent Manager — Aggregator (:8110)",
+    "description": "The aggregated, OTP-gated, cross-registry fetch on the Aggregation Layer service (`:8110`).\n\nThe Consent Manager runs on `:8000`; the aggregation layer calls it over HTTP for every consent decision.\n\n## Before you start\n\n```bash\ncd aggregation-layer\ndocker compose -p aggregation-layer -f deploy/docker-compose.yml up -d   # :8110\npython postman/agg-prep.py     # signs the consent object, writes the env\n```\n\nImport `OpenG2P-Aggregator.postman_environment.json`, select it, then run folders 1→4 in order. Each request saves what the next one needs, so nothing has to be copied by hand.\n\n## Two clocks are running\n\n| | expires |\n|---|---|\n| the consent object | 300s (`replay_freshness_window_sec`) |\n| the OTP | 300s (`otp_ttl_sec`) |\n\nRe-run `agg-prep.py` if a seek comes back `replay`.\n\n## Why Postman cannot do all of it\n\nA consent object is an ES256 compact JWS and Postman's sandbox has no ECDSA, so `agg-prep.py` signs it outside and hands it over as `{{consent_jws}}`. Everything else is plain HTTP.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "agg_url",
+      "value": "http://localhost:8110"
+    },
+    {
+      "key": "cm_url",
+      "value": "http://localhost:8000"
+    },
+    {
+      "key": "callback_url",
+      "value": "http://localhost:9099/on-search"
+    }
+  ],
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Non-blocking guard. Never throws: a throw here aborts the request",
+          "// and Postman reports it in a way that hides the real problem.",
+          "const url = String(pm.request.url);",
+          "if (url.indexOf('/aggregation/fields') === -1) {",
+          "  const t = pm.variables.get('access_token') || '';",
+          "  if (!t) {",
+          "    console.warn('access_token is empty - run postman/agg-prep.py, then',",
+          "                 're-import the environment.');",
+          "  } else {",
+          "    try {",
+          "      let seg = t.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');",
+          "      while (seg.length % 4) seg += '=';",
+          "      const left = JSON.parse(atob(seg)).exp - Math.floor(Date.now() / 1000);",
+          "      if (left <= 0) {",
+          "        console.warn('access_token EXPIRED ' + (-left) + 's ago - re-run agg-prep.py');",
+          "      }",
+          "    } catch (e) { /* not fatal */ }",
+          "  }",
+          "}"
+        ]
+      }
+    }
+  ],
+  "item": [
+    {
+      "name": "0 Health & discovery",
+      "description": "Is the local backend up, and what may a partner ask for?",
+      "item": [
+        {
+          "name": "Aggregator backend is up (:8110)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{agg_url}}/docs",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "docs"
+              ]
+            },
+            "description": "The local backend. Should be 200 and list the aggregator routes.",
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        },
+        {
+          "name": "Original backend for comparison (:8000)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{cm_url}}/docs",
+              "host": [
+                "{{cm_url}}"
+              ],
+              "path": [
+                "docs"
+              ]
+            },
+            "description": "The Docker backend. Same image lineage, no aggregator routes - this is the 'before' side of the comparison.",
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        },
+        {
+          "name": "Field catalog",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{agg_url}}/consent/v1/aggregation/fields",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "consent",
+                "v1",
+                "aggregation",
+                "fields"
+              ]
+            },
+            "description": "Every alias a partner may request, with the registry that holds it and the top-level scope its consent must carry.\n\nOpen by design: it is the same for every caller and describes nobody's data. Every other route here is subject-scoped and 401s without a token.",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const j = pm.response.json();",
+                  "pm.test('catalog returned', () => pm.expect(j.fields).to.be.an('array'));",
+                  "const byReg = {};",
+                  "(j.fields || []).forEach(f => { (byReg[f.registry] = byReg[f.registry] || []).push(f.field); });",
+                  "Object.keys(byReg).sort().forEach(r =>",
+                  "  console.log(r + ': ' + byReg[r].length + ' field(s)'));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "1 Partner — the seek",
+      "description": "The whole point of the endpoint: ONE call naming fields from three registries, answered later on a callback.",
+      "item": [
+        {
+          "name": "⭐ Seek — one call, three registries",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{agg_url}}/dci/registry/async/search",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "dci",
+                "registry",
+                "async",
+                "search"
+              ]
+            },
+            "description": "Returns **202 and an ack — no data**. Nothing is fetched until the farmer has entered their OTP.\n\nUnauthenticated by Keycloak **on purpose**: the partner authenticates with the signed consent object in `authorize.consent_jws`, verified against Partner Management — exactly as `/validate` and the registries' own search do.\n\n`fields` are catalog aliases. `registry_queries` exists because each registry keys on its own functional id, so one `id_value` cannot match all three.\n\n| response | meaning |\n|---|---|\n| 202 | accepted, OTP issued |\n| 400 `unknown_field` | an alias is not in the catalog — rejected loudly, because dropping it silently looks identical to 'no data' |\n| 403 `replay` | the consent object is older than 300s — re-run `agg-prep.py` |\n| 403 `signature_invalid` | usually the 300s PM key cache, not a bad signature — restart the backend |\n| 403 `no_subject_consent` | the subject has not granted these fields to the aggregator binding |",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"header\": {\n    \"version\": \"1.0.0\",\n    \"message_id\": \"{{$guid}}\",\n    \"message_ts\": \"{{$isoTimestamp}}\",\n    \"action\": \"search\",\n    \"sender_id\": \"komal-partner\",\n    \"receiver_id\": \"cm-aggregator\",\n    \"sender_uri\": \"{{callback_url}}\",\n    \"total_count\": 1,\n    \"is_msg_encrypted\": false\n  },\n  \"message\": {\n    \"transaction_id\": \"{{$randomUUID}}\",\n    \"search_request\": [\n      {\n        \"reference_id\": \"postman-1\",\n        \"timestamp\": \"{{$isoTimestamp}}\",\n        \"search_criteria\": {\n          \"version\": \"1.0.0\",\n          \"query_type\": \"idtype-value\",\n          \"query\": {\n            \"type\": \"idtype-value\",\n            \"value\": {\n              \"id_type\": \"functional_id\",\n              \"id_value\": \"{{query_id_value}}\"\n            }\n          },\n          \"fields\": {{fields}},\n          \"registry_queries\": {{registry_queries}},\n          \"authorize\": {\n            \"consent_jws\": \"{{consent_jws}}\"\n          }\n        }\n      }\n    ]\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('accepted (202)', () => pm.response.to.have.status(202));",
+                  "const j = pm.response.json();",
+                  "const target = pm.environment.name ? pm.environment : pm.collectionVariables;",
+                  "if (j.aggregation_id) { target.set('aggregation_id', j.aggregation_id); }",
+                  "if (j.correlation_id) { target.set('correlation_id', j.correlation_id); }",
+                  "console.log('aggregation : ' + j.aggregation_id);",
+                  "console.log('registries  : ' + (j.registries || []).join(', '));",
+                  "console.log('fields      : ' + (j.accepted_fields || []).length);",
+                  "console.log('OTP expires : ' + j.otp_expires_at);"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "2 Farmer — OTP and release",
+      "description": "The subject's half. This is what actually authorises the fetch.",
+      "item": [
+        {
+          "name": "Read the OTP (dev only)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{agg_url}}/consent/v1/aggregation/{{aggregation_id}}/otp",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "consent",
+                "v1",
+                "aggregation",
+                "{{aggregation_id}}",
+                "otp"
+              ]
+            },
+            "description": "Mounted only when `otp_debug_enabled=true`, and subject-scoped.\n\nWith the **internal** provider the plaintext is returned here because the flow would otherwise be untestable from a tool that cannot read the service log.\n\nWith **mock-identity** it is not: MOSIP owns that code, and its OTP is the constant `111111`.\n\nNormally only `sha256(code + salt)` is stored."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const j = pm.response.json();",
+                  "const target = pm.environment.name ? pm.environment : pm.collectionVariables;",
+                  "if (j.otp) {",
+                  "  target.set('otp', j.otp);",
+                  "  console.log('OTP ' + j.otp + ' (provider: ' + j.otp_provider + ')');",
+                  "} else {",
+                  "  target.set('otp', '111111');",
+                  "  console.warn('No plaintext returned. ' + (j.note || ''));",
+                  "  console.warn(\"Defaulted otp to 111111 (the mock's constant).\");",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Wrong OTP — 401",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{agg_url}}/consent/v1/farmer-consent-validate",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "consent",
+                "v1",
+                "farmer-consent-validate"
+              ]
+            },
+            "description": "Run this BEFORE the successful validate — order matters. Once a request reaches `delivered` it answers `409 wrong_state` instead, which is correct but not what this request is demonstrating.\n\nAttempts are capped by `otp_max_attempts` (3) and the cap is **terminal** — exhausting it rejects the request rather than resetting it, so it cannot be ground down by asking again.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"aggregation_id\": \"{{aggregation_id}}\",\n  \"subject_id\": {\n    \"type\": \"{{subject_id_type}}\",\n    \"value\": \"{{subject_id_value}}\"\n  },\n  \"otp\": \"000000\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('rejected', () => pm.expect(pm.response.code).to.be.oneOf([401, 409]));",
+                  "const j = pm.response.json();",
+                  "if (pm.response.code === 409) {",
+                  "  console.warn('Already delivered - run this before the successful validate.');",
+                  "} else {",
+                  "  console.log(j.detail);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "⭐ farmer-consent-validate",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{agg_url}}/consent/v1/farmer-consent-validate",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "consent",
+                "v1",
+                "farmer-consent-validate"
+              ]
+            },
+            "description": "The farmer releases their own data. On success the aggregator fans out to the registries and POSTs the merged record to `sender_uri`.\n\n**The farmer comes from the bearer token**, not from the body. `subject_id` is an optional cross-check that must agree with the token; it cannot establish identity on its own. That matters: with the mock provider the OTP is a constant, so an aggregation id plus a code must not be enough.\n\n`correlation_id` works in place of `aggregation_id`.\n\n| response | meaning |\n|---|---|\n| 200 | verified; delivery starts in the background |\n| 401 | no token, or the token identifies no subject |\n| 404 | unknown id **or** it belongs to another farmer — the same answer either way, because confirming it exists is itself a disclosure |\n| 401 `otp_invalid` | wrong code; attempts are capped |\n| 410 `otp_expired` | past `otp_ttl_sec` |",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"aggregation_id\": \"{{aggregation_id}}\",\n  \"subject_id\": {\n    \"type\": \"{{subject_id_type}}\",\n    \"value\": \"{{subject_id_value}}\"\n  },\n  \"otp\": \"{{otp}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('released (200)', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "console.log('status          : ' + j.status);",
+                  "console.log('released fields : ' + (j.released_fields || []).join(', '));",
+                  "console.log('released to     : ' + j.released_to);",
+                  "console.log('callback        : ' + j.callback_url);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Wrong farmer — must be refused",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{agg_url}}/consent/v1/farmer-consent-validate",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "consent",
+                "v1",
+                "farmer-consent-validate"
+              ]
+            },
+            "description": "The same valid OTP, a different farmer. Must be **404**.\n\nRun it before the real one to see the refusal on a live request.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"aggregation_id\": \"{{aggregation_id}}\",\n  \"subject_id\": {\n    \"type\": \"national_id\",\n    \"value\": \"SOMEONE-ELSE\"\n  },\n  \"otp\": \"{{otp}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('refused', () => pm.expect(pm.response.code).to.be.oneOf([401, 404]));",
+                  "console.log('refused with HTTP ' + pm.response.code + ' - correct');"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "No token — must be 401",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{agg_url}}/consent/v1/farmer-consent-validate",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "consent",
+                "v1",
+                "farmer-consent-validate"
+              ]
+            },
+            "description": "Proves the subject routes are authenticated. Must be **401**, the same as the original backend's `/consent/v1/my/consents`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"aggregation_id\": \"{{aggregation_id}}\",\n  \"otp\": \"{{otp}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 without a token', () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "3 Audit — what actually happened",
+      "description": "Where the internal hops are visible after the fact.",
+      "item": [
+        {
+          "name": "Aggregation status",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{agg_url}}/consent/v1/aggregation/{{aggregation_id}}",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "consent",
+                "v1",
+                "aggregation",
+                "{{aggregation_id}}"
+              ]
+            },
+            "description": "`registry_results` is the per-registry audit: which id each was queried on, how many records came back, and which fields were projected.\n\nSubject-scoped — 404 for another farmer's request.\n\n`status`: `pending_otp` → `verified` → `delivered` (or `failed` / `rejected`)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const j = pm.response.json();",
+                  "console.log('status   : ' + j.status);",
+                  "console.log('callback : HTTP ' + j.callback_status);",
+                  "Object.keys(j.registry_results || {}).sort().forEach(k => {",
+                  "  const v = j.registry_results[k];",
+                  "  if (v && v.status) {",
+                  "    console.log('  ' + k + ': ' + v.status + '  queried=' + v.queried +",
+                  "                '  records=' + v.records + '  fields=' + (v.fields||[]).join(','));",
+                  "  }",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Decision log on the ORIGINAL backend",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{cm_url}}/consent/v1/decisions?limit=8",
+              "host": [
+                "{{cm_url}}"
+              ],
+              "path": [
+                "consent",
+                "v1",
+                "decisions"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "8"
+                }
+              ]
+            },
+            "description": "**This is where the internal calls show up.** One partner request produces FOUR `/consent/v1/validate` calls on `:8000`:\n\n| binding | when |\n|---|---|\n| `komal-aggregator` | the partner's seek — may it ask for these fields? |\n| `agg-farmer` | the hop to `:8006` |\n| `agg-livestock` | the hop to `:8016` |\n| `agg-cropsown` | the hop to `:8017` |\n\nThe aggregator signs each internal consent object, but the **registry** decides whether to honour it, by asking the original CM. The aggregator never marks its own homework."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "let rows = pm.response.json();",
+                  "rows = Array.isArray(rows) ? rows : (rows.items || []);",
+                  "console.log('most recent /validate decisions:');",
+                  "rows.slice(0, 6).forEach(r =>",
+                  "  console.log('  ' + r.decision + '  ' + r.reason_code +",
+                  "              '  partner=' + String(r.partner_id).slice(0, 8)));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "What the partner received (callback receiver)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{cm_url}}/../..",
+              "host": [
+                "{{cm_url}}"
+              ],
+              "path": [
+                "..",
+                ".."
+              ]
+            },
+            "description": "Not a Consent Manager route — point this at whatever received the callback.\n\nThe test harness runs a receiver on `http://localhost:9099`:\n`GET /last` → the most recent on-search envelope, `GET /all` → every one.\n\nChange the URL to `http://localhost:9099/last` and send. You should see `header.status: succ`, `meta.subject_authentication: otp`, and one merged `reg_records[0]` keyed by the partner's own aliases.",
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "4 Failure modes worth seeing",
+      "description": "Each fails for a different, named reason. These are safe to run at any point — none of them depend on the aggregation's state.",
+      "item": [
+        {
+          "name": "Unknown field — 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{agg_url}}/dci/registry/async/search",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "dci",
+                "registry",
+                "async",
+                "search"
+              ]
+            },
+            "description": "Unknown aliases are refused **together and by name**, rather than dropped. A silently shortened record is indistinguishable from 'this farmer has no such data'.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"header\": {\n    \"version\": \"1.0.0\",\n    \"message_id\": \"{{$guid}}\",\n    \"message_ts\": \"{{$isoTimestamp}}\",\n    \"action\": \"search\",\n    \"sender_id\": \"komal-partner\",\n    \"receiver_id\": \"cm-aggregator\",\n    \"sender_uri\": \"{{callback_url}}\",\n    \"total_count\": 1,\n    \"is_msg_encrypted\": false\n  },\n  \"message\": {\n    \"transaction_id\": \"{{$randomUUID}}\",\n    \"search_request\": [\n      {\n        \"reference_id\": \"postman-1\",\n        \"timestamp\": \"{{$isoTimestamp}}\",\n        \"search_criteria\": {\n          \"version\": \"1.0.0\",\n          \"query_type\": \"idtype-value\",\n          \"query\": {\n            \"type\": \"idtype-value\",\n            \"value\": {\n              \"id_type\": \"functional_id\",\n              \"id_value\": \"{{query_id_value}}\"\n            }\n          },\n          \"fields\": [\n            \"farmer.firstname\",\n            \"farmer.nickname\",\n            \"cow.colour\"\n          ],\n          \"registry_queries\": {{registry_queries}},\n          \"authorize\": {\n            \"consent_jws\": \"{{consent_jws}}\"\n          }\n        }\n      }\n    ]\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 unknown_field', () => pm.response.to.have.status(400));",
+                  "console.log(pm.response.json().detail);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "No consent object — 403",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{agg_url}}/dci/registry/async/search",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "dci",
+                "registry",
+                "async",
+                "search"
+              ]
+            },
+            "description": "Fails closed on a malformed consent object.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"header\": {\n    \"version\": \"1.0.0\",\n    \"message_id\": \"{{$guid}}\",\n    \"message_ts\": \"{{$isoTimestamp}}\",\n    \"action\": \"search\",\n    \"sender_id\": \"komal-partner\",\n    \"receiver_id\": \"cm-aggregator\",\n    \"sender_uri\": \"{{callback_url}}\",\n    \"total_count\": 1,\n    \"is_msg_encrypted\": false\n  },\n  \"message\": {\n    \"transaction_id\": \"{{$randomUUID}}\",\n    \"search_request\": [\n      {\n        \"reference_id\": \"postman-1\",\n        \"timestamp\": \"{{$isoTimestamp}}\",\n        \"search_criteria\": {\n          \"version\": \"1.0.0\",\n          \"query_type\": \"idtype-value\",\n          \"query\": {\n            \"type\": \"idtype-value\",\n            \"value\": {\n              \"id_type\": \"functional_id\",\n              \"id_value\": \"{{query_id_value}}\"\n            }\n          },\n          \"fields\": {{fields}},\n          \"registry_queries\": {{registry_queries}},\n          \"authorize\": {\n            \"consent_jws\": \"not-a-jws\"\n          }\n        }\n      }\n    ]\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('refused', () => pm.expect(pm.response.code).to.be.oneOf([400, 403]));",
+                  "console.log(JSON.stringify(pm.response.json()));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Locally generated keys (scripts/register-aggregator.py, postman/agg-prep.py) - never commit
+deploy/keys/*.p12
+postman/.agg-prep-key.pem
+deploy/.env
