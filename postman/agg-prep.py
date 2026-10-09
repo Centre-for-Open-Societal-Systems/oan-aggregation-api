@@ -19,6 +19,7 @@ Run it from the host (all services are reached on their published ports):
 
     python postman/agg-prep.py
     python postman/agg-prep.py --scopes FARMER_REGISTRY.farmer_personal_details
+    python postman/agg-prep.py --no-grant   # the seek raises a consent request instead
 
     G2P_PARTNER_AUDIENCE   partner binding audience          (default demo-partner)
     G2P_PARTNER_PM_ID      its Partner Management partner id  (default PARTNER_DEMO)
@@ -82,11 +83,60 @@ def b64u(obj) -> str:
     return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip("=")
 
 
+def grant(H, subject, partner_uuid, scopes):
+    """request -> authenticate -> approve, as the subject: an active grant for the scopes."""
+    r = httpx.post(CM + "/consent/v1/consent-requests", headers=H, timeout=30, json={
+        "subject_id": {"type": "national_id", "value": subject},
+        "partner_id": partner_uuid,
+        "purpose": {"code": "loan_origination", "text": "postman aggregation"},
+        "requested_scopes": scopes,
+    })
+    if r.status_code >= 400:
+        raise SystemExit("consent-request failed: %s %s" % (r.status_code, r.text[:300]))
+    request_id = r.json()["id"]
+
+    now = datetime.now(timezone.utc)
+    id_token = (b64u({"alg": "none", "typ": "JWT"}) + "." + b64u({
+        "iss": KEYCLOAK + "/realms/staff", "sub": uuid.uuid4().hex,
+        "preferred_username": subject, "subject_id_value": subject,
+        "amr": ["otp"], "iat": int(now.timestamp()),
+        "exp": int(now.timestamp()) + 600}) + ".")
+    httpx.post(CM + "/consent/v1/consent-requests/%s/authenticate" % request_id,
+               headers=H, timeout=20, json={"id_token": id_token})
+    ap_ = httpx.post(CM + "/consent/v1/consent-requests/%s/approve" % request_id,
+                     headers=H, timeout=20, json={"granted_scopes": scopes})
+    if ap_.status_code >= 400:
+        raise SystemExit("approve failed: %s %s" % (ap_.status_code, ap_.text[:300]))
+    granted = ap_.json().get("effective_data_scopes") or scopes
+    print("[grant   ] %d scope id(s) granted to %s" % (len(granted), AUDIENCE))
+    return granted
+
+
+def withdraw_grants(H, partner_uuid):
+    """Revoke the subject's active consents to this partner, so the seek raises a request."""
+    my = httpx.get(CM + "/consent/v1/my/consents", headers=H, timeout=30,
+                   params={"status": "active", "size": 100})
+    my.raise_for_status()
+    active = [c.get("consent_id") or c.get("id") for c in my.json().get("items") or []
+              if c.get("partner_id") == partner_uuid and c.get("status") == "active"]
+    for consent_id in active:
+        httpx.post(CM + "/consent/v1/consents/%s/revoke" % consent_id, headers=H, timeout=30,
+                   json={"originated_by": "subject", "reason": "agg-prep --no-grant"}
+                   ).raise_for_status()
+    print("[no grant] %d active consent(s) to %s withdrawn, none granted (a consent-basis "
+          "partner's seek raises a consent request; a legitimate_interest one needs none)"
+          % (len(active), AUDIENCE))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--catalog", default=str(HERE.parent / "deploy" / "registries.yaml"))
     ap.add_argument("--scopes", help="comma-separated scope ids (default: every scope "
                                      "in the catalog)")
+    ap.add_argument("--no-grant", action="store_true",
+                    help="withdraw the subject's active consents to this partner instead of "
+                         "granting one: the seek then raises a consent request, approved on "
+                         "the CM consent screen (consent_url in the ack)")
     args = ap.parse_args()
     try:
         catalog = load_catalog(args.catalog)
@@ -116,30 +166,11 @@ def main() -> int:
     print("[binding ] %s  (%s)" % (partner_uuid, AUDIENCE))
 
     # ── subject grant, over the SCOPE IDS ───────────────────────────────────
-    r = httpx.post(CM + "/consent/v1/consent-requests", headers=H, timeout=30, json={
-        "subject_id": {"type": "national_id", "value": subject},
-        "partner_id": partner_uuid,
-        "purpose": {"code": "loan_origination", "text": "postman aggregation"},
-        "requested_scopes": scopes,
-    })
-    if r.status_code >= 400:
-        raise SystemExit("consent-request failed: %s %s" % (r.status_code, r.text[:300]))
-    request_id = r.json()["id"]
-
-    now = datetime.now(timezone.utc)
-    id_token = (b64u({"alg": "none", "typ": "JWT"}) + "." + b64u({
-        "iss": KEYCLOAK + "/realms/staff", "sub": uuid.uuid4().hex,
-        "preferred_username": subject, "subject_id_value": subject,
-        "amr": ["otp"], "iat": int(now.timestamp()),
-        "exp": int(now.timestamp()) + 600}) + ".")
-    httpx.post(CM + "/consent/v1/consent-requests/%s/authenticate" % request_id,
-               headers=H, timeout=20, json={"id_token": id_token})
-    ap_ = httpx.post(CM + "/consent/v1/consent-requests/%s/approve" % request_id,
-                     headers=H, timeout=20, json={"granted_scopes": scopes})
-    if ap_.status_code >= 400:
-        raise SystemExit("approve failed: %s %s" % (ap_.status_code, ap_.text[:300]))
-    granted = ap_.json().get("effective_data_scopes") or scopes
-    print("[grant   ] %d scope id(s) granted to %s" % (len(granted), AUDIENCE))
+    if args.no_grant:
+        withdraw_grants(H, partner_uuid)
+        granted = scopes
+    else:
+        granted = grant(H, subject, partner_uuid, scopes)
 
     # ── partner key + consent object ────────────────────────────────────────
     kid = "agg-postman-" + uuid.uuid4().hex[:6]
@@ -181,6 +212,9 @@ def main() -> int:
 
     values = [
         {"key": "access_token", "value": token, "type": "secret"},
+        # "Get subject token" in the collection logs in again with these.
+        {"key": "keycloak_url", "value": KEYCLOAK},
+        {"key": "subject_password", "value": SUBJECT_PASSWORD, "type": "secret"},
         {"key": "agg_url", "value": AGG},
         {"key": "cm_url", "value": CM},
         {"key": "callback_url", "value": CALLBACK},

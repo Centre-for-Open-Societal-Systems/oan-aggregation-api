@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "OpenG2P Aggregation Layer (Beneficiary-360)",
-    "description": "The consent-gated, OTP-gated Beneficiary-360 fetch on the Aggregation Layer (`agg_url`, default http://localhost:8110).\n\n## Before you start\n\n```bash\npython postman/agg-prep.py   # signs the consent object, writes the local environment\n```\n\nImport `OpenG2P-Aggregator.local.postman_environment.json` (generated, gitignored), select it, then run the folders in order. Each request saves what the next one needs.\n\n## Two clocks are running\n\n| | expires |\n|---|---|\n| the consent object | 300s (`replay_freshness_window_sec`) |\n| the OTP | 300s (`otp_ttl_sec`) |\n\nRe-run `agg-prep.py` if a seek comes back `replay`.\n\n## Why Postman cannot do all of it\n\nA consent object is an ES256 compact JWS and Postman's sandbox has no ECDSA, so `agg-prep.py` signs it outside and hands it over as `{{consent_jws}}`. Everything else is plain HTTP.",
+    "description": "The consent-gated, OTP-gated Beneficiary-360 fetch on the Aggregation Layer (`agg_url`, default http://localhost:8110).\n\n## Before you start\n\n```bash\npython postman/agg-prep.py   # signs the consent object, writes the local environment\n```\n\nImport `OpenG2P-Aggregator.local.postman_environment.json` (generated, gitignored), select it, then run the folders in order. Each request saves what the next one needs.\n\n## Two clocks are running\n\n| | expires |\n|---|---|\n| the consent object | 300s (`replay_freshness_window_sec`) |\n| the OTP | 300s (`otp_ttl_sec`) |\n| the subject's token (`access_token`) | 300s (Keycloak) |\n\nRe-run `agg-prep.py` if a seek comes back `replay`. If a request answers `G2P-AUT-401 ... Signature has expired`, send **2 Subject - OTP and release / Get subject token**.\n\n## Why Postman cannot do all of it\n\nA consent object is an ES256 compact JWS and Postman's sandbox has no ECDSA, so `agg-prep.py` signs it outside and hands it over as `{{consent_jws}}`. Everything else is plain HTTP.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "auth": {
@@ -18,6 +18,10 @@
     {
       "key": "agg_url",
       "value": "http://localhost:8110"
+    },
+    {
+      "key": "keycloak_url",
+      "value": "http://localhost:8080"
     },
     {
       "key": "callback_receiver",
@@ -165,6 +169,75 @@
     {
       "name": "2 Subject - OTP and release",
       "item": [
+        {
+          "name": "Get subject token",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/x-www-form-urlencoded"
+              }
+            ],
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                {
+                  "key": "grant_type",
+                  "value": "password"
+                },
+                {
+                  "key": "client_id",
+                  "value": "consent-manager-ui"
+                },
+                {
+                  "key": "username",
+                  "value": "{{subject_id_value}}"
+                },
+                {
+                  "key": "password",
+                  "value": "{{subject_password}}"
+                },
+                {
+                  "key": "scope",
+                  "value": "openid"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{keycloak_url}}/realms/staff/protocol/openid-connect/token",
+              "host": [
+                "{{keycloak_url}}"
+              ],
+              "path": [
+                "realms",
+                "staff",
+                "protocol",
+                "openid-connect",
+                "token"
+              ]
+            },
+            "description": "The subject's Keycloak login, saved as `{{access_token}}` for every request that follows. The token lives 300s: send this again whenever a request answers `G2P-AUT-401 ... Signature has expired`. `subject_password` and `keycloak_url` come from the environment `agg-prep.py` writes."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('token issued (200)', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "const target = pm.environment.name ? pm.environment : pm.collectionVariables;",
+                  "if (j.access_token) { target.set('access_token', j.access_token); }",
+                  "console.log('access_token for ' + pm.variables.get('subject_id_value') + ', expires in ' + j.expires_in + 's');"
+                ]
+              }
+            }
+          ]
+        },
         {
           "name": "Read the OTP (dev only)",
           "request": {
@@ -596,6 +669,183 @@
                 "type": "text/javascript",
                 "exec": [
                   "pm.test('422', () => pm.response.to.have.status(422));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "5 One registry only",
+      "description": "Optional. A Beneficiary-360 seek may name the registries it wants in `registryFilter` (codes from `GET /aggregation/v1/registries`); without it every catalog registry is queried. Send ONE of these instead of folder 1, then run folders 2 and 3. A code that is not in the catalog comes back as a REGISTRY_NOT_CONFIGURED warning; a filter naming no catalog registry is 422 no_registry. Re-run agg-prep.py (and re-import the environment) before EACH seek: a consent object that already carried a seek for other registries is answered 409 consent_object_reused. Not part of a top-to-bottom run: each seek here replaces aggregation_id.",
+      "item": [
+        {
+          "name": "Seek - Farmer only",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{agg_url}}/dci/registry/async/search",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "dci",
+                "registry",
+                "async",
+                "search"
+              ]
+            },
+            "description": "The same seek with `registryFilter: [\"FARMER_REGISTRY\"]`: only that registry is queried and only its scopes are released. Then run folders 2 and 3.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"header\": {\n    \"version\": \"1.0.0\",\n    \"message_id\": \"{{$guid}}\",\n    \"message_ts\": \"{{$isoTimestamp}}\",\n    \"action\": \"search\",\n    \"sender_id\": \"{{partner_audience}}\",\n    \"receiver_id\": \"aggregation-layer\",\n    \"sender_uri\": \"{{callback_url}}\",\n    \"total_count\": 1,\n    \"is_msg_encrypted\": false\n  },\n  \"message\": {\n    \"transaction_id\": \"txn-{{$timestamp}}\",\n    \"search_request\": [\n      {\n        \"reference_id\": \"ref-{{$timestamp}}\",\n        \"timestamp\": \"{{$isoTimestamp}}\",\n        \"search_criteria\": {\n          \"version\": \"1.0.0\",\n          \"query_type\": \"beneficiary360\",\n          \"query\": {\n            \"@context\": \"{{bene360_context}}\",\n            \"foundationalId\": \"{{foundational_id}}\",\n            \"timeframe\": \"Timeframe-Medium\",\n            \"sections\": [\n              \"REGISTRIES\"\n            ],\n            \"registryFilter\": [\n              \"FARMER_REGISTRY\"\n            ],\n            \"correlationId\": \"postman-{{$timestamp}}\"\n          },\n          \"purpose\": {\n            \"code\": \"loan_origination\"\n          },\n          \"authorize\": {\n            \"consent_jws\": \"{{consent_jws}}\"\n          }\n        }\n      }\n    ]\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('accepted (202)', () => pm.response.to.have.status(202));",
+                  "pm.test('only FARMER_REGISTRY planned', () => pm.expect(pm.response.json().registries).to.eql(['FARMER_REGISTRY']));",
+                  "const j = pm.response.json();",
+                  "const target = pm.environment.name ? pm.environment : pm.collectionVariables;",
+                  "if (j.aggregation_id) { target.set('aggregation_id', j.aggregation_id); }",
+                  "if (j.correlation_id) { target.set('correlation_id', j.correlation_id); }",
+                  "console.log('aggregation : ' + j.aggregation_id);",
+                  "console.log('registries  : ' + (j.registries || []).join(', '));",
+                  "console.log('scopes      : ' + (j.accepted_scopes || []).length);",
+                  "console.log('OTP expires : ' + j.otp_expires_at);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Seek - Livestock only",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{agg_url}}/dci/registry/async/search",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "dci",
+                "registry",
+                "async",
+                "search"
+              ]
+            },
+            "description": "The same seek with `registryFilter: [\"LIVESTOCK_REGISTRY\"]`: only that registry is queried and only its scopes are released. Then run folders 2 and 3.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"header\": {\n    \"version\": \"1.0.0\",\n    \"message_id\": \"{{$guid}}\",\n    \"message_ts\": \"{{$isoTimestamp}}\",\n    \"action\": \"search\",\n    \"sender_id\": \"{{partner_audience}}\",\n    \"receiver_id\": \"aggregation-layer\",\n    \"sender_uri\": \"{{callback_url}}\",\n    \"total_count\": 1,\n    \"is_msg_encrypted\": false\n  },\n  \"message\": {\n    \"transaction_id\": \"txn-{{$timestamp}}\",\n    \"search_request\": [\n      {\n        \"reference_id\": \"ref-{{$timestamp}}\",\n        \"timestamp\": \"{{$isoTimestamp}}\",\n        \"search_criteria\": {\n          \"version\": \"1.0.0\",\n          \"query_type\": \"beneficiary360\",\n          \"query\": {\n            \"@context\": \"{{bene360_context}}\",\n            \"foundationalId\": \"{{foundational_id}}\",\n            \"timeframe\": \"Timeframe-Medium\",\n            \"sections\": [\n              \"REGISTRIES\"\n            ],\n            \"registryFilter\": [\n              \"LIVESTOCK_REGISTRY\"\n            ],\n            \"correlationId\": \"postman-{{$timestamp}}\"\n          },\n          \"purpose\": {\n            \"code\": \"loan_origination\"\n          },\n          \"authorize\": {\n            \"consent_jws\": \"{{consent_jws}}\"\n          }\n        }\n      }\n    ]\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('accepted (202)', () => pm.response.to.have.status(202));",
+                  "pm.test('only LIVESTOCK_REGISTRY planned', () => pm.expect(pm.response.json().registries).to.eql(['LIVESTOCK_REGISTRY']));",
+                  "const j = pm.response.json();",
+                  "const target = pm.environment.name ? pm.environment : pm.collectionVariables;",
+                  "if (j.aggregation_id) { target.set('aggregation_id', j.aggregation_id); }",
+                  "if (j.correlation_id) { target.set('correlation_id', j.correlation_id); }",
+                  "console.log('aggregation : ' + j.aggregation_id);",
+                  "console.log('registries  : ' + (j.registries || []).join(', '));",
+                  "console.log('scopes      : ' + (j.accepted_scopes || []).length);",
+                  "console.log('OTP expires : ' + j.otp_expires_at);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Seek - Cropsown only",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{agg_url}}/dci/registry/async/search",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "dci",
+                "registry",
+                "async",
+                "search"
+              ]
+            },
+            "description": "The same seek with `registryFilter: [\"CROPSOWN_REGISTRY\"]`: only that registry is queried and only its scopes are released. Then run folders 2 and 3.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"header\": {\n    \"version\": \"1.0.0\",\n    \"message_id\": \"{{$guid}}\",\n    \"message_ts\": \"{{$isoTimestamp}}\",\n    \"action\": \"search\",\n    \"sender_id\": \"{{partner_audience}}\",\n    \"receiver_id\": \"aggregation-layer\",\n    \"sender_uri\": \"{{callback_url}}\",\n    \"total_count\": 1,\n    \"is_msg_encrypted\": false\n  },\n  \"message\": {\n    \"transaction_id\": \"txn-{{$timestamp}}\",\n    \"search_request\": [\n      {\n        \"reference_id\": \"ref-{{$timestamp}}\",\n        \"timestamp\": \"{{$isoTimestamp}}\",\n        \"search_criteria\": {\n          \"version\": \"1.0.0\",\n          \"query_type\": \"beneficiary360\",\n          \"query\": {\n            \"@context\": \"{{bene360_context}}\",\n            \"foundationalId\": \"{{foundational_id}}\",\n            \"timeframe\": \"Timeframe-Medium\",\n            \"sections\": [\n              \"REGISTRIES\"\n            ],\n            \"registryFilter\": [\n              \"CROPSOWN_REGISTRY\"\n            ],\n            \"correlationId\": \"postman-{{$timestamp}}\"\n          },\n          \"purpose\": {\n            \"code\": \"loan_origination\"\n          },\n          \"authorize\": {\n            \"consent_jws\": \"{{consent_jws}}\"\n          }\n        }\n      }\n    ]\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('accepted (202)', () => pm.response.to.have.status(202));",
+                  "pm.test('only CROPSOWN_REGISTRY planned', () => pm.expect(pm.response.json().registries).to.eql(['CROPSOWN_REGISTRY']));",
+                  "const j = pm.response.json();",
+                  "const target = pm.environment.name ? pm.environment : pm.collectionVariables;",
+                  "if (j.aggregation_id) { target.set('aggregation_id', j.aggregation_id); }",
+                  "if (j.correlation_id) { target.set('correlation_id', j.correlation_id); }",
+                  "console.log('aggregation : ' + j.aggregation_id);",
+                  "console.log('registries  : ' + (j.registries || []).join(', '));",
+                  "console.log('scopes      : ' + (j.accepted_scopes || []).length);",
+                  "console.log('OTP expires : ' + j.otp_expires_at);"
                 ]
               }
             }
