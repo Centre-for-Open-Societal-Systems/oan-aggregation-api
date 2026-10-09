@@ -87,3 +87,29 @@ def test_subject_check_ignores_a_declared_prefix(fixtures):
     for asked, subject in [("FAN-" + fan, fan + "5"), ("FAN-", "FAN-"), ("", "")]:
         with pytest.raises(AggregationError):
             AggregatorService._check_subject({"foundationalId": asked}, subject, same)
+
+
+FARMER = ["FARMER_REGISTRY.farmer_personal_details", "FARMER_REGISTRY.farm_details"]
+LIVESTOCK = ["LIVESTOCK_REGISTRY.livestock_details", "LIVESTOCK_REGISTRY.animal_details"]
+
+
+def test_granted_scopes_are_the_requested_ones_the_permit_covers():
+    granted = AggregatorService._granted_scopes(FARMER + LIVESTOCK, FARMER[:1] + LIVESTOCK)
+    assert granted == FARMER[:1] + LIVESTOCK
+
+
+def test_a_reused_consent_object_is_named_as_such():
+    # The CM returns the first seek's permit (farmer) for a livestock-only seek.
+    with pytest.raises(AggregationError) as caught:
+        AggregatorService._granted_scopes(LIVESTOCK, FARMER)
+    assert (caught.value.status, caught.value.reason) == (409, "consent_object_reused")
+    assert "FARMER_REGISTRY" in caught.value.detail
+    assert "LIVESTOCK_REGISTRY" in caught.value.detail
+
+
+@pytest.mark.parametrize("effective", [None, []])
+def test_a_permit_without_scopes_is_no_scope_permitted(effective):
+    with pytest.raises(AggregationError) as caught:
+        AggregatorService._granted_scopes(LIVESTOCK, effective)
+    assert (caught.value.status, caught.value.reason) == (403, "no_scope_permitted")
+    assert "LIVESTOCK_REGISTRY" in caught.value.detail

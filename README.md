@@ -268,6 +268,7 @@ validation.
 | 403 | CM reason code (`signature_invalid`, `replay`, `expired`, …) | the CM refused the consent object |
 | 403 | `subject_mismatch` | `foundationalId` is not the consent's subject |
 | 403 | `no_scope_permitted` / `no_scope_requested` | nothing of the requested registries is within the consent |
+| 409 | `consent_object_reused` | the consent object already carried a seek for other registries (the CM answers an object once, with its first permit); sign a new one |
 | 422 | `section_not_supported` | only sections without a connected source were asked for |
 | 422 | `no_registry` | `registryFilter` names no registry in the catalog |
 | 401 / 404 / 409 | `unauthenticated`, `not_found`, `wrong_state`, OTP reasons | subject routes |

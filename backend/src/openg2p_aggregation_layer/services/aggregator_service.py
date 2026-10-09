@@ -68,7 +68,7 @@ from ..config import Settings
 from ..db import async_session
 from ..models import AggregationGrant, AggregationRequest, AggregationStatus, GrantStatus
 from ..kafka_bus import TYPE_FANOUT_REQUESTED, bus, envelope
-from ..registry_catalog import get_catalog
+from ..registry_catalog import SCOPE_SEPARATOR, get_catalog
 from .cm_client import CMClient, CMError
 from .otp_provider import OtpError
 from .otp_service import OtpService
@@ -186,12 +186,7 @@ class AggregatorService(BaseService):
                 403, reason,
                 decision.get("detail") or "consent did not permit this request")
 
-        permitted = set(decision.get("effective_data_scopes") or [])
-        granted = [scope for scope in requestable if scope in permitted]
-        if not granted:
-            raise AggregationError(
-                403, "no_scope_permitted",
-                "none of the requested registries' scopes are within the consent")
+        granted = self._granted_scopes(requestable, decision.get("effective_data_scopes"))
 
         subject = decision.get("subject_id") or {}
         self._check_subject(query, subject.get("value"), get_catalog().same_identifier)
@@ -277,6 +272,34 @@ class AggregatorService(BaseService):
         _logger.info("Aggregation %s: pending_otp, %d scope(s) across %s",
                      request.id, len(granted), in_play)
         return request
+
+    @staticmethod
+    def _granted_scopes(requestable: List[str], effective: Optional[List[str]]) -> List[str]:
+        """The requested scope ids the CM's permit covers; never empty.
+
+        The CM answers a consent object once: its first /validate records the
+        permit, and every later /validate of the same object returns that
+        record, whatever scopes are asked for. So a permit naming only scopes
+        outside ``requestable`` (the CM otherwise answers consented ∩ policy ∩
+        requested) means the object already carried a seek for other
+        registries - say so, rather than claim the consent lacks the scopes.
+        """
+        permitted = set(effective or [])
+        granted = [scope for scope in requestable if scope in permitted]
+        if granted:
+            return granted
+        asked = sorted({scope.split(SCOPE_SEPARATOR, 1)[0] for scope in requestable})
+        if permitted:
+            used_for = sorted({scope.split(SCOPE_SEPARATOR, 1)[0] for scope in permitted})
+            raise AggregationError(
+                409, "consent_object_reused",
+                "this consent object already carried a seek for %s; the Consent "
+                "Manager answers a consent object once, so it cannot be used for %s. "
+                "Sign a new consent object for this seek"
+                % (", ".join(used_for), ", ".join(asked)))
+        raise AggregationError(
+            403, "no_scope_permitted",
+            "the consent permits none of the scopes of %s" % ", ".join(asked))
 
     @staticmethod
     def _check_subject(query: Dict[str, Any], subject_value: Optional[str],
