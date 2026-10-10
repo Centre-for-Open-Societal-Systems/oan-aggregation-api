@@ -9,24 +9,33 @@ registry is modified, and consent enforcement stays on for every internal hop.
 Two signatures per call, as in the sync path:
 
 1. a **consent JWS** — the partner-signed consent object. Here the aggregator
-   signs it with the CM key, because on this hop the aggregator *is* the
+   signs it with its own key, because on this hop the aggregator *is* the
    partner. Its public half must be registered in Partner Management and it
-   needs a CM binding per registry, exactly as any partner does. See
-   ``scripts/register-aggregator.py``.
+   needs a CM binding per registry, exactly as any partner does — on lawful
+   basis ``legitimate_interest``, so the CM caps the hop at the binding's
+   ceiling and the subject's consent is enforced by the aggregator before it
+   calls. See ``scripts/register-aggregator.py``.
 2. a **detached envelope signature** over the canonical ``header`` + ``message``.
 
 So the registry validates the aggregator's consent by calling CM's own
 ``/validate`` — the aggregator does not get to mark its own homework.
+
+Everything registry-specific - URL, binding, DCI ``reg_type`` and the
+``id_type`` of the foundational ID - comes from the registry's catalog entry
+(``registry_catalog.py``); nothing about any registry is here. The registry's
+answer is a substring match, so the caller keeps only the records the catalog's
+``search.match`` identifies exactly (``RegistryEntry.identifies``).
 """
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import httpx
 from openg2p_fastapi_common.service import BaseService
 
 from ..config import Settings
+from ..registry_catalog import RegistryEntry
 from ..utils import b64url_encode, canonical_bytes
 from .crypto_service import CryptoService
 
@@ -67,7 +76,7 @@ class RegistryClient(BaseService):
         parts = signing_input.split(".")
         return signing_input + "." + signature, parts[0] + ".." + signature
 
-    def _consent_object(self, cfg: Dict[str, Any], subject_id_type: str,
+    def _consent_object(self, entry: RegistryEntry, subject_id_type: str,
                         subject_id_value: str, scopes: List[str],
                         purpose: Dict[str, Any]) -> str:
         """Mint the consent object this registry's CM binding will accept.
@@ -85,8 +94,8 @@ class RegistryClient(BaseService):
             "@type": "ConsentObject",
             "jti": uuid.uuid4().hex,
             "iss": _config.aggregator_issuer,
-            "aud": cfg["audience"],
-            "data_controller": cfg["controller_id"],
+            "aud": entry.binding.audience,
+            "data_controller": entry.binding.controller_id,
             "subject_id": {"type": subject_id_type, "value": subject_id_value},
             "purpose": purpose or {"code": _config.aggregator_purpose_code,
                                    "text": "aggregated partner fetch"},
@@ -104,16 +113,17 @@ class RegistryClient(BaseService):
 
     # ── the call ────────────────────────────────────────────────────────────
 
-    async def search(self, registry: str, cfg: Dict[str, Any], subject_id_type: str,
-                     subject_id_value: str, query_value: str, scopes: List[str],
+    async def search(self, registry: str, entry: RegistryEntry, subject_id_type: str,
+                     subject_id_value: str, foundational_id: str, scopes: List[str],
                      purpose: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Fetch this registry's records, clamped to ``scopes`` by the registry.
+        """Fetch this registry's records for ``foundational_id``, clamped to
+        ``scopes`` (top-level template blocks) by the registry.
 
         Returns ``reg_records``. Raises RegistryError on anything else, so a
         caller can record one registry's failure without losing the others.
         """
         consent_jws = self._consent_object(
-            cfg, subject_id_type, subject_id_value, scopes, purpose)
+            entry, subject_id_type, subject_id_value, scopes, purpose)
         now = datetime.now(timezone.utc)
         reference_id = "agg-" + uuid.uuid4().hex[:8]
 
@@ -123,7 +133,7 @@ class RegistryClient(BaseService):
             "message_ts": now.isoformat(),
             "action": "search",
             "sender_id": _config.aggregator_sender_id,
-            "receiver_id": cfg.get("receiver_id") or registry,
+            "receiver_id": entry.partner_api.receiver_id,
             "total_count": 1,
             "is_msg_encrypted": False,
         }
@@ -134,13 +144,14 @@ class RegistryClient(BaseService):
                 "timestamp": now.isoformat(),
                 "search_criteria": {
                     "version": "1.0.0",
-                    "reg_type": cfg["reg_type"],
-                    "reg_record_type": cfg["reg_record_type"],
+                    "reg_type": entry.search.reg_type,
+                    "reg_record_type": entry.search.reg_record_type,
                     "query_type": "idtype-value",
                     "query": {"type": "idtype-value",
-                              "value": {"id_type": cfg.get("id_type", "functional_id"),
-                                        "id_value": query_value}},
-                    "pagination": {"page_size": _config.aggregator_page_size,
+                              "value": {"id_type": entry.search.id_type,
+                                        "id_value": foundational_id}},
+                    "pagination": {"page_size": (entry.search.page_size
+                                                 or _config.aggregator_page_size),
                                    "page_number": 1},
                     "authorize": {"consent_jws": consent_jws},
                 },
@@ -149,9 +160,10 @@ class RegistryClient(BaseService):
         _jws, signature = self._jws({"header": header, "message": message})
         body = {"signature": signature, "header": header, "message": message}
 
-        url = cfg["url"].rstrip("/") + "/dci/registry/sync/search"
+        url = entry.partner_api.base_url.rstrip("/") + "/dci/registry/sync/search"
+        timeout = entry.partner_api.timeout_sec or _config.aggregator_registry_timeout
         try:
-            async with httpx.AsyncClient(timeout=_config.aggregator_registry_timeout) as client:
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 response = await client.post(url, json=body)
         except Exception as exc:  # network / timeout
             _logger.exception("Registry '%s' unreachable at %s", registry, url)

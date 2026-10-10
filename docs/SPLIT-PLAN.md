@@ -1,81 +1,81 @@
 # Split plan: Aggregation Layer out of Consent Management
 
-Status: **approved** (2026-10-07). Steps 1 and the aggregator half of step 3 are done in this
-repo; the CM additions (step 2) are next. Nothing has been removed from consent-management.
+Status: **revised** (2026-10-08). The first plan (approved 2026-10-07) added five
+aggregation-specific APIs to the Consent Manager (CM PR #2: `/grants`, `/granted-scopes`,
+`/partners/by-audience`, extra `/validate` fields, a CM → AL webhook). That PR is closed.
+The decision now is:
 
-Source today: `Centre-for-Open-Societal-Systems/consent-management`, branch `main`, commit `260bb0e`
-(aggregator, OTP, Kafka queue, consent grouping). The aggregator currently runs **inside** the
-Consent Manager (CM) process and reads/writes CM tables directly.
+- **The CM contains zero aggregation-specific code.** The in-CM aggregator is removed
+  (consent-management branch `feature/remove-aggregator`).
+- **The Aggregation Layer keeps all its own state in its own Postgres DB** and uses only the
+  CM's generic, pre-existing APIs (docs/CM-API-CONTRACT.md).
 
 ## 1. Target picture
 
 ```
-Partner ──► Aggregation Layer ──► Consent Manager      (validate, raise consent, record grant)
-             │        ▲    │
-             │        │    └──► Farmer / Livestock / Cropsown registries
-             │        │          POST /dci/registry/sync/search  (unchanged)
-             │        └── CM events: consent approved / withdrawn
-             └──► Partner callback  (DCI on-search)
+Partner ──► Aggregation Layer ──► Consent Manager (generic APIs only)
+             │   own DB:            validate, consent-requests, consent status,
+             │   aggregation_requests, partner policy / list
+             │   aggregation_grants ◄── poll: request approved/denied, consent withdrawn
+             │
+             ├──► every registry in the registry catalog (deploy/registries.yaml)
+             │      POST /dci/registry/sync/search (unchanged; each hop validated by the
+             │      CM against an AL binding on lawful_basis legitimate_interest)
+             └──► Partner callback (DCI on-search carrying a Beneficiary-360 response)
 ```
 
-- The Aggregation Layer is its own service, its own database, its own signing key.
-- It talks to the CM **only over HTTP APIs** and receives CM events over a webhook (or Kafka).
-- Registries are not changed. They keep validating every hop with the CM.
+## 2. What lives in this repo
 
-## 2. What moves to this repo
-
-| From `consent-management/backend/src/openg2p_consent_manager/` | Notes |
+| Piece | Notes |
 |---|---|
-| `services/aggregator_service.py` | Rewritten to call the CM over HTTP instead of its tables |
-| `controllers/aggregator_controller.py` | Same routes (`/dci/registry/async/search`, `/aggregation/...`) |
-| `services/field_catalog.py` | As is |
-| `services/registry_client.py` | Signs with the aggregator's **own** key, not the CM key |
-| `models/aggregation.py`, `schemas/aggregation.py` | Table `aggregation_requests` moves to the aggregator DB |
-| `kafka_bus/` (bus, consumers, topics), `worker.py`, `reap.py` | Fan-out + callback retry queue |
-| `services/otp_provider.py`, `otp_publisher.py`, `otp_service.py`, `utils/fayda_otp.py` | **Copied**, see §3 |
-| `postman/OpenG2P-Aggregator.*`, `postman/agg-prep.py`, `postman/callback_receiver.py`, `register-aggregator.py`, `docker-compose.kafka.yml`, `test/kafka/` | As is, endpoints updated |
+| `services/aggregator_service.py`, `controllers/aggregator_controller.py` | `POST /dci/registry/async/search` (Beneficiary-360 query) and the service's own `/aggregation/v1/...` routes (see README) |
+| `services/cm_client.py` | The only place that talks to the CM |
+| `services/cm_poller.py`, `AggregatorService.sync_with_cm` | Reads approval / denial / withdrawal back from the CM |
+| `models/aggregation.py` (`aggregation_requests`), `models/grant.py` (`aggregation_grants`) | Own DB. The grant table replaces the per-registry grant the CM used to record |
+| `registry_catalog.py`, `bene360.py`, `services/registry_client.py` | The registry catalog (YAML, config only), the bene-360 mapping + field-level filter, and the registry hops, signed with the aggregator's own key |
+| `kafka_bus/`, `worker.py`, `reap.py` | Fan-out + callback retry queue; worker and reaper also poll the CM |
+| `services/otp_*.py`, `utils/fayda_otp.py` | Copied from the CM (the CM keeps its own copy for the consent screen) |
 
-## 3. What stays in Consent Management
+## 3. What stays in Consent Management (unchanged behaviour)
 
 - Validation / PDP (`/consent/v1/validate`), incl. the subject-consent check (B8) and the
-  `legitimate_interest` lawful basis. **The Cropsown → Farmer lookup depends on this.**
-- Consent requests, approve / deny / revoke, the OTP on the consent screen.
-- My consents portal + grouping, Decisions, receipts, AWE policy approval.
-- OTP code is needed on **both** sides (CM consent screen, aggregator release). It is copied,
-  not shared; a common library can come later.
+  `legitimate_interest` lawful basis.
+- Consent requests, approve / deny / revoke, the OTP on the consent screen,
+  `required_auth_method`.
+- My consents portal + grouping (consent ← access records), Decisions, receipts, AWE.
 
-## 4. New things the CM must offer (the only CM code changes)
+## 4. Behaviour that changed with this revision
 
-| # | CM API | Replaces (today: direct DB access) |
-|---|---|---|
-| 1 | `/consent/v1/validate` returns `partner_id` + `partner_audience` in the decision | Reading `ConsentArtefact` / `Partner` after validate |
-| 2 | `GET /consent/v1/partners/by-audience/{aud}` (service role) | `select(Partner).where(audience=...)` |
-| 3 | `POST /consent/v1/grants` (service role, aggregator only): record AuthContext + one originated grant per registry binding, reuse an identical live grant | `_mint_grants` writing `AuthContext` + `ConsentArtefact` |
-| 4 | `GET /consent/v1/consent-requests/{id}/granted-scopes` (service role) | Reading the approved artefact after approval |
-| 5 | Outbound event `consent_request.approved` and `consent.withdrawn` (webhook to the aggregator; Kafka optional) | `lifecycle_service` calling `release_for_consent_request`; `consent_service` cancelling in-flight aggregations |
+1. **Registry hops run on `legitimate_interest`.** The CM no longer records a grant per
+   registry for the aggregator; the AL→registry bindings skip B8 and are capped at their
+   policy ceiling. The subject's consent + OTP are enforced by the Aggregation Layer before
+   any registry call (`aggregation_grants`, consent status check).
+2. **Approval / withdrawal are polled**, not pushed. Effect within
+   `AGGREGATION_LAYER_CM_POLL_INTERVAL_SEC`; a withdrawal is also checked right before the
+   fan-out and before the callback.
+3. **Raised consent must be approved within the CM replay window** (300s by default) of the
+   partner object's `issued_at`; later, the aggregation is rejected
+   (`consent_approved_after_replay_window`) and the partner re-seeks.
+4. **My consents** no longer groups per-registry grants under the consent (there are none in
+   the CM); each hop's embedded artefact on the AL binding is a separate row.
+5. **Service account role.** The `aggregation-layer` Keycloak client needs
+   `CONSENT_MANAGER_ADMIN` (the CM's policy read and partner list require it).
+6. **Beneficiary-360 contract, config-only registries** (2026-10-08). The partner's
+   query is an OpenG2P bene-360 request and the callback carries a bene-360 response.
+   Partners consent to scope ids `<registryCode>.<block>` instead of field aliases;
+   the per-field filter moved from code (`field_catalog.py`, removed) to the registry
+   catalog. Every registry, binding and path now lives in `deploy/registries.yaml`:
+   adding one is configuration plus `scripts/register-aggregator.py`.
 
-Existing CM APIs reused as is: `POST /consent/v1/consent-requests` (raise consent),
-`GET /consent/v1/partners/{id}/policy` (`required_auth_method`).
+## 5. Steps
 
-Service-to-service auth: a Keycloak client `aggregation-layer` with a CM service role.
-
-## 5. Things that change behaviour (to agree on)
-
-1. **My consents grouping.** Today the CM joins `aggregation_requests` to show one consent with
-   its registry grants. After the split the CM keeps that grouping from its own data (the grant
-   API stores the aggregation id in the AuthContext); the aggregation status is no longer shown there.
-2. **Withdraw cascade.** Withdrawing a consent cancels in-flight fetches via the event in §4.5.
-   Between the withdraw and the event there is a small window; the registry hop is still denied
-   by the CM because the grant is already revoked.
-3. **New partner identity.** The aggregator gets its own key + PM registration
-   (`PARTNER_AGGREGATION_LAYER`) instead of signing with the CM key.
-
-## 6. Steps (after confirmation)
-
-1. Copy the files in §2 here, keep them running against the CM in-process mode → baseline tests.
-2. Add the 5 CM additions (§4) in `consent-management` on a feature branch.
-3. Switch the aggregator to HTTP + events; own DB; own key.
-4. Run the existing tests: Postman folder 10/12, `verify-aggregated.py`, Kafka consumer test.
-5. Only then remove the aggregator code from `consent-management` (separate PR).
-
-Nothing is removed from `consent-management` until step 5 passes.
+1. ~~Copy the aggregator here~~ (done, PR #2 of this repo).
+2. ~~Add 5 CM APIs~~ — dropped; CM PR closed.
+3. Switch the aggregator to generic CM APIs + own grants + polling (branch
+   `feature/standalone-db`). Verified by `test/e2e/run.sh` against CM `develop` minus the
+   aggregator: real Postgres, both services, fake PM / registry / callback.
+4. Remove the in-CM aggregator (consent-management branch `feature/remove-aggregator`).
+5. Re-run `scripts/register-aggregator.py` (bindings → `legitimate_interest`, AWE approval,
+   60s policy cache), then `scripts/stack-check.py` and the Postman collection on the stack.
+6. Beneficiary-360 request/response + registry catalog (this repo, `develop`). Partner
+   bindings must allow the new scope ids: `scripts/register-aggregator.py --partner <aud>`.

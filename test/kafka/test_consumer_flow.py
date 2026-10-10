@@ -1,12 +1,12 @@
 """Drive the three consumer handlers with a stubbed service and bus.
 
-    ~/agg-venv/bin/python test/kafka/test_consumer_flow.py
+    PYTHONPATH=backend/src python test/kafka/test_consumer_flow.py
 
 No broker and no database, on purpose: this is the part of the queue that is
 pure arithmetic and wiring — which attempt number goes where, whether a retry
 keeps the delivery's message id, whether the last attempt gives up instead of
 looping — and none of it needs infrastructure to be wrong. Run it before
-standing anything up; the end-to-end flow is `./demo-check.sh` plus a seek.
+standing anything up; the end-to-end flow is test/e2e.
 """
 import asyncio
 from datetime import datetime, timezone
@@ -35,7 +35,7 @@ class FakeService:
         calls.append(("fetch", agg_id))
         return {"callback_url": "http://partner/cb",
                 "body": {"header": {"message_id": "m1"}, "message": {}},
-                "results": {"farmer": {"status": "ok"}}}
+                "results": {"REGISTRY_A": {"status": "ok"}}}
     async def deliver_stage(self, agg_id, url, body, attempt):
         calls.append(("deliver", agg_id, attempt))
         return self.deliver_ok

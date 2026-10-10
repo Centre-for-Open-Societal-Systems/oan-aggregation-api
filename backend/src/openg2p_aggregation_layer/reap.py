@@ -3,7 +3,15 @@
 
     python -m openg2p_aggregation_layer.reap
 
-A worker claims a row by moving its status, does the work, then moves it on.
+Two sweeps, one command.
+
+First, consent state is read back from the CM (``sync_with_cm``): parked rows
+whose consent request was decided are released or rejected, and in-flight
+rows whose consent was withdrawn are cancelled. The CM pushes nothing, so a
+deployment that runs no poll loop still converges on every reaper tick.
+
+Second, the stale-claim sweep. A worker claims a row by moving its status,
+does the work, then moves it on.
 Kill it in between and the row keeps a claim nobody holds — and the Kafka
 message, redelivered to its replacement, is correctly refused as already
 claimed. This is the sweep that unsticks that: rows claimed longer ago than
@@ -33,6 +41,8 @@ async def _run() -> int:
     from .kafka_bus.bus import bus
 
     aggregator = AggregatorService.get_component()
+    synced = await aggregator.sync_with_cm()
+    _logger.info("CM sync: %s", synced)
     released = await aggregator.reap_stale_claims()
     if released and _config.kafka_enabled:
         await bus.start()

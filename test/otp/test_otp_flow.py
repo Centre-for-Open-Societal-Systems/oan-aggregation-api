@@ -87,15 +87,15 @@ async def run(provider):
     await expect_error("expired OTP rejected", provider.verify(r, r.otp_debug_code), "otp_expired")
 
     if provider.name == "fayda":
-        # Code bound to one farmer cannot be validated as another.
+        # Code bound to one subject cannot be validated as another.
         r = row("7615076397")
         await provider.issue(r, r.subject_id_value)
         r.subject_id_value = "1111111111"
         try:
             await provider.verify(r, r.otp_debug_code)
-            check("other farmer cannot use the OTP", False)
+            check("other subject cannot use the OTP", False)
         except OtpError as exc:
-            check("other farmer cannot use the OTP", r.otp_verified_at is None
+            check("other subject cannot use the OTP", r.otp_verified_at is None
                   and exc.reason in ("otp_subject_mismatch", "otp_invalid"))
 
 

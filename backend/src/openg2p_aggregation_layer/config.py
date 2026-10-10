@@ -13,10 +13,11 @@ class Settings(BaseSettings):
     openapi_description: str = """
         Aggregation Layer for OpenG2P.
 
-        One partner call naming fields from several registries, gated on the
-        subject's consent (held by the Consent Manager) and, where the
-        partner's policy asks for it, an OTP. The aggregated record is POSTed
-        to the partner's callback as a signed DCI on-search.
+        One partner call for a beneficiary's data across several registries
+        (an OpenG2P Beneficiary-360 request), gated on the subject's consent
+        (held by the Consent Manager) and, where the partner's policy asks for
+        it, an OTP. The Beneficiary-360 response is POSTed to the partner's
+        callback inside a signed DCI on-search.
         """
     openapi_version: str = __version__
 
@@ -45,41 +46,66 @@ class Settings(BaseSettings):
 
     # ── Consent Manager (reached over HTTP only) ────────────────────────────
     # Every consent decision is the CM's: validate, raise a consent request,
-    # record the subject's grant, read what was granted. See
-    # docs/CM-API-CONTRACT.md for the five calls this service depends on.
+    # read its status, read a consent's status. Only the CM's generic APIs are
+    # used - see docs/CM-API-CONTRACT.md. The CM holds nothing for this
+    # service; what the subject authorised per registry hop is kept here
+    # (models/grant.py).
     cm_base_url: str = "http://localhost:8000"
     cm_timeout: float = 15.0
     # Service-to-service auth: Keycloak client-credentials for the
-    # `aggregation-layer` client, which holds the CM service role. A static
-    # token, when set, is sent verbatim instead (dev).
+    # `aggregation-layer` client. Its service account needs the CM admin role
+    # (CONSENT_MANAGER_ADMIN): that is what the CM's policy read and partner
+    # list require today. A static token, when set, is sent verbatim (dev).
     cm_token_url: str = ""
     cm_client_id: str = "aggregation-layer"
     cm_client_secret: str = ""
     cm_static_token: str = ""
-    # Shared secret the CM signs its consent events with (HMAC-SHA256 over
-    # "<timestamp>.<body>"). Empty disables the check - dev only.
-    cm_events_hmac_secret: str = ""
-    cm_events_max_skew_sec: int = 300
+    # CM partner id per partner audience, as JSON: {"partner-x": "<uuid>"}.
+    # The CM's /validate answers with the consent, not the partner, so the
+    # partner is read from the (CM-verified) object's ``aud`` and mapped to its
+    # CM id here. An audience missing from the map is looked up once in the
+    # CM's partner list (GET /consent/v1/partners) and cached.
+    cm_partner_ids: str = ""
+    # How often consent state is read back from the CM: raised consent
+    # requests (approved / denied / expired) and the consent each in-flight
+    # aggregation stands on (withdrawn / expired). Nothing is pushed by the
+    # CM, so this is the delay between a decision there and its effect here.
+    # 0 disables the loop; the reaper still runs one pass per invocation.
+    cm_poll_interval_sec: int = 15
+    # Run the poll loop inside the API process (dev). In production set it
+    # false and let `python -m openg2p_aggregation_layer.worker` poll.
+    cm_poll_in_app: bool = True
+    # A poller that dies holding a row releases it after this long.
+    cm_poll_claim_timeout_sec: int = 120
 
     # ── Caller authentication (Keycloak / OIDC bearer) ──────────────────────
     # Used by the subject-facing routes (verify-otp, status). Same realm the
-    # CM's beneficiary API uses, so a farmer's token works on both.
+    # CM's beneficiary API uses, so a subject's token works on both.
     auth_enabled: bool = True
     auth_issuer: str = ""
     auth_jwks_url: str = ""
     auth_audience: str = ""
     auth_algorithms: list[str] = ["RS256", "ES256", "EdDSA"]
-    auth_admin_role: str = "AGGREGATION_LAYER_ADMIN"
     subject_default_id_type: str = "national_id"
 
+    # ── Registry catalog ────────────────────────────────────────────────────
+    # The YAML file that lists every registry this service may query: where
+    # it is, which CM binding each hop spends, how its record maps onto the
+    # Beneficiary-360 response and which fields may leave this service. Loaded
+    # and validated at startup; an invalid file stops the service. Adding a
+    # registry is an entry there, never a code change. See registry_catalog.py
+    # and deploy/registries.yaml.
+    registry_catalog_path: str = ""
+
     # ── Aggregator: async, OTP-gated, cross-registry fetch ──────────────────
-    # One partner call naming fields from several registries, answered on a
-    # callback once the subject has entered an OTP. The registries' own
+    # One partner call for a beneficiary across several registries, answered
+    # on a callback once the subject has authorised it. The registries' own
     # /dci/registry/sync/search is untouched; the aggregator calls each of them
     # as an ordinary partner, so consent enforcement still applies per hop.
     # Identity the aggregator signs its internal consent objects with. Its
     # public key must be registered in Partner Management and it needs a CM
-    # binding per registry — see scripts/register-aggregator.py.
+    # binding per registry on lawful_basis legitimate_interest — see
+    # scripts/register-aggregator.py.
     aggregator_issuer: str = "aggregation-layer"
     # MUST map to the Partner Management partner holding the aggregator's public
     # key. The registry derives that reference from the DCI header as
@@ -89,6 +115,8 @@ class Settings(BaseSettings):
     # fails with signature_invalid / REQUEST_VALIDATION_ERROR.
     aggregator_sender_id: str = "aggregation-layer"
     aggregator_purpose_code: str = "loan_origination"
+    # Validity of each hop's consent object AND of the per-registry grant
+    # this service records (models/grant.py).
     aggregator_consent_validity_sec: int = 300
     # A per-registry grant is reused, rather than minted again, only while at
     # least this much of its validity is left. A fan-out that retries must not
@@ -98,23 +126,21 @@ class Settings(BaseSettings):
     # park the aggregation until it is approved, instead of refusing the seek
     # with no_subject_consent. False restores the two-step behaviour where the
     # partner must obtain consent out of band before it may call.
+    #
+    # Only reachable when the CM runs with subject_consent_required=true -
+    # otherwise /validate permits on the policy ceiling and never answers
+    # no_subject_consent. On approval the partner's object is validated again
+    # to learn what was granted, so the approval must land within the CM's
+    # replay window (replay_freshness_window_sec, 300s by default) of the
+    # object's issued_at; later, the row is rejected and the partner re-seeks.
     aggregator_raise_consent: bool = True
     # Where the subject's consent screen lives, used to build the consent_url
     # the partner redirects them to. Empty omits the field rather than guessing.
     consent_ui_base_url: str = "http://localhost:3002"
+    # Defaults for a registry hop; a catalog entry may override both.
     aggregator_page_size: int = 10
     aggregator_registry_timeout: float = 30.0
     aggregator_callback_timeout: float = 30.0
-    # reg_type/reg_record_type on the aggregated on-search. The record spans
-    # registries, so neither can honestly be one registry's value.
-    aggregator_reg_type: str = "spdci-extensions-dci:AggregatedRecord"
-    aggregator_reg_record_type: str = "spdci-extensions-dci:AggregatedRecord"
-    # Where each registry lives and which CM binding to spend there, as JSON:
-    #   {"farmer": {"url": "...", "audience": "...", "controller_id": "...",
-    #               "reg_type": "...", "reg_record_type": "...",
-    #               "receiver_id": "...", "id_type": "functional_id"}}
-    # Keys must match the registry prefixes used in services/field_catalog.py.
-    aggregator_registries: str = ""
 
     # ── Kafka (the fan-out and delivery queues) ────────────────────────────
     #
@@ -192,7 +218,7 @@ class Settings(BaseSettings):
     # Mixed into the OTP hash so a stolen database row cannot be brute-forced
     # against a 6-digit space offline. Set this per environment.
     otp_salt: str = "change-me-per-environment"
-    # DEV ONLY. Exposes GET /consent/v1/aggregation/{id}/otp. There is no SMS or
+    # DEV ONLY. Exposes GET /aggregation/v1/requests/{id}/otp. There is no SMS or
     # email gateway in this stack, so the default sender logs the code; this
     # endpoint reports the OTP state alongside it.
     otp_debug_enabled: bool = False
@@ -216,22 +242,13 @@ class Settings(BaseSettings):
     otp_publish_access_key: str = ""
     otp_publish_secret_key: str = ""
 
-    # ── Fayda (OAN mock, g2p_ati_consent_mgt/utils/mock_fayda_otp_api.py) ───
-    # Base URL with no path: the endpoints are /requestData and /getDataAuth.
-    fayda_base_url: str = ""
-    fayda_client_id: str = "demo-client"
-    fayda_client_secret: str = "demo-secret"
-    fayda_version: str = "1.0"
-    # env and domain_uri must match the server's own MOCK_FAYDA_ENV and
-    # MOCK_FAYDA_DOMAIN_URI exactly, or it answers 400 before anything else.
-    fayda_env: str = "prod"
-    fayda_domain_uri: str = "fayda.et"
+    # ── Fayda OTP rules, applied in-process (utils/fayda_otp.py) ────────────
+    # There is no HTTP call to a Fayda service, so no URL or client secret.
     fayda_identifier_type: str = "FIN"
     fayda_otp_channel: str = "PHONE"
     # Only used to render the masked-mobile line in the log, so an
     # operator can see WHERE a real Fayda would have sent the code.
     fayda_demo_phone: str = "0911000055"
-    fayda_timeout: float = 20.0
     # Fayda keys on the individual's Fayda/FIN number, not a Keycloak username,
     # so a demo subject has to be mapped onto one.
     # JSON: {"staff": "6140798523698702"}
@@ -256,25 +273,20 @@ class Settings(BaseSettings):
 
 
     @property
-    def aggregator_registry_map(self) -> dict:
-        """``aggregator_registries`` parsed, with a safe empty default.
-
-        A bad value must not take the whole service down at import time, so a
-        parse failure logs and yields {} — the aggregator then reports
-        'not_configured' per registry instead of 500ing.
-        """
+    def cm_partner_id_map(self) -> dict:
+        """``cm_partner_ids`` parsed; a bad value logs and yields {}."""
         import json
         import logging
 
-        raw = (self.aggregator_registries or "").strip()
+        raw = (self.cm_partner_ids or "").strip()
         if not raw:
             return {}
         try:
             parsed = json.loads(raw)
         except Exception as exc:  # noqa: BLE001
             logging.getLogger(self.logging_default_logger_name).error(
-                "aggregation_layer_aggregator_registries is not valid JSON (%s); "
-                "the aggregator will report every registry as not_configured", exc)
+                "aggregation_layer_cm_partner_ids is not valid JSON (%s); partners "
+                "will be looked up in the CM", exc)
             return {}
         return parsed if isinstance(parsed, dict) else {}
 

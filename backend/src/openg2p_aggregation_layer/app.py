@@ -8,8 +8,9 @@ _config = Settings.get_config()
 
 from openg2p_fastapi_common.app import Initializer as BaseInitializer
 
-from .controllers import AggregatorController, CMEventsController
-from .models import AggregationRequest
+from .controllers import AggregatorController
+from .models import AggregationGrant, AggregationRequest
+from .registry_catalog import CatalogError, get_catalog
 from .services import (
     AggregatorService,
     CMClient,
@@ -26,6 +27,17 @@ class Initializer(BaseInitializer):
     def initialize(self, **kwargs):
         super().initialize(**kwargs)
 
+        # The registry catalog first, and fatally: a service that starts with
+        # a broken catalog fails on the first partner call instead, far from
+        # the cause. The message lists every problem in the file.
+        try:
+            catalog = get_catalog()
+        except CatalogError as exc:
+            _logger.critical("%s", exc)
+            raise
+        _logger.info("Registry catalog %s: %s", _config.registry_catalog_path,
+                     ", ".join(catalog.codes()))
+
         # Services — order matters: a service that calls get_component() in its
         # __init__ must be constructed after its dependencies.
         CryptoService()
@@ -36,7 +48,6 @@ class Initializer(BaseInitializer):
         AggregatorService()  # depends on CMClient, RegistryClient, OtpService
 
         AggregatorController().post_init()
-        CMEventsController().post_init()
 
     # ── the aggregation queue ───────────────────────────────────────────────
     #
@@ -50,6 +61,12 @@ class Initializer(BaseInitializer):
 
     async def fastapi_app_startup(self, app):
         await super().fastapi_app_startup(app)
+        # Consent decisions are read back from the CM, not pushed by it; see
+        # services/cm_poller.py. In production the worker polls instead.
+        if _config.cm_poll_in_app:
+            from .services.cm_poller import poller
+
+            await poller.start()
         if not _config.kafka_enabled:
             return
         from .kafka_bus.bus import bus
@@ -64,6 +81,9 @@ class Initializer(BaseInitializer):
                          "only; run `python -m openg2p_aggregation_layer.worker`")
 
     async def fastapi_app_shutdown(self, app):
+        from .services.cm_poller import poller
+
+        await poller.stop()
         if _config.kafka_enabled:
             from .kafka_bus.bus import bus
             from .kafka_bus.consumers import runner
@@ -78,9 +98,12 @@ class Initializer(BaseInitializer):
 
         async def migrate():
             _logger.info("Migrating aggregation layer database")
-            # A fresh database: the table is created in its current shape, so
-            # none of the ALTERs the CM carried for older schemas apply here.
+            # A fresh database: the tables are created in their current shape,
+            # so none of the ALTERs the CM carried for older schemas apply here.
             await AggregationRequest.create_migrate()
+            # What the subject authorised per registry hop - this service's
+            # own record now that the CM records nothing for it.
+            await AggregationGrant.create_migrate()
 
             from openg2p_fastapi_common.context import dbengine
             from sqlalchemy import text
@@ -100,6 +123,53 @@ class Initializer(BaseInitializer):
                         "CREATE INDEX IF NOT EXISTS "
                         "ix_aggregation_requests_consent_request_id "
                         "ON aggregation_requests (consent_request_id)"
+                    )
+                )
+                # The Beneficiary-360 contract replaced field aliases with
+                # scope ids: the column is renamed rather than re-created, so
+                # history keeps what was asked. Idempotent.
+                await conn.execute(
+                    text(
+                        "DO $$ BEGIN IF EXISTS (SELECT 1 FROM "
+                        "information_schema.columns WHERE table_name = "
+                        "'aggregation_requests' AND column_name = "
+                        "'requested_fields') AND NOT EXISTS (SELECT 1 FROM "
+                        "information_schema.columns WHERE table_name = "
+                        "'aggregation_requests' AND column_name = "
+                        "'requested_scopes') THEN ALTER TABLE "
+                        "aggregation_requests RENAME COLUMN requested_fields "
+                        "TO requested_scopes; END IF; END $$"
+                    )
+                )
+                # Columns added after the first release. create_migrate() does
+                # not ALTER an existing table, so a database created before
+                # carries them here; idempotent on every start.
+                for column, ddl in (
+                    ("consent_jws", "TEXT"),
+                    ("cm_consent_id", "VARCHAR"),
+                    ("grant_ids", "JSONB DEFAULT '{}'::jsonb"),
+                    ("query", "JSONB DEFAULT '{}'::jsonb"),
+                ):
+                    await conn.execute(
+                        text(
+                            "ALTER TABLE aggregation_requests ADD COLUMN IF NOT "
+                            "EXISTS %s %s" % (column, ddl)
+                        )
+                    )
+                await conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "ix_aggregation_requests_cm_consent_id "
+                        "ON aggregation_requests (cm_consent_id)"
+                    )
+                )
+                # The withdrawal sweep and the reuse lookup both start here.
+                await conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "ix_aggregation_grants_reuse "
+                        "ON aggregation_grants (partner_id, subject_id_value, "
+                        "registry, status)"
                     )
                 )
             _logger.info("Database migration complete")

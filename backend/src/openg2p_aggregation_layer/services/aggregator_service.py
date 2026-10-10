@@ -1,8 +1,9 @@
 """Orchestration for the async, OTP-gated, cross-registry fetch.
 
-The partner makes ONE call naming fields from any number of registries. It gets
-an ack straight back; the data arrives later at its callback, and only after the
-subject has entered an OTP.
+The partner makes ONE call - a Beneficiary-360 request for one beneficiary -
+covering any number of registries in the registry catalog. It gets an ack
+straight back; the bene-360 response arrives later at its callback, and only
+after the subject has authorised the release.
 
 Where each check happens, and why:
 
@@ -13,26 +14,42 @@ Where each check happens, and why:
     ceiling, the replay window and the B8 subject-grant narrowing for free, and
     means the aggregator has not invented a second, weaker way to be trusted.
 
-    The aggregator's CM binding carries **field aliases** as its data scopes
-    (``farmer.firstname`` …) rather than registry block names. CM treats scopes
-    as opaque strings, so this needs no CM change and makes
-    ``effective_data_scopes`` mean exactly "the fields this partner may ask
-    for". Requested fields are intersected with it.
+    The partner's CM binding with this service carries **scope ids** -
+    ``<registryCode>.<scope>``, one per top-level block of a registry's record
+    (``registry_catalog.py``). The CM treats scopes as opaque strings, so this
+    needs no CM change, and ``effective_data_scopes`` means exactly "the
+    registry blocks this partner may receive". The query's ``foundationalId``
+    must be the consent's subject: a consent for one person never fetches
+    another.
 
 ``verify_otp``
     The subject's real-time authorisation. Consent says the partner *may* hold
     this data; the OTP says the subject agrees to release it *now*.
 
 ``fan-out``
-    One call per registry, to its unchanged ``/dci/registry/sync/search``, with
-    consent enforcement still on. Registry failures are recorded per registry
-    rather than failing the whole request — a partner asking across three
-    registries should not lose two because one is down.
+    One call per registry, to its unchanged ``/dci/registry/sync/search``,
+    searching by the foundational ID with the catalog's ``id_type``. The
+    registry validates each hop with the CM, which caps it at the aggregator's
+    binding (lawful basis ``legitimate_interest``: the CM seeks no subject
+    grant on the hop). The subject's side of the hop is enforced HERE, before
+    the call: a hop goes out only on an active ``AggregationGrant`` and only
+    while the CM still reports the partner's consent as active. Registry
+    failures are recorded per registry rather than failing the whole request —
+    a partner asking across three registries should not lose two because one
+    is down.
+
+``sync_with_cm``
+    The CM pushes nothing. Approval, denial and withdrawal are read back from
+    its generic APIs by a poll (in the API process, the worker, and every
+    reaper run), and once more right before the fan-out and before the
+    callback, so a decision taken in the CM takes effect here.
 
 ``deliver``
-    The aggregated record is signed and POSTed to the callback in the standard
-    DCI ``on-search`` envelope, so the partner parses it with whatever already
-    handles a sync response. Nothing about the envelope shape is new.
+    Each registry's record is projected to the catalog's allowed fields and
+    mapped onto a bene-360 response (``bene360.py``), which is signed and
+    POSTed to the callback as ``reg_records[0]`` of a standard DCI
+    ``on-search``. A registry that failed, was not consented or is unknown is
+    explained in ``meta.warnings``.
 """
 import asyncio
 import logging
@@ -44,13 +61,14 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from openg2p_fastapi_common.service import BaseService
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 
+from .. import bene360
 from ..config import Settings
 from ..db import async_session
-from ..models import AggregationRequest, AggregationStatus
+from ..models import AggregationGrant, AggregationRequest, AggregationStatus, GrantStatus
 from ..kafka_bus import TYPE_FANOUT_REQUESTED, bus, envelope
-from . import field_catalog
+from ..registry_catalog import SCOPE_SEPARATOR, get_catalog
 from .cm_client import CMClient, CMError
 from .otp_provider import OtpError
 from .otp_service import OtpService
@@ -67,6 +85,20 @@ _MESSAGE_NS = uuid.UUID("6f0f5b1e-6a4e-5a0b-9d2a-0c1f8a3e7b40")
 #: Who holds a claim. Host plus pid is enough to find the process that stopped,
 #: and short enough for the column.
 WORKER_ID = ("%s:%d" % (socket.gethostname(), os.getpid()))[:64]
+
+
+#: Rows whose consent can still be withdrawn from under them. ``pending_consent``
+#: waits on a request the CM has not decided; ``delivering`` has already sent.
+_WITHDRAWABLE = tuple(s.value for s in (
+    AggregationStatus.received, AggregationStatus.pending_otp,
+    AggregationStatus.verified, AggregationStatus.queued,
+    AggregationStatus.fetching, AggregationStatus.fetched))
+
+
+def _aware(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 class AggregationError(Exception):
@@ -99,18 +131,15 @@ class AggregatorService(BaseService):
 
     # ── 1. seek ─────────────────────────────────────────────────────────────
 
-    async def seek(self, *, consent_jws: str, fields: List[str], callback_url: str,
-                   query_value: str, transaction_id: Optional[str],
-                   reference_id: Optional[str],
-                   purpose: Optional[Dict[str, Any]],
-                   registry_queries: Optional[Dict[str, str]] = None) -> AggregationRequest:
+    async def seek(self, *, consent_jws: str, query: Dict[str, Any], callback_url: str,
+                   transaction_id: Optional[str], reference_id: Optional[str],
+                   purpose: Optional[Dict[str, Any]]) -> AggregationRequest:
         """Validate, record, issue the OTP. Returns the row the ack is built from.
 
+        ``query`` is the partner's bene-360 request (already schema-checked).
         Deliberately does NOT fetch anything: the whole point of the flow is
         that no registry is touched until the subject has answered.
         """
-        if not fields:
-            raise AggregationError(400, "no_fields", "requested_fields is empty")
         if not callback_url:
             raise AggregationError(
                 400, "no_callback",
@@ -118,16 +147,26 @@ class AggregatorService(BaseService):
         if not callback_url.lower().startswith(("http://", "https://")):
             raise AggregationError(400, "bad_callback", "sender_uri must be an http(s) URL")
 
-        # Reject unknown aliases loudly and all at once. Dropping them silently
-        # would be indistinguishable from "the farmer has no such data".
-        try:
-            by_registry = field_catalog.resolve(fields)
-        except field_catalog.UnknownFieldError as exc:
-            raise AggregationError(400, "unknown_field", str(exc)) from exc
+        catalog = get_catalog()
+        if "REGISTRIES" not in bene360.requested_sections(query):
+            raise AggregationError(
+                422, "section_not_supported",
+                "only REGISTRIES can be answered; PROGRAMS, DISBURSEMENTS and "
+                "BRIDGE_PROCESSING have no source connected")
+        registries = bene360.planned_registries(catalog, query)
+        if not registries:
+            raise AggregationError(
+                422, "no_registry",
+                "registryFilter names no registry in this service's catalog "
+                "(GET /aggregation/v1/registries)")
+        # Ask the CM only about the blocks of the registries in play. The CM
+        # answers consented ∩ policy ∩ requested, so a scope the partner's
+        # object carries for a registry it filtered out is never released.
+        requestable = catalog.scope_ids(registries)
 
-        # The CM's PDP decides whether this partner may hold these fields.
+        # The CM's PDP decides whether this partner may hold these blocks.
         try:
-            decision = await self.cm.validate(consent_jws, fields)
+            decision = await self.cm.validate(consent_jws, requestable)
         except CMError as exc:
             raise AggregationError(exc.status, exc.reason, exc.detail) from exc
         if decision.get("decision") != "permit":
@@ -139,38 +178,41 @@ class AggregatorService(BaseService):
             # until it is approved.
             if reason == "no_subject_consent" and _config.aggregator_raise_consent:
                 return await self._raise_consent_request(
-                    consent_jws=consent_jws, fields=fields, callback_url=callback_url,
-                    query_value=query_value, transaction_id=transaction_id,
+                    consent_jws=consent_jws, query=query, requestable=requestable,
+                    callback_url=callback_url, transaction_id=transaction_id,
                     reference_id=reference_id, purpose=purpose,
-                    registry_queries=registry_queries, by_registry=by_registry,
                 )
             raise AggregationError(
                 403, reason,
                 decision.get("detail") or "consent did not permit this request")
 
-        permitted = set(decision.get("effective_data_scopes") or [])
-        granted_fields = [f for f in fields if f in permitted]
-        if not granted_fields:
-            raise AggregationError(
-                403, "no_field_permitted",
-                "none of the requested fields are within the consent")
-
-        # Re-resolve against what was actually permitted, so a partially
-        # permitted request only ever fans out to the registries it still needs.
-        by_registry = field_catalog.resolve(granted_fields)
-
-        # Who the partner is comes from the CM's decision (CM API #1), never
-        # from anything in the partner's own body.
-        partner_id = decision.get("partner_id") or ""
-        partner_audience = decision.get("partner_audience")
+        granted = self._granted_scopes(requestable, decision.get("effective_data_scopes"))
 
         subject = decision.get("subject_id") or {}
+        self._check_subject(query, subject.get("value"), get_catalog().same_identifier)
+
+        # Who the partner is: the CM looked the binding up by the object's
+        # ``aud`` and verified the signature against that partner's key, so
+        # after a permit ``aud`` IS the partner - never anything else in the
+        # partner's own body. Its CM id comes from config or the CM's list.
+        partner_audience = self.cm.decode_claims(consent_jws).get("aud")
+        try:
+            partner_id = await self.cm.partner_id_for(partner_audience) or ""
+        except CMError as exc:
+            raise AggregationError(exc.status, exc.reason, exc.detail) from exc
+        if not partner_id:
+            # Not fatal: the OTP check below keeps the factor for an unknown
+            # partner, and nothing else needs the id before release.
+            _logger.warning("No CM partner id for audience '%s'; the OTP is kept",
+                            partner_audience)
+
         request = AggregationRequest(
             partner_id=partner_id,
             partner_audience=partner_audience,
             subject_id_type=subject.get("type", ""),
             subject_id_value=subject.get("value", ""),
-            requested_fields=granted_fields,
+            requested_scopes=granted,
+            query=query,
             purpose=purpose or {},
             transaction_id=transaction_id,
             correlation_id=uuid.uuid4().hex,
@@ -178,14 +220,12 @@ class AggregatorService(BaseService):
             callback_url=callback_url,
             status=AggregationStatus.received.value,
             lawful_basis=decision.get("lawful_basis") or "consent",
-            registry_results={"query_value": query_value,
-                              "registry_queries": registry_queries or {},
-                              "registries": sorted(by_registry),
-                              # The CM record this permit was minted as. Sent
-                              # back with the grants so My consents can group
-                              # them under the consent they came from.
-                              "validated_consent_id": decision.get("consent_id")},
+            # The CM record this permit was minted as. The CM revokes it with
+            # the subject's consent, so its status is how a withdrawal is seen.
+            cm_consent_id=decision.get("consent_id"),
+            registry_results={},
         )
+        in_play = sorted(catalog.split_scope_ids(granted))
 
         # An internal partner is never sent to find a subject who can enter a
         # code: under legitimate_interest there is no consent screen and nobody
@@ -198,9 +238,8 @@ class AggregatorService(BaseService):
                 await session.commit()
                 await session.refresh(request)
             _logger.info("Aggregation %s: lawful_basis=%s, no consent sought - "
-                         "%d field(s) across %s on the policy ceiling alone",
-                         request.id, request.lawful_basis,
-                         len(granted_fields), sorted(by_registry))
+                         "%d scope(s) across %s on the policy ceiling alone",
+                         request.id, request.lawful_basis, len(granted), in_play)
             await self._mint_grants(request)
             await self.enqueue_fan_out(request.id)
             return request
@@ -222,52 +261,107 @@ class AggregatorService(BaseService):
 
         if not request.otp_required:
             # Everything verify_otp would have done on a correct code. The grant
-            # is not optional: without it the aggregator holds a policy ceiling
-            # and no subject grant, and B8 denies every registry.
-            _logger.info("Aggregation %s: no OTP required by policy, %d field(s) "
+            # is not optional: no registry is called without one.
+            _logger.info("Aggregation %s: no OTP required by policy, %d scope(s) "
                          "across %s - fanning out now",
-                         request.id, len(granted_fields), sorted(by_registry))
+                         request.id, len(granted), in_play)
             await self._mint_grants(request)
             await self.enqueue_fan_out(request.id)
             return request
 
-        _logger.info("Aggregation %s: pending_otp, %d field(s) across %s",
-                     request.id, len(granted_fields), sorted(by_registry))
+        _logger.info("Aggregation %s: pending_otp, %d scope(s) across %s",
+                     request.id, len(granted), in_play)
         return request
+
+    @staticmethod
+    def _granted_scopes(requestable: List[str], effective: Optional[List[str]]) -> List[str]:
+        """The requested scope ids the CM's permit covers; never empty.
+
+        The CM answers a consent object once: its first /validate records the
+        permit, and every later /validate of the same object returns that
+        record, whatever scopes are asked for. So a permit naming only scopes
+        outside ``requestable`` (the CM otherwise answers consented ∩ policy ∩
+        requested) means the object already carried a seek for other
+        registries - say so, rather than claim the consent lacks the scopes.
+        """
+        permitted = set(effective or [])
+        granted = [scope for scope in requestable if scope in permitted]
+        if granted:
+            return granted
+        asked = sorted({scope.split(SCOPE_SEPARATOR, 1)[0] for scope in requestable})
+        if permitted:
+            used_for = sorted({scope.split(SCOPE_SEPARATOR, 1)[0] for scope in permitted})
+            raise AggregationError(
+                409, "consent_object_reused",
+                "this consent object already carried a seek for %s; the Consent "
+                "Manager answers a consent object once, so it cannot be used for %s. "
+                "Sign a new consent object for this seek"
+                % (", ".join(used_for), ", ".join(asked)))
+        raise AggregationError(
+            403, "no_scope_permitted",
+            "the consent permits none of the scopes of %s" % ", ".join(asked))
+
+    @staticmethod
+    def _check_subject(query: Dict[str, Any], subject_value: Optional[str],
+                       same=None) -> None:
+        """The beneficiary asked about must be the one who consented.
+
+        The registries are searched by ``foundationalId``, and on the hop the
+        CM checks the aggregator's binding, not the subject. So this is the
+        only place that stops a partner holding one person's consent from
+        fetching another person's record. ``same`` compares two spellings of
+        one ID (``RegistryCatalog.same_identifier``: "FAN-1234" is "1234");
+        without it the values must be equal.
+        """
+        asked = query.get("foundationalId")
+        same = same or (lambda a, b: bool(a) and a == b)
+        if not subject_value or not same(asked, subject_value):
+            raise AggregationError(
+                403, "subject_mismatch",
+                "foundationalId must be the consent object's subject_id.value")
 
     # ── 1b. raise the consent the subject was never asked for ───────────────
 
-    async def _raise_consent_request(self, *, consent_jws: str, fields: List[str],
-                                     callback_url: str, query_value: str,
+    async def _raise_consent_request(self, *, consent_jws: str, query: Dict[str, Any],
+                                     requestable: List[str], callback_url: str,
                                      transaction_id: Optional[str],
                                      reference_id: Optional[str],
-                                     purpose: Optional[Dict[str, Any]],
-                                     registry_queries: Optional[Dict[str, str]],
-                                     by_registry) -> AggregationRequest:
+                                     purpose: Optional[Dict[str, Any]]
+                                     ) -> AggregationRequest:
         """Park the aggregation and ask the subject, once, on the consent screen.
 
         Reading the claims unverified is safe *here specifically*: the subject
         grant is the last check ``validate`` performs, so a ``no_subject_consent``
         deny means the signature, the partner, the policy ceiling and the replay
         window have all already passed. Nothing is released on these claims —
-        they only decide who to ask.
+        they only decide who to ask, and for what.
+
+        The partner's object is kept on the row until the request is decided:
+        on approval it is validated once more, which is how the granted scopes
+        are learnt (see ``_release``).
         """
         claims = self.cm.decode_claims(consent_jws)
         subject = claims.get("subject_id") or {}
         audience = claims.get("aud")
+        self._check_subject(query, subject.get("value"), get_catalog().same_identifier)
+
+        # Ask for exactly what the partner's object names within the
+        # registries in play; the subject decides how much of it to grant.
+        wanted = set(claims.get("data_scopes") or [])
+        scopes = [scope for scope in requestable if scope in wanted]
+        if not scopes:
+            raise AggregationError(
+                403, "no_scope_requested",
+                "the consent object names no scope of the requested registries")
 
         try:
-            partner = await self.cm.partner_by_audience(audience)
+            partner_id = await self.cm.partner_id_for(audience)
         except CMError as exc:
             raise AggregationError(exc.status, exc.reason, exc.detail) from exc
-        if partner is None:
+        if not partner_id:
             raise AggregationError(403, "unknown_partner",
                                    "no CM binding for audience '%s'" % audience)
-        partner_id = partner["id"]
-        partner_audience = partner.get("audience") or audience
 
-        # Ask for exactly what the partner asked for; the subject decides how
-        # much of it to grant on the screen.
         try:
             consent_request = await self.cm.create_consent_request(
                 subject_id={"type": subject.get("type", ""),
@@ -275,7 +369,7 @@ class AggregatorService(BaseService):
                 partner_id=partner_id,
                 purpose=purpose or claims.get("purpose") or {
                     "code": _config.aggregator_purpose_code},
-                requested_scopes=fields,
+                requested_scopes=scopes,
             )
         except CMError as exc:
             raise AggregationError(exc.status, "consent_request_failed",
@@ -283,20 +377,20 @@ class AggregatorService(BaseService):
 
         request = AggregationRequest(
             partner_id=partner_id,
-            partner_audience=partner_audience,
+            partner_audience=audience,
             subject_id_type=subject.get("type", ""),
             subject_id_value=subject.get("value", ""),
-            requested_fields=fields,
+            requested_scopes=scopes,
+            query=query,
             purpose=purpose or {},
             transaction_id=transaction_id,
             correlation_id=uuid.uuid4().hex,
             reference_id=reference_id,
             callback_url=callback_url,
             consent_request_id=consent_request["id"],
+            consent_jws=consent_jws,
             status=AggregationStatus.pending_consent.value,
-            registry_results={"query_value": query_value,
-                              "registry_queries": registry_queries or {},
-                              "registries": sorted(by_registry)},
+            registry_results={},
         )
         async with async_session()() as session:
             session.add(request)
@@ -305,74 +399,225 @@ class AggregatorService(BaseService):
 
         _logger.info(
             "Aggregation %s: no consent for %s yet - raised consent request %s "
-            "(%d field(s)); waiting on the consent screen",
-            request.id, request.subject_id_value, consent_request["id"], len(fields))
+            "(%d scope(s)); waiting on the consent screen",
+            request.id, request.subject_id_value, consent_request["id"], len(scopes))
         return request
 
-    async def release_for_consent_request(self, consent_request_id: str) -> None:
-        """A consent request was just approved — release whatever was waiting.
+    # ── 1c. read consent state back from the CM ─────────────────────────────
+    #
+    # The CM tells nobody when a consent request is decided or a consent is
+    # withdrawn; both are read from its generic APIs. sync_with_cm is one pass
+    # over everything that can change because of such a decision. It is run
+    # by the poll loop (API process and/or worker, cm_poll_interval_sec) and
+    # once per reaper run. Every step is idempotent and a parked row is claimed
+    # before it is worked on, so any number of pollers may run at once.
 
-        Called on the CM's ``consent_request.approved`` event (CM API #5).
-        Silent when nothing is waiting, which is the normal case for a consent
-        raised by hand. Safe to receive twice: only ``pending_consent`` rows
-        are picked up, and the first delivery moves them out of it.
+    async def sync_with_cm(self) -> Dict[str, int]:
+        """One pass: release / reject parked rows, cancel withdrawn ones."""
+        resolved = await self._sync_parked()
+        withdrawn = await self._sync_in_flight()
+        return {"parked_resolved": resolved, "withdrawn": withdrawn}
+
+    async def _claim_for_sync(self, request_id: str, status: str) -> bool:
+        """Claim one row for this poller, unless another holds a live claim."""
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            seconds=_config.cm_poll_claim_timeout_sec)
+        async with async_session()() as session:
+            result = await session.execute(
+                update(AggregationRequest)
+                .where(AggregationRequest.id == request_id,
+                       AggregationRequest.status == status,
+                       or_(AggregationRequest.claimed_at.is_(None),
+                           AggregationRequest.claimed_at < cutoff))
+                .values(claimed_by=WORKER_ID, claimed_at=datetime.now(timezone.utc)))
+            await session.commit()
+            return (result.rowcount or 0) > 0
+
+    async def _unclaim(self, request_id: str) -> None:
+        async with async_session()() as session:
+            await session.execute(
+                update(AggregationRequest)
+                .where(AggregationRequest.id == request_id,
+                       AggregationRequest.status == AggregationStatus.pending_consent.value,
+                       AggregationRequest.claimed_by == WORKER_ID)
+                .values(claimed_by=None, claimed_at=None))
+            await session.commit()
+
+    async def _sync_parked(self) -> int:
+        """Rows waiting on a raised consent request: has the CM decided it?"""
+        async with async_session()() as session:
+            ids = list((await session.execute(
+                select(AggregationRequest.id).where(
+                    AggregationRequest.status == AggregationStatus.pending_consent.value)
+            )).scalars().all())
+        resolved = 0
+        for request_id in ids:
+            if not await self._claim_for_sync(
+                    request_id, AggregationStatus.pending_consent.value):
+                continue
+            try:
+                if await self._resolve_parked(request_id):
+                    resolved += 1
+            except CMError as exc:
+                # Unreachable CM: the row stays parked and the next pass asks
+                # again. Never guessed at.
+                _logger.warning("Aggregation %s: consent request not checked - %s %s",
+                                request_id, exc.reason, exc.detail)
+            finally:
+                await self._unclaim(request_id)
+        return resolved
+
+    async def _resolve_parked(self, request_id: str) -> bool:
+        """Release or reject one parked row from its consent request's status.
+
+        True when the row left ``pending_consent``.
         """
         async with async_session()() as session:
-            rows = await session.execute(
-                select(AggregationRequest).where(
-                    AggregationRequest.consent_request_id == consent_request_id,
-                    AggregationRequest.status == AggregationStatus.pending_consent.value,
-                )
-            )
-            waiting = rows.scalars().all()
-        if not waiting:
+            row = await session.get(AggregationRequest, request_id)
+        if row is None or row.status != AggregationStatus.pending_consent.value:
+            return False
+
+        consent_request = await self.cm.get_consent_request(row.consent_request_id)
+        if consent_request is None:
+            await self._reject(row.id, "consent_request_missing")
+            return True
+        status = consent_request.get("status")
+        if status in ("denied", "expired"):
+            await self._reject(row.id, "consent_%s" % status)
+            _logger.info("Aggregation %s: consent request %s was %s",
+                         row.id, row.consent_request_id, status)
+            return True
+        if status != "approved":
+            return False
+        await self._release(row, consent_request)
+        return True
+
+    async def _release(self, row, consent_request: Dict[str, Any]) -> None:
+        """A consent request was approved — release the row it was raised for.
+
+        What the subject granted is not on the consent request. It is learnt
+        the way any partner learns it: by asking the CM's /validate again with
+        the partner's own consent object, which the CM now narrows to the
+        subject's grant (B8). That also yields the CM consent record whose
+        status says, later, whether the subject has withdrawn.
+
+        The CM refuses an object issued more than its replay window ago
+        (300s by default). An approval that lands after that cannot be turned
+        into a granted scope set from here, so the row is rejected and the
+        partner re-seeks with a fresh object - which the CM then permits
+        directly on the grant the subject just gave.
+        """
+        decision = await self.cm.validate(row.consent_jws or "",
+                                          list(row.requested_scopes or []))
+        if decision.get("decision") != "permit":
+            reason = str(decision.get("reason_code") or "deny")
+            if reason == "replay":
+                reason = "consent_approved_after_replay_window"
+            await self._reject(row.id, reason)
+            _logger.info("Aggregation %s: approved, but the partner's object no "
+                         "longer validates (%s); the partner must seek again",
+                         row.id, reason)
             return
 
-        # What the subject actually granted is the ceiling now, exactly as it
-        # would have been had the consent existed when the partner called
-        # (CM API #4). If the CM cannot be reached this raises and the rows
-        # stay parked; the event is retried rather than guessed at.
-        consent_request = await self.cm.granted_scopes(consent_request_id) or {}
-        granted = set(consent_request.get("granted_scopes") or [])
+        granted = set(decision.get("effective_data_scopes") or [])
+        kept = [s for s in (row.requested_scopes or []) if s in granted]
+        if not kept:
+            await self._reject(row.id, "no_scope_granted")
+            _logger.info("Aggregation %s: subject granted none of the requested "
+                         "scopes", row.id)
+            return
 
-        for row in waiting:
-            kept = [f for f in (row.requested_fields or []) if f in granted]
-            async with async_session()() as session:
-                request = await session.get(AggregationRequest, row.id)
-                if not kept:
-                    request.status = AggregationStatus.rejected.value
-                    request.failure_reason = "no_field_granted"
-                    await session.commit()
-                    _logger.info("Aggregation %s: subject granted none of the "
-                                 "requested fields", row.id)
-                    continue
-                request.requested_fields = kept
-                request.status = AggregationStatus.verified.value
-                # Whatever the subject answered on the consent screen IS the
-                # authentication behind this release; carry its timestamp so the
-                # grants minted below point at when it happened. A screen that
-                # took an id_token instead leaves otp_verified_at NULL, and the
-                # grant is then recorded as consent-backed rather than OTP-backed.
-                verified_at = consent_request.get("otp_verified_at")
-                request.otp_verified_at = (
-                    datetime.fromisoformat(verified_at) if verified_at else None)
-                request.otp_required = bool(verified_at)
-                request.otp_channel = consent_request.get("otp_channel")
-                request.otp_provider = consent_request.get("otp_provider")
+        # Whatever the subject answered on the consent screen IS the
+        # authentication behind this release. A screen that took an id_token
+        # instead leaves otp_verified_at empty, and the grants are then
+        # recorded as consent-backed rather than OTP-backed.
+        verified_at = consent_request.get("otp_verified_at")
+        async with async_session()() as session:
+            request = await session.get(AggregationRequest, row.id)
+            if request.status != AggregationStatus.pending_consent.value:
+                return
+            request.requested_scopes = kept
+            request.cm_consent_id = decision.get("consent_id")
+            request.lawful_basis = decision.get("lawful_basis") or "consent"
+            request.otp_verified_at = (
+                datetime.fromisoformat(verified_at) if verified_at else None)
+            request.otp_required = bool(verified_at)
+            request.otp_channel = consent_request.get("otp_channel")
+            request.consent_jws = None   # spent; not kept past the decision
+            request.status = AggregationStatus.verified.value
+            request.claimed_by = None
+            request.claimed_at = None
+            await session.commit()
+            await session.refresh(request)
+
+        await self._mint_grants(request)
+        await self.enqueue_fan_out(request.id)
+        _logger.info("Aggregation %s: released by consent request %s (%d scope(s))",
+                     request.id, request.consent_request_id, len(kept))
+
+    async def _sync_in_flight(self) -> int:
+        """Rows not yet delivered: is the consent they stand on still active?
+
+        One CM call per distinct consent, however many rows share it.
+        """
+        async with async_session()() as session:
+            rows = (await session.execute(
+                select(AggregationRequest.id, AggregationRequest.cm_consent_id).where(
+                    AggregationRequest.status.in_(_WITHDRAWABLE),
+                    AggregationRequest.lawful_basis == "consent",
+                    AggregationRequest.cm_consent_id.isnot(None))
+            )).all()
+        consent_ids = sorted({consent_id for _id, consent_id in rows})
+
+        cancelled = 0
+        for consent_id in consent_ids:
+            try:
+                status = await self.cm.consent_status(consent_id)
+            except CMError as exc:
+                _logger.warning("Consent %s not checked - %s %s",
+                                consent_id, exc.reason, exc.detail)
+                continue
+            if status == "active":
+                continue
+            reason = ("consent_withdrawn" if status == "revoked"
+                      else "consent_%s" % (status or "unknown"))
+            cancelled += await self.cancel_for_withdrawal(consent_id, reason=reason)
+        return cancelled
+
+    async def consent_still_active(self, request) -> bool:
+        """The check made right before the fan-out and before the callback.
+
+        A row on a non-consent basis stands on no consent. A consent-basis row
+        with no CM record to check is treated as withdrawn: failing open here
+        would release data on nothing. Raises CMError when the CM cannot say.
+        """
+        if (request.lawful_basis or "consent") != "consent":
+            return True
+        if not request.cm_consent_id:
+            return False
+        return (await self.cm.consent_status(request.cm_consent_id)) == "active"
+
+    async def _reject(self, request_id: str, reason: str) -> None:
+        async with async_session()() as session:
+            row = await session.get(AggregationRequest, request_id)
+            if row is not None and row.status not in (
+                    AggregationStatus.delivered.value, AggregationStatus.delivering.value):
+                row.status = AggregationStatus.rejected.value
+                row.failure_reason = reason
+                row.consent_jws = None
+                row.claimed_by = None
+                row.claimed_at = None
+                row.next_retry_at = None
                 await session.commit()
-                await session.refresh(request)
-
-            await self._mint_grants(request)
-            await self.enqueue_fan_out(request.id)
-            _logger.info("Aggregation %s: released by consent request %s (%d field(s))",
-                         request.id, consent_request_id, len(kept))
 
     # ── 2. verify ───────────────────────────────────────────────────────────
 
-    async def verify_otp(self, request_id: str, code: str) -> AggregationRequest:
+    async def _verify_otp(self, request_id: str, code: str) -> AggregationRequest:
         """Check the code and, on success, start the fan-out in the background.
 
-        The caller gets an immediate answer; delivery happens on the callback.
+        Only ever reached through ``verify_for_subject``, which has already
+        established that the caller is the subject. The caller gets an
+        immediate answer; delivery happens on the callback.
         """
         async with async_session()() as session:
             request = await session.get(AggregationRequest, request_id)
@@ -402,148 +647,172 @@ class AggregatorService(BaseService):
             await session.refresh(request)
 
         # The OTP the subject just entered IS their grant for this fetch. Mint
-        # it before fanning out, or every registry will deny the aggregator
-        # with no_subject_consent.
+        # it before fanning out: no registry is called without one.
         await self._mint_grants(request)
 
         await self.enqueue_fan_out(request.id)
         return request
 
     async def _mint_grants(self, request) -> None:
-        """Record the subject's authentication as an originated grant per binding.
+        """Record the subject's authorisation as a grant per registry hop.
 
-        Without this the aggregator is an unknown quantity to the PDP: it holds
-        a policy ceiling but no subject grant, and B8 denies it at every
-        registry. Rather than exempt the aggregator - which would leave a path
-        to registry data that the subject never touched - what the subject
-        actually did is written down, by the CM, as what it actually is.
+        The registries validate each hop with the CM, where the aggregator's
+        bindings run on ``legitimate_interest``: the CM caps the hop at the
+        binding's policy ceiling and looks for no subject grant. So the
+        subject's side of the hop is held here, and no registry is called
+        without an active grant (``_query_registries``).
 
         ``auth_method`` follows ``request.otp_required``: "otp" when a code was
         answered, "consent" when the partner's policy asked for none and the
-        subject's standing grant is the whole of the authority. Recording
-        "otp" in the second case would put an act in the audit trail that never
-        happened.
+        subject's standing consent is the whole of the authority, "none" under
+        legitimate_interest. Recording "otp" in the second case would put an
+        act in the audit trail that never happened.
 
-        The CM writes one AuthContext for the request and one grant per
-        registry binding (CM API #3). Reuse is the CM's call too: the newest
-        live grant is reused only when scopes, purpose, method and lawful basis
-        all match exactly and at least ``reuse_min_remaining_sec`` is left.
+        A live grant is reused rather than written again only when partner,
+        subject, registry, scopes, purpose, method, lawful basis and the CM
+        consent it stands on all match exactly, and at least
+        ``aggregator_grant_reuse_min_remaining_sec`` of it is left.
         """
         basis = getattr(request, "lawful_basis", "consent") or "consent"
         method = ("otp" if request.otp_required
                   else "consent" if basis == "consent" else "none")
-        by_registry = field_catalog.resolve(request.requested_fields)
+        purpose = request.purpose or {"code": _config.aggregator_purpose_code}
+        catalog = get_catalog()
+        by_registry = catalog.split_scope_ids(request.requested_scopes)
         now = datetime.now(timezone.utc)
         valid_until = now + timedelta(seconds=_config.aggregator_consent_validity_sec)
+        reuse_floor = now + timedelta(
+            seconds=_config.aggregator_grant_reuse_min_remaining_sec)
 
-        bindings = []
-        for registry, specs in sorted(by_registry.items()):
-            cfg = _config.aggregator_registry_map.get(registry)
-            if not cfg:
-                continue
-            bindings.append({"registry": registry,
-                             "audience": cfg.get("audience"),
-                             "scopes": field_catalog.scopes_for(specs)})
+        grant_ids: Dict[str, str] = {}
+        minted, reused = [], []
+        async with async_session()() as session:
+            for registry, scopes in sorted(by_registry.items()):
+                entry = catalog.get(registry)
+                candidates = (await session.execute(
+                    select(AggregationGrant).where(
+                        AggregationGrant.partner_id == request.partner_id,
+                        AggregationGrant.subject_id_type == request.subject_id_type,
+                        AggregationGrant.subject_id_value == request.subject_id_value,
+                        AggregationGrant.registry == registry,
+                        AggregationGrant.status == GrantStatus.active.value,
+                        AggregationGrant.auth_method == method,
+                        AggregationGrant.lawful_basis == basis,
+                        AggregationGrant.valid_until >= reuse_floor)
+                    .order_by(AggregationGrant.created_at.desc())
+                )).scalars().all()
+                match = next((g for g in candidates
+                              if sorted(g.scopes or []) == scopes
+                              and (g.purpose or {}) == purpose
+                              and g.cm_consent_id == request.cm_consent_id), None)
+                if match is not None:
+                    grant_ids[registry] = match.id
+                    reused.append(registry)
+                    continue
+                grant = AggregationGrant(
+                    partner_id=request.partner_id,
+                    partner_audience=request.partner_audience,
+                    subject_id_type=request.subject_id_type,
+                    subject_id_value=request.subject_id_value,
+                    registry=registry,
+                    registry_audience=entry.binding.audience,
+                    scopes=scopes,
+                    purpose=purpose,
+                    auth_method=method,
+                    auth_timestamp=_aware(request.otp_verified_at) or now,
+                    otp_channel=request.otp_channel,
+                    lawful_basis=basis,
+                    cm_consent_id=request.cm_consent_id,
+                    consent_request_id=request.consent_request_id,
+                    aggregation_id=request.id,
+                    valid_until=valid_until,
+                    status=GrantStatus.active.value,
+                )
+                session.add(grant)
+                grant_ids[registry] = grant.id
+                minted.append(registry)
 
-        result = await self.cm.record_grants({
-            "aggregation_id": request.id,
-            "subject_id": {"type": request.subject_id_type,
-                           "value": request.subject_id_value},
-            "issuer": _config.aggregator_issuer,
-            "auth_method": method,
-            "auth_timestamp": (request.otp_verified_at or now).isoformat(),
-            "lawful_basis": basis,
-            "otp_channel": request.otp_channel,
-            "purpose": request.purpose or {"code": _config.aggregator_purpose_code},
-            "valid_until": valid_until.isoformat(),
-            "reuse_min_remaining_sec": _config.aggregator_grant_reuse_min_remaining_sec,
-            "bindings": bindings,
-            "consent_request_id": request.consent_request_id,
-            "root_consent_id": (request.registry_results or {}).get("validated_consent_id"),
-        }) or {}
-        for skipped in result.get("skipped") or []:
-            _logger.warning("Aggregation %s: no CM binding for %s (%s); it will "
-                            "deny with unknown_partner", request.id,
-                            skipped.get("registry"), skipped.get("reason"))
+            row = await session.get(AggregationRequest, request.id)
+            if row is not None:
+                row.grant_ids = grant_ids
+            await session.commit()
+        request.grant_ids = grant_ids
         _logger.info("Aggregation %s: %s-backed grants minted for %s (valid %ss), "
-                     "reused for %s",
-                     request.id, method, result.get("minted"),
-                     _config.aggregator_consent_validity_sec, result.get("reused"))
+                     "reused for %s", request.id, method, minted,
+                     _config.aggregator_consent_validity_sec, reused)
 
-    async def cancel_for_withdrawal(self, *, partner_id: str, subject_id_type: str,
-                                    subject_id_value: str) -> int:
-        """The subject withdrew consent to this partner: stop what is in flight.
+    async def _active_grant(self, request, registry: str) -> Optional[AggregationGrant]:
+        """The grant this fetch spends at ``registry``, if it is still good."""
+        grant_id = (request.grant_ids or {}).get(registry)
+        if not grant_id:
+            return None
+        async with async_session()() as session:
+            grant = await session.get(AggregationGrant, grant_id)
+            if grant is None or grant.status != GrantStatus.active.value:
+                return None
+            if _aware(grant.valid_until) <= datetime.now(timezone.utc):
+                grant.status = GrantStatus.expired.value
+                await session.commit()
+                return None
+            return grant
 
-        Called on the CM's ``consent.withdrawn`` event (CM API #5), which the
-        CM sends only when no other live consent to the same partner remains.
-        ``pending_consent`` waits on a different, not-yet-approved request and
-        ``delivering`` has already sent, so neither is touched. A fetch that
-        starts between the withdraw and this event is still denied at the
-        registry, because the CM has already revoked the grant.
+    async def cancel_for_withdrawal(self, consent_id: str,
+                                    reason: str = "consent_withdrawn") -> int:
+        """The CM no longer reports this consent as active: stop what stands on it.
+
+        Every aggregation not yet delivered that stands on ``consent_id`` is
+        rejected, and every grant minted from it is revoked, so a queued or
+        retrying fan-out finds nothing to spend. ``pending_consent`` stands on
+        no consent yet and ``delivering`` has already sent, so neither is
+        touched. Each fan-out stage claims its row by status, so a rejected
+        row is skipped by fetch, delivery and every retry.
         """
-        cancellable = tuple(s.value for s in (
-            AggregationStatus.received, AggregationStatus.pending_otp,
-            AggregationStatus.verified, AggregationStatus.queued,
-            AggregationStatus.fetching, AggregationStatus.fetched))
+        now = datetime.now(timezone.utc)
         async with async_session()() as session:
             result = await session.execute(
                 update(AggregationRequest)
-                .where(AggregationRequest.partner_id == partner_id,
-                       AggregationRequest.subject_id_type == subject_id_type,
-                       AggregationRequest.subject_id_value == subject_id_value,
-                       AggregationRequest.status.in_(cancellable))
+                .where(AggregationRequest.cm_consent_id == consent_id,
+                       AggregationRequest.status.in_(_WITHDRAWABLE))
                 .values(status=AggregationStatus.rejected.value,
-                        failure_reason="consent_withdrawn",
+                        failure_reason=reason,
                         claimed_by=None, claimed_at=None, next_retry_at=None))
+            revoked = await session.execute(
+                update(AggregationGrant)
+                .where(AggregationGrant.cm_consent_id == consent_id,
+                       AggregationGrant.status == GrantStatus.active.value)
+                .values(status=GrantStatus.revoked.value, revoked_at=now,
+                        revoke_reason=reason))
             await session.commit()
         cancelled = result.rowcount or 0
-        _logger.info("Consent withdrawn for %s/%s: %d in-flight aggregation(s) "
-                     "cancelled", partner_id, subject_id_value, cancelled)
+        _logger.info("Consent %s is no longer active (%s): %d in-flight "
+                     "aggregation(s) cancelled, %d grant(s) revoked",
+                     consent_id, reason, cancelled, revoked.rowcount or 0)
         return cancelled
 
-    async def verify_for_subject(self, *, aggregation_id: Optional[str],
-                                 correlation_id: Optional[str],
-                                 subject_id, code: str,
-                                 caller: Optional[Dict[str, str]] = None
-                                 ) -> AggregationRequest:
-        """The farmer's own release: find the request, check it is theirs, verify.
+    async def verify_for_subject(self, *, aggregation_id: str, code: str,
+                                 caller: Optional[Dict[str, str]],
+                                 subject_id=None) -> AggregationRequest:
+        """The subject's own release: find the request, check it is theirs, verify.
 
         The subject check is the point. Without it, anyone holding an
         aggregation id and a valid OTP could release a record belonging to
         someone else - and with a provider whose OTP is a constant, that is not
-        hypothetical.
+        hypothetical. So the caller's token is required and authoritative; a
+        ``subject_id`` in the body is an extra assertion that must agree with
+        it, never a substitute for it.
         """
-        if not aggregation_id and not correlation_id:
-            raise AggregationError(400, "no_identifier",
-                                   "supply aggregation_id or correlation_id")
-
-        async with async_session()() as session:
-            request = None
-            if aggregation_id:
-                request = await session.get(AggregationRequest, aggregation_id)
-            if request is None and correlation_id:
-                result = await session.execute(
-                    select(AggregationRequest).where(
-                        AggregationRequest.correlation_id == correlation_id))
-                request = result.scalars().first()
+        if not caller or not caller.get("subject_id_value"):
+            raise AggregationError(401, "unauthenticated",
+                                   "the caller must be an authenticated subject")
+        request = await self.get(aggregation_id)
         if request is None:
             raise AggregationError(404, "not_found", "no such aggregation request")
 
-        # The authenticated caller is authoritative. A body subject_id is an
-        # extra assertion to agree with, never the thing that establishes who is
-        # asking - the probe showed that omitting it used to skip the check
-        # entirely and release the record.
-        claims = []
-        if caller and caller.get("subject_id_value"):
-            claims.append((caller.get("subject_id_type") or request.subject_id_type,
-                           caller["subject_id_value"], "token"))
+        claims = [(caller.get("subject_id_type") or request.subject_id_type,
+                   caller["subject_id_value"], "token")]
         if subject_id is not None and getattr(subject_id, "value", None):
             claims.append((getattr(subject_id, "type", None) or request.subject_id_type,
                            subject_id.value, "body"))
-        if not claims:
-            raise AggregationError(401, "unauthenticated",
-                                   "the caller must be an authenticated subject")
-
         for wanted_type, wanted_value, where in claims:
             if (wanted_value != request.subject_id_value
                     or wanted_type != request.subject_id_type):
@@ -552,7 +821,7 @@ class AggregatorService(BaseService):
                 # an id exists but belongs to someone else is a disclosure.
                 raise AggregationError(404, "not_found", "no such aggregation request")
 
-        return await self.verify_otp(request.id, code)
+        return await self._verify_otp(request.id, code)
 
     # ── 3. fan out and deliver ──────────────────────────────────────────────
     #
@@ -680,8 +949,28 @@ class AggregatorService(BaseService):
         if request is None:
             return None
 
-        aggregated, results = await self._query_registries(request)
-        body = self._build_envelope(request, aggregated, results)
+        # Right before any registry is touched: is the consent this fetch
+        # stands on still active in the CM? The poll may not have run since
+        # the subject withdrew. An unreachable CM fails closed.
+        try:
+            still_active = await self.consent_still_active(request)
+        except CMError as exc:
+            _logger.warning("Aggregation %s: consent not checkable before the "
+                            "fan-out - %s %s", request_id, exc.reason, exc.detail)
+            await self._mark_failed(request_id, "consent_check_failed")
+            return None
+        if not still_active:
+            if request.cm_consent_id:
+                await self.cancel_for_withdrawal(request.cm_consent_id)
+            else:
+                await self._reject(request_id, "no_consent_reference")
+            _logger.info("Aggregation %s: consent no longer active - nothing "
+                         "fetched", request_id)
+            return None
+
+        outcomes = await self._query_registries(request)
+        body = self._build_envelope(request, outcomes)
+        results = self._summarise(outcomes)
 
         # Conditional on still being 'fetching': the subject may have withdrawn
         # while the registries were answering, which rejects the row. An
@@ -706,48 +995,83 @@ class AggregatorService(BaseService):
         return {"callback_url": request.callback_url, "body": body,
                 "results": results}
 
-    async def _query_registries(self, request) -> tuple:
-        """One call per registry, failures recorded per registry.
+    @staticmethod
+    def _query_of(request) -> Dict[str, Any]:
+        """The row's bene-360 request. A row written before the query was
+        stored has none; it is answered for its subject over the short window."""
+        query = dict(request.query or {})
+        query.setdefault("foundationalId", request.subject_id_value)
+        query.setdefault("timeframe", "Timeframe-Short")
+        return query
+
+    async def _query_registries(self, request) -> Dict[str, Dict[str, Any]]:
+        """One call per registry, the outcome recorded per registry.
 
         A partner asking across three registries should not lose two because
-        one is down, so a RegistryError is written into ``results`` and the
-        loop continues.
+        one is down, so a RegistryError becomes that registry's outcome and
+        the loop continues. A registry the query covers but the consent does
+        not is never called; it is reported as such in the response.
         """
-        by_registry = field_catalog.resolve(request.requested_fields)
-        results_seed = request.registry_results or {}
-        default_query = results_seed.get("query_value") or request.subject_id_value
-        per_registry = results_seed.get("registry_queries") or {}
-        aggregated: Dict[str, Any] = {}
-        results: Dict[str, Any] = dict(request.registry_results or {})
+        catalog = get_catalog()
+        query = self._query_of(request)
+        granted = catalog.split_scope_ids(request.requested_scopes)
+        foundational_id = query["foundationalId"]
+        outcomes: Dict[str, Dict[str, Any]] = {}
 
-        for registry, specs in sorted(by_registry.items()):
-            cfg = _config.aggregator_registry_map.get(registry)
-            if not cfg:
-                results[registry] = {"status": "error", "reason": "not_configured"}
+        for registry in bene360.planned_registries(catalog, query):
+            scopes = granted.get(registry)
+            if not scopes:
+                outcomes[registry] = {"status": "not_consented"}
                 continue
-            scopes = field_catalog.scopes_for(specs)
-            query_value = per_registry.get(registry) or default_query
+            entry = catalog.get(registry)
+            # The subject's side of the hop. The CM caps the hop at the
+            # binding's ceiling and asks for no grant (legitimate_interest),
+            # so this is the only place the subject's authorisation is spent.
+            if await self._active_grant(request, registry) is None:
+                outcomes[registry] = {"status": "no_active_grant"}
+                continue
             try:
                 records = await self.registries.search(
-                    registry, cfg, request.subject_id_type, request.subject_id_value,
-                    query_value, scopes, request.purpose)
+                    registry, entry, request.subject_id_type, request.subject_id_value,
+                    entry.search_value(foundational_id), entry.hop_scopes(scopes),
+                    request.purpose)
             except RegistryError as exc:
                 _logger.warning("Aggregation %s: %s failed - %s %s",
                                 request.id, registry, exc.reason, exc.detail)
-                results[registry] = {"status": "error", "reason": exc.reason,
-                                     "detail": exc.detail}
+                outcomes[registry] = {"status": "error", "reason": exc.reason,
+                                      "detail": exc.detail}
                 continue
 
-            # Keep only the requested leaves. The registry clamped to whole
-            # blocks; this is where the partner's field list is honoured.
-            projected: Dict[str, Any] = {}
-            for record in records:
-                projected.update(field_catalog.project(record, specs))
-            aggregated.update(projected)
-            results[registry] = {"status": "ok", "records": len(records),
-                                 "queried": query_value,
-                                 "fields": sorted(projected)}
-        return aggregated, results
+            # The registry's search is a substring match, so a record that
+            # only mentions the ID (a phone number, another person's ID) can
+            # come back. Only an exact identifier match is this beneficiary.
+            matched = [r for r in records if entry.identifies(r, foundational_id)]
+            if len(matched) < len(records):
+                _logger.warning("Aggregation %s: %s returned %d record(s) not identified "
+                                "by the foundational ID; discarded", request.id,
+                                registry, len(records) - len(matched))
+
+            # The registry clamped to whole blocks; this is where each block
+            # is cut down to the catalog's allowed fields and placed on its
+            # register or table. Only granted scopes are read, so the block
+            # fetched for the identifier check alone never leaves.
+            outcomes[registry] = {
+                "status": "ok", "records": len(matched), "scopes": scopes,
+                "discarded": len(records) - len(matched),
+                "membership": bene360.map_registry(
+                    registry, entry, matched, scopes, foundational_id)}
+        return outcomes
+
+    @staticmethod
+    def _summarise(outcomes: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+        """What each registry did, for the row's audit trail - never the data."""
+        summary: Dict[str, Any] = {}
+        for registry, outcome in outcomes.items():
+            row = {k: v for k, v in outcome.items() if k != "membership"}
+            if outcome.get("status") == "ok":
+                row["matched"] = bool(outcome.get("membership"))
+            summary[registry] = row
+        return summary
 
     # ── stage 2: the partner's callback ─────────────────────────────────────
 
@@ -768,6 +1092,35 @@ class AggregatorService(BaseService):
             _logger.info("Aggregation %s: delivery skipped, not claimable",
                          request_id)
             return True  # somebody else owns it; this copy must not retry
+
+        # Last chance to honour a withdrawal: the envelope is built but not
+        # sent. A withdrawn consent closes the row (no retry); a CM that
+        # cannot answer puts it back to 'fetched' so the normal callback retry
+        # asks again - the data is never released on an unanswered check.
+        async with async_session()() as session:
+            row = await session.get(AggregationRequest, request_id)
+        try:
+            still_active = await self.consent_still_active(row)
+        except CMError as exc:
+            _logger.warning("Aggregation %s: consent not checkable before the "
+                            "callback - %s %s", request_id, exc.reason, exc.detail)
+            await self._set_status(request_id,
+                                   expect=(AggregationStatus.delivering.value,),
+                                   to=AggregationStatus.fetched.value)
+            return False
+        if not still_active:
+            # 'delivering' is outside what a withdrawal cancels, so close the
+            # row here explicitly before revoking what else stands on it.
+            await self._set_status(request_id,
+                                   expect=(AggregationStatus.delivering.value,),
+                                   to=AggregationStatus.fetched.value)
+            if row.cm_consent_id:
+                await self.cancel_for_withdrawal(row.cm_consent_id)
+            else:
+                await self._reject(request_id, "no_consent_reference")
+            _logger.info("Aggregation %s: consent no longer active - the "
+                         "callback was not sent", request_id)
+            return True
 
         status_code = await self._post_callback(request_id, callback_url, body)
         accepted = bool(status_code and 200 <= status_code < 300)
@@ -820,9 +1173,8 @@ class AggregatorService(BaseService):
 
     # ── the envelope ────────────────────────────────────────────────────────
 
-    def _build_envelope(self, request, aggregated: Dict[str, Any],
-                        results: Dict[str, Any]) -> Dict[str, Any]:
-        """The standard DCI on-search body, signed, ready to POST.
+    def _build_envelope(self, request, outcomes: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+        """The standard DCI on-search body carrying the bene-360 response, signed.
 
         Built once and then carried on the delivery topic, so a retry re-sends
         the identical bytes. That matters twice over: the JWS stays valid
@@ -832,8 +1184,10 @@ class AggregatorService(BaseService):
         a second result.
         """
         now = datetime.now(timezone.utc)
-        any_ok = any(isinstance(v, dict) and v.get("status") == "ok"
-                     for v in results.values())
+        any_ok = any(o.get("status") == "ok" for o in outcomes.values())
+        record = bene360.build_response(
+            catalog=get_catalog(), query=self._query_of(request), outcomes=outcomes,
+            response_id="urn:openg2p:aggregation:%s" % request.id, generated_at=now)
 
         header = {
             "version": "1.0.0",
@@ -848,8 +1202,9 @@ class AggregatorService(BaseService):
             "sender_id": _config.aggregator_sender_id,
             "receiver_id": request.partner_audience or request.partner_id,
             "is_msg_encrypted": False,
+            # This service's own facts about the release. They stay out of the
+            # bene-360 response, whose schema admits no extra properties.
             "meta": {
-                "aggregated": True,
                 "consent_enforcement": (
                     "enabled" if request.lawful_basis == "consent" else "not_applicable"),
                 # Why the data moved, and what the subject actually did. Telling
@@ -860,12 +1215,12 @@ class AggregatorService(BaseService):
                 "subject_authentication": (
                     "otp" if request.otp_required
                     else "consent" if request.lawful_basis == "consent" else "none"),
-                "registries": {k: v for k, v in results.items() if isinstance(v, dict)},
             },
         }
         if not any_ok:
             header["status_reason_code"] = "AGG-VAL-001"
-            header["status_reason_message"] = "no registry returned data"
+            header["status_reason_message"] = (
+                "no registry could be queried; see meta.warnings in the record")
 
         message = {
             "transaction_id": request.transaction_id or request.correlation_id,
@@ -875,14 +1230,14 @@ class AggregatorService(BaseService):
                 "timestamp": now.isoformat(),
                 "status": "succ" if any_ok else "rjct",
                 "data": {
-                    "reg_type": _config.aggregator_reg_type,
-                    "reg_record_type": _config.aggregator_reg_record_type,
-                    # One aggregated record. The partner's own field aliases are
-                    # the keys, so it never has to know which registry answered.
-                    "reg_records": [aggregated] if aggregated else [],
+                    "version": "1.0.0",
+                    "reg_type": bene360.DCI_REG_TYPE,
+                    "reg_record_type": bene360.DCI_REG_RECORD_TYPE,
+                    # One record: the bene-360 response. It carries its own
+                    # warnings, so even a rejected search explains itself.
+                    "reg_records": [record],
                 },
-                "pagination": {"page_size": 1, "page_number": 1,
-                               "total_count": 1 if aggregated else 0},
+                "pagination": {"page_size": 1, "page_number": 1, "total_count": 1},
                 "locale": "en",
             }],
         }

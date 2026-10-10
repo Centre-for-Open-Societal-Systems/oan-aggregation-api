@@ -82,7 +82,7 @@ def transaction_binding(transaction_id: str, individual_id: str) -> str:
 
     Mirrors the original's check that a verify names the same individual the
     transaction was opened for. Folding both into the hashed material means a
-    code for one farmer cannot be spent on another even if the comparison above
+    code for one individual cannot be spent on another even if the comparison above
     it were ever skipped.
     """
     return "%s|%s" % (transaction_id or "", individual_id or "")
