@@ -8,8 +8,8 @@ _config = Settings.get_config()
 
 from openg2p_fastapi_common.app import Initializer as BaseInitializer
 
-from .controllers import AggregatorController
-from .models import AggregationGrant, AggregationRequest
+from .controllers import AggregatorController, StaffController
+from .models import AggregationGrant, AggregationRequest, StaffSearchAudit, StaffTabViewAudit
 from .registry_catalog import CatalogError, get_catalog
 from .services import (
     AggregatorService,
@@ -18,6 +18,8 @@ from .services import (
     OtpPublisher,
     OtpService,
     RegistryClient,
+    StaffApiClient,
+    StaffSearchService,
 )
 
 _logger = logging.getLogger(_config.logging_default_logger_name)
@@ -46,8 +48,11 @@ class Initializer(BaseInitializer):
         OtpService()
         RegistryClient()   # depends on CryptoService
         AggregatorService()  # depends on CMClient, RegistryClient, OtpService
+        StaffApiClient()
+        StaffSearchService()  # depends on StaffApiClient
 
         AggregatorController().post_init()
+        StaffController().post_init()
 
     # ── the aggregation queue ───────────────────────────────────────────────
     #
@@ -104,6 +109,10 @@ class Initializer(BaseInitializer):
             # What the subject authorised per registry hop - this service's
             # own record now that the CM records nothing for it.
             await AggregationGrant.create_migrate()
+            # Who ran a staff search and which tabs they opened (no consent
+            # on that path, so this is the only record of it).
+            await StaffSearchAudit.create_migrate()
+            await StaffTabViewAudit.create_migrate()
 
             from openg2p_fastapi_common.context import dbengine
             from sqlalchemy import text

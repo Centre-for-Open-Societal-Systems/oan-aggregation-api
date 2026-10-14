@@ -86,6 +86,8 @@ The schemas this service is tested against are vendored in
 | `GET /aggregation/v1/requests/{id}` | The subject (bearer token) | Status and audit of the subject's own request. |
 | `GET /aggregation/v1/queue` | Any authenticated caller | Queue health (counts and configuration only). |
 | `GET /aggregation/v1/requests/{id}/otp` | The subject, **development only** | Mounted only with `AGGREGATION_LAYER_OTP_DEBUG_ENABLED=true`. |
+| `POST /aggregation/v1/staff/registry/search` | Registry staff (bearer token + staff search role) | Find a beneficiary in every registry's staff-api, **no consent**: summary and tabs per record. See [Staff search](#staff-search). |
+| `POST /aggregation/v1/staff/registry/tab` | Registry staff, same role | One tab of a record that search returned: sections, fields, rows. |
 
 OpenAPI: `GET /docs` on a running instance.
 
@@ -273,6 +275,107 @@ validation.
 | 422 | `no_registry` | `registryFilter` names no registry in the catalog |
 | 401 / 404 / 409 | `unauthenticated`, `not_found`, `wrong_state`, OTP reasons | subject routes |
 
+### Staff search
+
+A registry staff user (Farmer, Livestock or Crop sown staff portal) finds a beneficiary in
+**every** registry and opens their data tab by tab. It is a separate door from the partner
+seek: **no consent, no consent object, no consent request, no OTP, no callback**. Two calls,
+like the staff portal (tab data is fetched only when a tab is opened):
+
+```
+client --(1) POST /aggregation/v1/staff/registry/search --> AL --> each registry's staff-api
+       <-- per registry: records, each with a summary and its tabs                (search only)
+           (each tab carries the request that opens it)
+client --(2) POST /aggregation/v1/staff/registry/tab  (the tab's request.body) --> AL --> staff-api
+       <-- that tab only: sections, fields, rows                               (get_tab_records)
+```
+
+The client talks to this service only. The staff-apis stay inside the cluster; their
+login, CSRF, payload format and ids are this service's business.
+
+| | |
+|---|---|
+| Caller | Bearer token from the `AUTH_ISSUER` realm (`staff`) holding one of `STAFF_SEARCH_ROLES` (default realm role `AGGREGATION_STAFF_VIEWER`). Otherwise `401` / `403`, before any registry is called. Same for both routes. |
+| Registries | Every catalog entry with a `staff_api` block (or `registryFilter`), in parallel. A new registry is a catalog entry: no code change. |
+| Search, per registry | `search_in_a_register` per `staff_api.registers` (one staff-api call each) → exact match on `staff_api.match_fields`. The summary is the registry's own list row; the tabs are the register's active tabs (`get_all_tabs`, cached). |
+| Tab | One `get_tab_records` call. Section labels and fields come from the tab's section metadata (`/register-tab-metadata/get_sections`, cached). |
+| Dynamic tabs | Tabs, sections and fields are the registries' metadata, cached `STAFF_API_METADATA_TTL_SEC` (600s). A tab added in a registry appears by itself; an unknown `tabId` re-reads the tab list once before `400 unknown_tab`. `staff_api.hidden_tabs` keeps a tab away from staff. |
+| Tab bound to its search | A tab request is accepted only for a record its search returned (`400 record_not_in_search`), from the staff user who ran it (`404 search_not_found` otherwise), within `STAFF_SEARCH_TTL_SEC` (`410 search_expired`: search again). |
+| Credentials | This service's own Keycloak client (`STAFF_API_CLIENT_ID`, client_credentials, token reused until shortly before expiry). Its service account needs a view-only role (e.g. Data Supervisor) on each `<registry>-registry-staff-portal` client; IAM turns it into `register:view`. A registry on another Keycloak sets `staff_api.auth`. |
+| Load | One pooled HTTP client; at most `STAFF_API_MAX_CONCURRENCY` calls in flight per registry (per worker); a call that waits longer than `STAFF_API_QUEUE_TIMEOUT_SEC` fails that registry with `registry_busy`; `STAFF_RATE_LIMIT_PER_MINUTE` per staff user (per worker, `429`); list sections paged (`page`, `pageSize`). |
+| Audit | `staff_search_audit`: one row per search (its id is the `searchId`): staff user, roles, beneficiary, registries, purpose, outcome and records found. `staff_tab_view_audit`: one row per tab opened. The registries only see this service's service account, so these are the record of who looked. |
+
+Search request (`registryFilter` and `purpose` optional):
+
+```json
+{ "foundationalId": "2222444466668888", "registryFilter": ["CROPSOWN_REGISTRY"], "purpose": "field_verification" }
+```
+
+Response (`200`), shortened:
+
+```json
+{
+  "schemaVersion": "1",
+  "searchId": "4178401f-...",
+  "foundationalId": "2222444466668888",
+  "searchedAt": "2026-10-12T11:30:42+00:00",
+  "expiresAt": "2026-10-12T12:00:42+00:00",
+  "searchedBy": "staff",
+  "registries": [{
+    "registryCode": "CROPSOWN_REGISTRY", "registryName": "Crop Sown Registry", "status": "found",
+    "records": [{
+      "register": "CropSown", "registerId": "6b06a95a-...", "recordId": "cossx-cs-abeba-0001",
+      "summary": {
+        "functionalId": "REG/S1/2026/90011", "name": "Abeba Tadesse REG/S1/2026/90011",
+        "linkFoundationalId": "FAN-2222444466668888",
+        "displayFields": [{"name": "region_name", "value": "Oromia", "order": 2}]
+      },
+      "tabs": [{
+        "tabId": "cropsown_sowing_tab", "label": "cropsown_sowing_tab", "order": 30,
+        "request": {"method": "POST", "url": "/aggregation/v1/staff/registry/tab",
+                    "body": {"searchId": "4178401f-...", "registryCode": "CROPSOWN_REGISTRY",
+                             "registerId": "6b06a95a-...", "recordId": "cossx-cs-abeba-0001",
+                             "tabId": "cropsown_sowing_tab"}}
+      }]
+    }]
+  }]
+}
+```
+
+Tab request: the tab's `request.body`, optionally with `page` (1-based) and `pageSize`
+(default `STAFF_TAB_PAGE_SIZE`, capped at `STAFF_TAB_MAX_PAGE_SIZE`). Response, shortened:
+
+```json
+{
+  "schemaVersion": "1",
+  "searchId": "4178401f-...", "registryCode": "CROPSOWN_REGISTRY", "registerId": "6b06a95a-...",
+  "recordId": "cossx-cs-abeba-0001", "tabId": "cropsown_sowing_tab", "label": "cropsown_sowing_tab",
+  "sections": [{
+    "sectionId": "cropsown_sowing_details_section_01", "mnemonic": "cs_sowing_details",
+    "label": "Sowing Details", "order": 10, "isList": true, "registerId": "ee41a5f0-...",
+    "fields": [{"key": "sowing_date", "label": "Sowing Date", "type": "date", "order": 0}],
+    "records": [{"sowing_date": "2026-06-10", "...": "..."}],
+    "pagination": {"page": 1, "pageSize": 50, "totalItems": 1, "totalPages": 1}
+  }]
+}
+```
+
+`label`s are the registry's own (a tab label is often an i18n key the client translates).
+`fields` come from the section's UI schema; `options` are listed for fixed choices. Records are
+what the staff portal shows (the staff-api's own fields); the catalog's `scopes` / `fields`
+filter applies to the partner path only. A client renders what it gets and ignores properties
+it does not know: within `schemaVersion` "1" changes only add.
+
+Search errors per registry: `status: error` with `error.reason` (`staff_api_forbidden`,
+`unreachable`, `unknown_register`, `registry_busy`); one registry failing does not fail the
+others. Other errors: `400 unknown_registry` (a `registryFilter` code without `staff_api`),
+`400` for a body with unknown properties, `429 rate_limited`, `503 staff_search_not_configured`
+(no registry has `staff_api`). Tab errors: `400 unknown_registry` / `record_not_in_search` /
+`unknown_tab`, `404 search_not_found`, `410 search_expired`, `502` with the registry's reason.
+
+Postman: [postman/OpenG2P-Aggregator-Staff.postman_collection.json](postman/README.md#staff-search-collection)
+(search per registry, every tab per registry, every tab the search returned, paging, refusals).
+
 ## Consent and OTP flow
 
 1. **Seek.** The partner's consent object is validated by the CM's `/consent/v1/validate` —
@@ -316,11 +419,17 @@ Every setting is `AGGREGATION_LAYER_<NAME>`; the full list with comments is
 | `AGGREGATOR_SENDER_ID`, `AGGREGATOR_ISSUER` | DCI `sender_id` / consent `iss` on registry hops. `sender_id` must map to the PM partner (`PARTNER_<SENDER_ID>`). |
 | `CM_BASE_URL`, `CM_TOKEN_URL`, `CM_CLIENT_ID`, `CM_CLIENT_SECRET` | The Consent Manager and the client-credentials login to it. |
 | `CM_POLL_INTERVAL_SEC`, `CM_POLL_IN_APP` | How consent decisions are read back from the CM. |
-| `AUTH_ENABLED`, `AUTH_ISSUER`, `AUTH_JWKS_URL`, `AUTH_AUDIENCE` | Verification of the subject's bearer token. |
+| `AUTH_ENABLED`, `AUTH_ISSUER`, `AUTH_JWKS_URL`, `AUTH_AUDIENCE` | Verification of the subject's and staff bearer token (Keycloak realm). |
+| `SUBJECT_AUTH_ISSUER`, `SUBJECT_AUTH_JWKS_URL`, `SUBJECT_AUTH_AUDIENCE` | The farmer token issued by the CM beneficiary API after a Fayda / eSignet login (`subject_id_value` = national ID), accepted on the subject routes (`GET /requests/{id}`, `verify-otp`) only, verified with the CM beneficiary JWKS (`<bene api>/.well-known/jwks.json`). Unset = off. |
+| `SUBJECT_AUTH_REQUIRED` | `true`: the subject routes accept only the farmer token, so a staff-realm user can no longer act as a farmer. Default `false`. |
 | `OTP_PROVIDER`, `OTP_SALT`, `OTP_TTL_SEC`, `OTP_MAX_ATTEMPTS` | OTP behaviour. |
 | `OTP_DEBUG_ENABLED` | **Development only**, default `false`: keeps the plaintext OTP and exposes it on an endpoint. |
 | `AGGREGATOR_REGISTRY_TIMEOUT`, `AGGREGATOR_PAGE_SIZE` | Defaults for registry hops (a catalog entry may override). |
 | `KAFKA_ENABLED`, `KAFKA_BOOTSTRAP_SERVERS`, … | Optional queue; see [docs/KAFKA.md](docs/KAFKA.md). |
+| `STAFF_SEARCH_ROLES` | Roles (JSON list) a staff caller needs for the staff search. Empty closes it. |
+| `STAFF_API_TOKEN_URL`, `STAFF_API_CLIENT_ID`, `STAFF_API_CLIENT_SECRET`, `STAFF_API_TIMEOUT` | This service's client-credentials login to the registries' staff-apis. |
+| `STAFF_API_METADATA_TTL_SEC`, `STAFF_API_MAX_CONCURRENCY`, `STAFF_API_QUEUE_TIMEOUT_SEC` | Staff-api metadata cache; per-registry concurrency limit and how long a call may wait for it. |
+| `STAFF_SEARCH_TTL_SEC`, `STAFF_TAB_PAGE_SIZE`, `STAFF_TAB_MAX_PAGE_SIZE`, `STAFF_RATE_LIMIT_PER_MINUTE` | How long a search opens tabs; list paging; per-user limit (0 = off). |
 
 ### Registry catalog
 
@@ -492,6 +601,7 @@ CM_SRC=../consent-management bash test/e2e/run.sh          # real CM + Postgres,
 | `test/unit/test_bene360_schema.py` | generated requests and responses against the published bene-360 schemas |
 | `test/unit/test_fourth_registry.py` | a registry added only through a catalog fixture is queried and mapped |
 | `test/unit/test_subject_checks.py` | subject binding of the query and of the OTP release |
+| `test/unit/test_staff_search.py` | `staff_api` catalog block, exact match of staff-api hits, search summary + tabs, tab sections / fields / paging, metadata cache and new tabs, tab bound to its search, rate limit, audit, one registry failing |
 | `test/e2e` | the whole flow against the CM: consent held + OTP, raise + approve, withdraw, deny, late approval |
 
 ## Security notes
@@ -517,6 +627,12 @@ CM_SRC=../consent-management bash test/e2e/run.sh          # real CM + Postgres,
 - **Personal data at rest:** with Kafka, the delivery topic carries the signed response until it
   is delivered; its retention is short by default (`KAFKA_DELIVERY_RETENTION_MS`, 1 hour). The
   database keeps per-registry outcomes, never attribute values.
+- **Staff search has no consent check.** Access rests on the staff role
+  (`STAFF_SEARCH_ROLES`) and on the view-only role of this service's staff-api account; every
+  search and every tab opened is audited (`staff_search_audit`, `staff_tab_view_audit`). A tab
+  opens only for a record the same user's recent search returned. Give the role only to staff
+  the policy allows, and
+  treat `STAFF_API_CLIENT_SECRET` as read access to every registry.
 - The registry catalog holds no secrets; secrets belong in the environment.
 
 ## Repository layout

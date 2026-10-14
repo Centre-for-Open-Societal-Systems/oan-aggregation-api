@@ -87,6 +87,55 @@ class Settings(BaseSettings):
     auth_audience: str = ""
     auth_algorithms: list[str] = ["RS256", "ES256", "EdDSA"]
     subject_default_id_type: str = "national_id"
+    # The farmer token: the CM beneficiary API logs a farmer in with Fayda /
+    # eSignet and issues its own JWT (subject_id_value = national ID), signed
+    # with the CM key. When subject_auth_issuer is set, the subject routes
+    # (status, verify-otp) also accept that token, verified with the CM
+    # beneficiary API's JWKS (<bene api>/.well-known/jwks.json). Staff routes
+    # never do. Unset = only the auth_* realm, as before.
+    subject_auth_issuer: str = ""
+    subject_auth_jwks_url: str = ""
+    subject_auth_audience: str = "coss-beneficiary"
+    subject_auth_algorithms: list[str] = ["EdDSA", "ES256", "RS256", "PS256"]
+    # True = the subject routes take ONLY the farmer token; a staff-realm user
+    # can no longer stand in for a farmer (production, once farmers log in
+    # with Fayda).
+    subject_auth_required: bool = False
+
+    # ── Staff search (POST /aggregation/v1/staff/registry/search) ───────────
+    # Registry staff look a beneficiary up across every registry that has a
+    # staff_api in the catalog, with no consent, no consent object and no OTP.
+    # The caller is a staff user (token from the auth_* realm above) holding
+    # one of these roles (realm or client). Empty refuses every caller: the
+    # route exists but nobody may use it until a role is named.
+    staff_search_roles: list[str] = ["AGGREGATION_STAFF_VIEWER"]
+    # This service's own Keycloak client for the registries' staff-apis
+    # (client_credentials). Its service account needs a view-only role
+    # (e.g. Data Supervisor) on each registry's staff-portal client. A catalog
+    # entry's staff_api.auth overrides these for a registry on another Keycloak.
+    staff_api_token_url: str = ""
+    staff_api_client_id: str = "aggregation-layer-staff"
+    staff_api_client_secret: str = ""
+    # Per staff-api call; a catalog entry's staff_api.timeout_sec overrides it.
+    staff_api_timeout: float = 20.0
+    # Register ids, tab lists and tab sections are read from the staff-api and
+    # kept this long, so a tab or section added in a registry shows up without
+    # a restart. A tab id not in the cached list forces one early refresh.
+    staff_api_metadata_ttl_sec: int = 600
+    # At most this many staff-api calls in flight per registry (per worker);
+    # a call that cannot start within staff_api_queue_timeout_sec fails that
+    # registry with "registry_busy" instead of piling up.
+    staff_api_max_concurrency: int = 20
+    staff_api_queue_timeout_sec: float = 5.0
+    # How long a search's searchId can open tabs. A tab request is accepted
+    # only for a record that search returned, to the staff user who ran it.
+    staff_search_ttl_sec: int = 1800
+    # Rows per page of a list section in a tab answer (pageSize default / cap).
+    staff_tab_page_size: int = 50
+    staff_tab_max_page_size: int = 200
+    # Staff requests (search + tab) per user per minute, per worker; 0 = off.
+    # A gateway limit (e.g. Kong) is the cluster-wide one; this is the backstop.
+    staff_rate_limit_per_minute: int = 120
 
     # ── Registry catalog ────────────────────────────────────────────────────
     # The YAML file that lists every registry this service may query: where

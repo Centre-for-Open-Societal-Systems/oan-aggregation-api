@@ -1,0 +1,2286 @@
+{
+  "info": {
+    "name": "OpenG2P Aggregation Layer - Staff search (tab-wise)",
+    "description": "Registry staff look a beneficiary up across every registry with a `staff_api` in the catalog (`agg_url`, default http://localhost:8110). No consent, consent object or OTP: the staff user's role is checked by this service, and each registry's staff-api checks this service's own service account.\n\n## Two calls, tabs on demand\n\n```\n1. POST /aggregation/v1/staff/registry/search   {foundationalId, registryFilter?, purpose?}\n   -> per registry: found / not_found / error\n      per record: summary (the registry's list row) + tabs, each with the request that opens it\n2. POST /aggregation/v1/staff/registry/tab      the tab's request.body, as the search gave it\n   -> that tab only: sections (label, fields, isList) with their rows, list sections paged\n```\n\nTabs, sections and fields are the registries' own metadata: a tab added in a registry appears in the search answer without a change here. A client renders what it gets and ignores fields it does not know (`schemaVersion` \"1\").\n\nA tab request is accepted only for a record its search returned, from the staff user who ran it, until `expiresAt` (then `410 search_expired`: search again). Every search and every tab opened is audited (`staff_search_audit`, `staff_tab_view_audit`).\n\n## Running it\n\n1. Set `staff_username` / `staff_password` (collection variables, or import `OpenG2P-Aggregator-Staff.postman_environment.json` and fill every value). The user needs a role from `AGGREGATION_LAYER_STAFF_SEARCH_ROLES`. Local stack: `staff`, with the password from your local setup.\n2. Run the folders in order. **1 Search** saves `{{search_id}}` and the record ids the tab folders use.\n\n| Folder | What |\n|---|---|\n| 0 Login | staff token |\n| 1 Search | all registries, then each registry alone |\n| 2-4 | every tab of each registry, one request per tab (tab ids of the reference registries) |\n| 5 | every tab the search returned, sent as given: no tab id written in the collection |\n| 6 | paging a list section |\n| 7 | refusals |\n\n```bash\nnewman run postman/OpenG2P-Aggregator-Staff.postman_collection.json \\\n  --env-var staff_username=staff --env-var staff_password=<password>\n```\n",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "0 Login",
+      "description": "A registry staff user's token (Keycloak realm `staff`). The user needs one of `AGGREGATION_LAYER_STAFF_SEARCH_ROLES` (default realm role `AGGREGATION_STAFF_VIEWER`).",
+      "item": [
+        {
+          "name": "Get staff token",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/x-www-form-urlencoded"
+              }
+            ],
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                {
+                  "key": "grant_type",
+                  "value": "password"
+                },
+                {
+                  "key": "client_id",
+                  "value": "{{staff_client_id}}"
+                },
+                {
+                  "key": "username",
+                  "value": "{{staff_username}}"
+                },
+                {
+                  "key": "password",
+                  "value": "{{staff_password}}"
+                },
+                {
+                  "key": "scope",
+                  "value": "openid"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{keycloak_url}}/realms/{{staff_realm}}/protocol/openid-connect/token",
+              "host": [
+                "{{keycloak_url}}"
+              ],
+              "path": [
+                "realms",
+                "{{staff_realm}}",
+                "protocol",
+                "openid-connect",
+                "token"
+              ]
+            },
+            "description": "Saved as `{{staff_access_token}}`. Lives as long as the realm's access token lifespan (300s locally): run it again on a 401."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('token issued (200)', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "if (j.access_token) { pm.collectionVariables.set('staff_access_token', j.access_token); }"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "1 Search",
+      "description": "Who is this beneficiary, in which registry, and which tabs does each record have. No tab data: each tab carries the `request` that opens it. One staff-api call per register behind it.",
+      "item": [
+        {
+          "name": "All registries",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"foundationalId\": \"{{foundational_id}}\",\n  \"purpose\": \"field_verification\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/search",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "search"
+              ]
+            },
+            "description": "Every staff-enabled registry. Saves `{{search_id}}`, per record `{{<registry>_<register>_register_id}}` / `_record_id`, and every tab's request body for folder 5."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('schemaVersion 1, searchId, expiresAt', () => { pm.expect(body.schemaVersion).to.equal('1'); pm.expect(body.searchId).to.be.a('string'); pm.expect(body.expiresAt).to.be.a('string'); });",
+                  "pm.test('no registry failed', () => body.registries.forEach(r => pm.expect(r.status, r.registryCode + ' ' + JSON.stringify(r.error)).to.not.equal('error')));",
+                  "pm.test('summary and tabs, no tab data', () => body.registries.forEach(r => r.records.forEach(x => {",
+                  "  pm.expect(x.summary).to.be.an('object');",
+                  "  pm.expect(x.tabs).to.be.an('array');",
+                  "  x.tabs.forEach(t => { pm.expect(t.request.url).to.equal('/aggregation/v1/staff/registry/tab'); pm.expect(t.request.body.tabId).to.equal(t.tabId); pm.expect(t.request.body.searchId).to.equal(body.searchId); });",
+                  "  pm.expect(x).to.not.have.property('sections');",
+                  "})));",
+                  "const j = pm.response.json();",
+                  "pm.collectionVariables.set('search_id', j.searchId);",
+                  "j.registries.forEach(r => {",
+                  "  const short = r.registryCode.replace(/_REGISTRY$/, '').toLowerCase();",
+                  "  r.records.forEach(x => {",
+                  "    const k = short + '_' + x.register.toLowerCase();",
+                  "    pm.collectionVariables.set(k + '_register_id', x.registerId);",
+                  "    pm.collectionVariables.set(k + '_record_id', x.recordId);",
+                  "  });",
+                  "  console.log(r.registryCode, r.status, r.records.map(x => x.register + ' ' + x.recordId + ': ' + x.tabs.map(t => t.tabId).join(', ')).join(' | '));",
+                  "});",
+                  "const queue = [];",
+                  "j.registries.forEach(r => r.records.forEach(x => x.tabs.forEach(t => queue.push(t.request.body))));",
+                  "pm.collectionVariables.set('tab_queue', JSON.stringify(queue));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Farmer registry only",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"foundationalId\": \"{{foundational_id}}\",\n  \"registryFilter\": [\"FARMER_REGISTRY\"]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/search",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "search"
+              ]
+            },
+            "description": "`registryFilter` limits the search to one registry."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('schemaVersion 1, searchId, expiresAt', () => { pm.expect(body.schemaVersion).to.equal('1'); pm.expect(body.searchId).to.be.a('string'); pm.expect(body.expiresAt).to.be.a('string'); });",
+                  "pm.test('no registry failed', () => body.registries.forEach(r => pm.expect(r.status, r.registryCode + ' ' + JSON.stringify(r.error)).to.not.equal('error')));",
+                  "pm.test('summary and tabs, no tab data', () => body.registries.forEach(r => r.records.forEach(x => {",
+                  "  pm.expect(x.summary).to.be.an('object');",
+                  "  pm.expect(x.tabs).to.be.an('array');",
+                  "  x.tabs.forEach(t => { pm.expect(t.request.url).to.equal('/aggregation/v1/staff/registry/tab'); pm.expect(t.request.body.tabId).to.equal(t.tabId); pm.expect(t.request.body.searchId).to.equal(body.searchId); });",
+                  "  pm.expect(x).to.not.have.property('sections');",
+                  "})));",
+                  "pm.test('only FARMER_REGISTRY', () => pm.expect(body.registries.map(r => r.registryCode)).to.eql([\"FARMER_REGISTRY\"]));",
+                  "const j = pm.response.json();",
+                  "pm.collectionVariables.set('search_id', j.searchId);",
+                  "j.registries.forEach(r => {",
+                  "  const short = r.registryCode.replace(/_REGISTRY$/, '').toLowerCase();",
+                  "  r.records.forEach(x => {",
+                  "    const k = short + '_' + x.register.toLowerCase();",
+                  "    pm.collectionVariables.set(k + '_register_id', x.registerId);",
+                  "    pm.collectionVariables.set(k + '_record_id', x.recordId);",
+                  "  });",
+                  "  console.log(r.registryCode, r.status, r.records.map(x => x.register + ' ' + x.recordId + ': ' + x.tabs.map(t => t.tabId).join(', ')).join(' | '));",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Livestock registry only",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"foundationalId\": \"{{foundational_id}}\",\n  \"registryFilter\": [\"LIVESTOCK_REGISTRY\"]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/search",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "search"
+              ]
+            },
+            "description": "Livestock searches two registers (Farmer, Livestock): a record for each the beneficiary is in."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('schemaVersion 1, searchId, expiresAt', () => { pm.expect(body.schemaVersion).to.equal('1'); pm.expect(body.searchId).to.be.a('string'); pm.expect(body.expiresAt).to.be.a('string'); });",
+                  "pm.test('no registry failed', () => body.registries.forEach(r => pm.expect(r.status, r.registryCode + ' ' + JSON.stringify(r.error)).to.not.equal('error')));",
+                  "pm.test('summary and tabs, no tab data', () => body.registries.forEach(r => r.records.forEach(x => {",
+                  "  pm.expect(x.summary).to.be.an('object');",
+                  "  pm.expect(x.tabs).to.be.an('array');",
+                  "  x.tabs.forEach(t => { pm.expect(t.request.url).to.equal('/aggregation/v1/staff/registry/tab'); pm.expect(t.request.body.tabId).to.equal(t.tabId); pm.expect(t.request.body.searchId).to.equal(body.searchId); });",
+                  "  pm.expect(x).to.not.have.property('sections');",
+                  "})));",
+                  "pm.test('only LIVESTOCK_REGISTRY', () => pm.expect(body.registries.map(r => r.registryCode)).to.eql([\"LIVESTOCK_REGISTRY\"]));",
+                  "const j = pm.response.json();",
+                  "pm.collectionVariables.set('search_id', j.searchId);",
+                  "j.registries.forEach(r => {",
+                  "  const short = r.registryCode.replace(/_REGISTRY$/, '').toLowerCase();",
+                  "  r.records.forEach(x => {",
+                  "    const k = short + '_' + x.register.toLowerCase();",
+                  "    pm.collectionVariables.set(k + '_register_id', x.registerId);",
+                  "    pm.collectionVariables.set(k + '_record_id', x.recordId);",
+                  "  });",
+                  "  console.log(r.registryCode, r.status, r.records.map(x => x.register + ' ' + x.recordId + ': ' + x.tabs.map(t => t.tabId).join(', ')).join(' | '));",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Crop sown registry only, FAN- prefix",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"foundationalId\": \"FAN-{{foundational_id}}\",\n  \"registryFilter\": [\"CROPSOWN_REGISTRY\"]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/search",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "search"
+              ]
+            },
+            "description": "The FAN- prefix does not change the number."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('schemaVersion 1, searchId, expiresAt', () => { pm.expect(body.schemaVersion).to.equal('1'); pm.expect(body.searchId).to.be.a('string'); pm.expect(body.expiresAt).to.be.a('string'); });",
+                  "pm.test('no registry failed', () => body.registries.forEach(r => pm.expect(r.status, r.registryCode + ' ' + JSON.stringify(r.error)).to.not.equal('error')));",
+                  "pm.test('summary and tabs, no tab data', () => body.registries.forEach(r => r.records.forEach(x => {",
+                  "  pm.expect(x.summary).to.be.an('object');",
+                  "  pm.expect(x.tabs).to.be.an('array');",
+                  "  x.tabs.forEach(t => { pm.expect(t.request.url).to.equal('/aggregation/v1/staff/registry/tab'); pm.expect(t.request.body.tabId).to.equal(t.tabId); pm.expect(t.request.body.searchId).to.equal(body.searchId); });",
+                  "  pm.expect(x).to.not.have.property('sections');",
+                  "})));",
+                  "pm.test('only CROPSOWN_REGISTRY', () => pm.expect(body.registries.map(r => r.registryCode)).to.eql([\"CROPSOWN_REGISTRY\"]));",
+                  "const j = pm.response.json();",
+                  "pm.collectionVariables.set('search_id', j.searchId);",
+                  "j.registries.forEach(r => {",
+                  "  const short = r.registryCode.replace(/_REGISTRY$/, '').toLowerCase();",
+                  "  r.records.forEach(x => {",
+                  "    const k = short + '_' + x.register.toLowerCase();",
+                  "    pm.collectionVariables.set(k + '_register_id', x.registerId);",
+                  "    pm.collectionVariables.set(k + '_record_id', x.recordId);",
+                  "  });",
+                  "  console.log(r.registryCode, r.status, r.records.map(x => x.register + ' ' + x.recordId + ': ' + x.tabs.map(t => t.tabId).join(', ')).join(' | '));",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Search again (all registries) for the tab folders",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"foundationalId\": \"{{foundational_id}}\",\n  \"purpose\": \"field_verification\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/search",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "search"
+              ]
+            },
+            "description": "Leaves `{{search_id}}` on a search that returned every registry's records, for folders 2-4."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('schemaVersion 1, searchId, expiresAt', () => { pm.expect(body.schemaVersion).to.equal('1'); pm.expect(body.searchId).to.be.a('string'); pm.expect(body.expiresAt).to.be.a('string'); });",
+                  "pm.test('no registry failed', () => body.registries.forEach(r => pm.expect(r.status, r.registryCode + ' ' + JSON.stringify(r.error)).to.not.equal('error')));",
+                  "pm.test('summary and tabs, no tab data', () => body.registries.forEach(r => r.records.forEach(x => {",
+                  "  pm.expect(x.summary).to.be.an('object');",
+                  "  pm.expect(x.tabs).to.be.an('array');",
+                  "  x.tabs.forEach(t => { pm.expect(t.request.url).to.equal('/aggregation/v1/staff/registry/tab'); pm.expect(t.request.body.tabId).to.equal(t.tabId); pm.expect(t.request.body.searchId).to.equal(body.searchId); });",
+                  "  pm.expect(x).to.not.have.property('sections');",
+                  "})));",
+                  "const j = pm.response.json();",
+                  "pm.collectionVariables.set('search_id', j.searchId);",
+                  "j.registries.forEach(r => {",
+                  "  const short = r.registryCode.replace(/_REGISTRY$/, '').toLowerCase();",
+                  "  r.records.forEach(x => {",
+                  "    const k = short + '_' + x.register.toLowerCase();",
+                  "    pm.collectionVariables.set(k + '_register_id', x.registerId);",
+                  "    pm.collectionVariables.set(k + '_record_id', x.recordId);",
+                  "  });",
+                  "  console.log(r.registryCode, r.status, r.records.map(x => x.register + ' ' + x.recordId + ': ' + x.tabs.map(t => t.tabId).join(', ')).join(' | '));",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "2 Farmer registry - tabs",
+      "description": "One request per tab of FARMER_REGISTRY as the local registries define them. A deployment can add, remove or rename tabs; folder 5 opens whatever the search returned instead. An absent tab answers `400 unknown_tab`.",
+      "item": [
+        {
+          "name": "Farmer (identity, phones, birth, socio-economic)",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"FARMER_REGISTRY\",\n  \"registerId\": \"{{farmer_farmer_register_id}}\",\n  \"recordId\": \"{{farmer_farmer_record_id}}\",\n  \"tabId\": \"farmer_farmer_tab\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/tab",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "tab"
+              ]
+            },
+            "description": "Tab `farmer_farmer_tab` of the record saved by the search (`{{farmer_farmer_record_id}}`)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('one tab: sections with fields and records', () => {",
+                  "  pm.expect(j.schemaVersion).to.equal('1');",
+                  "  pm.expect(j.sections).to.be.an('array');",
+                  "  j.sections.forEach(s => { pm.expect(s.fields).to.be.an('array'); pm.expect(s.records).to.be.an('array'); if (s.isList) pm.expect(s.pagination).to.be.an('object'); });",
+                  "});",
+                  "console.log(j.tabId, j.sections.map(s => (s.label || s.sectionId) + ': ' + s.records.length + ' row(s), ' + s.fields.length + ' field(s)').join(' | '));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Household",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"FARMER_REGISTRY\",\n  \"registerId\": \"{{farmer_farmer_register_id}}\",\n  \"recordId\": \"{{farmer_farmer_record_id}}\",\n  \"tabId\": \"farmer_household_link_tab\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/tab",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "tab"
+              ]
+            },
+            "description": "Tab `farmer_household_link_tab` of the record saved by the search (`{{farmer_farmer_record_id}}`)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('one tab: sections with fields and records', () => {",
+                  "  pm.expect(j.schemaVersion).to.equal('1');",
+                  "  pm.expect(j.sections).to.be.an('array');",
+                  "  j.sections.forEach(s => { pm.expect(s.fields).to.be.an('array'); pm.expect(s.records).to.be.an('array'); if (s.isList) pm.expect(s.pagination).to.be.an('object'); });",
+                  "});",
+                  "console.log(j.tabId, j.sections.map(s => (s.label || s.sectionId) + ': ' + s.records.length + ' row(s), ' + s.fields.length + ' field(s)').join(' | '));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Location",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"FARMER_REGISTRY\",\n  \"registerId\": \"{{farmer_farmer_register_id}}\",\n  \"recordId\": \"{{farmer_farmer_record_id}}\",\n  \"tabId\": \"farmer_location_tab\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/tab",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "tab"
+              ]
+            },
+            "description": "Tab `farmer_location_tab` of the record saved by the search (`{{farmer_farmer_record_id}}`)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('one tab: sections with fields and records', () => {",
+                  "  pm.expect(j.schemaVersion).to.equal('1');",
+                  "  pm.expect(j.sections).to.be.an('array');",
+                  "  j.sections.forEach(s => { pm.expect(s.fields).to.be.an('array'); pm.expect(s.records).to.be.an('array'); if (s.isList) pm.expect(s.pagination).to.be.an('object'); });",
+                  "});",
+                  "console.log(j.tabId, j.sections.map(s => (s.label || s.sectionId) + ': ' + s.records.length + ' row(s), ' + s.fields.length + ' field(s)').join(' | '));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Land",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"FARMER_REGISTRY\",\n  \"registerId\": \"{{farmer_farmer_register_id}}\",\n  \"recordId\": \"{{farmer_farmer_record_id}}\",\n  \"tabId\": \"farmer_land_tab\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/tab",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "tab"
+              ]
+            },
+            "description": "Tab `farmer_land_tab` of the record saved by the search (`{{farmer_farmer_record_id}}`)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('one tab: sections with fields and records', () => {",
+                  "  pm.expect(j.schemaVersion).to.equal('1');",
+                  "  pm.expect(j.sections).to.be.an('array');",
+                  "  j.sections.forEach(s => { pm.expect(s.fields).to.be.an('array'); pm.expect(s.records).to.be.an('array'); if (s.isList) pm.expect(s.pagination).to.be.an('object'); });",
+                  "});",
+                  "console.log(j.tabId, j.sections.map(s => (s.label || s.sectionId) + ': ' + s.records.length + ' row(s), ' + s.fields.length + ' field(s)').join(' | '));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Crop",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"FARMER_REGISTRY\",\n  \"registerId\": \"{{farmer_farmer_register_id}}\",\n  \"recordId\": \"{{farmer_farmer_record_id}}\",\n  \"tabId\": \"farmer_crop_tab\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/tab",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "tab"
+              ]
+            },
+            "description": "Tab `farmer_crop_tab` of the record saved by the search (`{{farmer_farmer_record_id}}`)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('one tab: sections with fields and records', () => {",
+                  "  pm.expect(j.schemaVersion).to.equal('1');",
+                  "  pm.expect(j.sections).to.be.an('array');",
+                  "  j.sections.forEach(s => { pm.expect(s.fields).to.be.an('array'); pm.expect(s.records).to.be.an('array'); if (s.isList) pm.expect(s.pagination).to.be.an('object'); });",
+                  "});",
+                  "console.log(j.tabId, j.sections.map(s => (s.label || s.sectionId) + ': ' + s.records.length + ' row(s), ' + s.fields.length + ' field(s)').join(' | '));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Livestock owned",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"FARMER_REGISTRY\",\n  \"registerId\": \"{{farmer_farmer_register_id}}\",\n  \"recordId\": \"{{farmer_farmer_record_id}}\",\n  \"tabId\": \"farmer_livestock_tab\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/tab",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "tab"
+              ]
+            },
+            "description": "Tab `farmer_livestock_tab` of the record saved by the search (`{{farmer_farmer_record_id}}`)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('one tab: sections with fields and records', () => {",
+                  "  pm.expect(j.schemaVersion).to.equal('1');",
+                  "  pm.expect(j.sections).to.be.an('array');",
+                  "  j.sections.forEach(s => { pm.expect(s.fields).to.be.an('array'); pm.expect(s.records).to.be.an('array'); if (s.isList) pm.expect(s.pagination).to.be.an('object'); });",
+                  "});",
+                  "console.log(j.tabId, j.sections.map(s => (s.label || s.sectionId) + ': ' + s.records.length + ' row(s), ' + s.fields.length + ' field(s)').join(' | '));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Registrant IDs",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"FARMER_REGISTRY\",\n  \"registerId\": \"{{farmer_farmer_register_id}}\",\n  \"recordId\": \"{{farmer_farmer_record_id}}\",\n  \"tabId\": \"farmer_ids_tab\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/tab",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "tab"
+              ]
+            },
+            "description": "Tab `farmer_ids_tab` of the record saved by the search (`{{farmer_farmer_record_id}}`)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('one tab: sections with fields and records', () => {",
+                  "  pm.expect(j.schemaVersion).to.equal('1');",
+                  "  pm.expect(j.sections).to.be.an('array');",
+                  "  j.sections.forEach(s => { pm.expect(s.fields).to.be.an('array'); pm.expect(s.records).to.be.an('array'); if (s.isList) pm.expect(s.pagination).to.be.an('object'); });",
+                  "});",
+                  "console.log(j.tabId, j.sections.map(s => (s.label || s.sectionId) + ': ' + s.records.length + ' row(s), ' + s.fields.length + ' field(s)').join(' | '));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Enumerator",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"FARMER_REGISTRY\",\n  \"registerId\": \"{{farmer_farmer_register_id}}\",\n  \"recordId\": \"{{farmer_farmer_record_id}}\",\n  \"tabId\": \"farmer_enumerator_tab\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/tab",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "tab"
+              ]
+            },
+            "description": "Tab `farmer_enumerator_tab` of the record saved by the search (`{{farmer_farmer_record_id}}`)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('one tab: sections with fields and records', () => {",
+                  "  pm.expect(j.schemaVersion).to.equal('1');",
+                  "  pm.expect(j.sections).to.be.an('array');",
+                  "  j.sections.forEach(s => { pm.expect(s.fields).to.be.an('array'); pm.expect(s.records).to.be.an('array'); if (s.isList) pm.expect(s.pagination).to.be.an('object'); });",
+                  "});",
+                  "console.log(j.tabId, j.sections.map(s => (s.label || s.sectionId) + ': ' + s.records.length + ' row(s), ' + s.fields.length + ' field(s)').join(' | '));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "3 Livestock registry - tabs",
+      "description": "One request per tab of LIVESTOCK_REGISTRY as the local registries define them. A deployment can add, remove or rename tabs; folder 5 opens whatever the search returned instead. An absent tab answers `400 unknown_tab`.",
+      "item": [
+        {
+          "name": "Farmer register: Farmer profile",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"LIVESTOCK_REGISTRY\",\n  \"registerId\": \"{{livestock_farmer_register_id}}\",\n  \"recordId\": \"{{livestock_farmer_record_id}}\",\n  \"tabId\": \"livestock_farmer_tab\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/tab",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "tab"
+              ]
+            },
+            "description": "Tab `livestock_farmer_tab` of the record saved by the search (`{{livestock_farmer_record_id}}`)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('one tab: sections with fields and records', () => {",
+                  "  pm.expect(j.schemaVersion).to.equal('1');",
+                  "  pm.expect(j.sections).to.be.an('array');",
+                  "  j.sections.forEach(s => { pm.expect(s.fields).to.be.an('array'); pm.expect(s.records).to.be.an('array'); if (s.isList) pm.expect(s.pagination).to.be.an('object'); });",
+                  "});",
+                  "console.log(j.tabId, j.sections.map(s => (s.label || s.sectionId) + ': ' + s.records.length + ' row(s), ' + s.fields.length + ' field(s)').join(' | '));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Livestock register: Livestock holding",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"LIVESTOCK_REGISTRY\",\n  \"registerId\": \"{{livestock_livestock_register_id}}\",\n  \"recordId\": \"{{livestock_livestock_record_id}}\",\n  \"tabId\": \"livestock_livestock_tab\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/tab",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "tab"
+              ]
+            },
+            "description": "Tab `livestock_livestock_tab` of the record saved by the search (`{{livestock_livestock_record_id}}`)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('one tab: sections with fields and records', () => {",
+                  "  pm.expect(j.schemaVersion).to.equal('1');",
+                  "  pm.expect(j.sections).to.be.an('array');",
+                  "  j.sections.forEach(s => { pm.expect(s.fields).to.be.an('array'); pm.expect(s.records).to.be.an('array'); if (s.isList) pm.expect(s.pagination).to.be.an('object'); });",
+                  "});",
+                  "console.log(j.tabId, j.sections.map(s => (s.label || s.sectionId) + ': ' + s.records.length + ' row(s), ' + s.fields.length + ' field(s)').join(' | '));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Livestock register: Animals, ear tag replacement",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"LIVESTOCK_REGISTRY\",\n  \"registerId\": \"{{livestock_livestock_register_id}}\",\n  \"recordId\": \"{{livestock_livestock_record_id}}\",\n  \"tabId\": \"livestock_animal_tab\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/tab",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "tab"
+              ]
+            },
+            "description": "Tab `livestock_animal_tab` of the record saved by the search (`{{livestock_livestock_record_id}}`)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('one tab: sections with fields and records', () => {",
+                  "  pm.expect(j.schemaVersion).to.equal('1');",
+                  "  pm.expect(j.sections).to.be.an('array');",
+                  "  j.sections.forEach(s => { pm.expect(s.fields).to.be.an('array'); pm.expect(s.records).to.be.an('array'); if (s.isList) pm.expect(s.pagination).to.be.an('object'); });",
+                  "});",
+                  "console.log(j.tabId, j.sections.map(s => (s.label || s.sectionId) + ': ' + s.records.length + ' row(s), ' + s.fields.length + ' field(s)').join(' | '));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Livestock register: Health events, vaccinations",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"LIVESTOCK_REGISTRY\",\n  \"registerId\": \"{{livestock_livestock_register_id}}\",\n  \"recordId\": \"{{livestock_livestock_record_id}}\",\n  \"tabId\": \"livestock_health_event_tab\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/tab",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "tab"
+              ]
+            },
+            "description": "Tab `livestock_health_event_tab` of the record saved by the search (`{{livestock_livestock_record_id}}`)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('one tab: sections with fields and records', () => {",
+                  "  pm.expect(j.schemaVersion).to.equal('1');",
+                  "  pm.expect(j.sections).to.be.an('array');",
+                  "  j.sections.forEach(s => { pm.expect(s.fields).to.be.an('array'); pm.expect(s.records).to.be.an('array'); if (s.isList) pm.expect(s.pagination).to.be.an('object'); });",
+                  "});",
+                  "console.log(j.tabId, j.sections.map(s => (s.label || s.sectionId) + ': ' + s.records.length + ' row(s), ' + s.fields.length + ' field(s)').join(' | '));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Livestock register: Vital events, breeding",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"LIVESTOCK_REGISTRY\",\n  \"registerId\": \"{{livestock_livestock_register_id}}\",\n  \"recordId\": \"{{livestock_livestock_record_id}}\",\n  \"tabId\": \"livestock_vital_event_tab\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/tab",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "tab"
+              ]
+            },
+            "description": "Tab `livestock_vital_event_tab` of the record saved by the search (`{{livestock_livestock_record_id}}`)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('one tab: sections with fields and records', () => {",
+                  "  pm.expect(j.schemaVersion).to.equal('1');",
+                  "  pm.expect(j.sections).to.be.an('array');",
+                  "  j.sections.forEach(s => { pm.expect(s.fields).to.be.an('array'); pm.expect(s.records).to.be.an('array'); if (s.isList) pm.expect(s.pagination).to.be.an('object'); });",
+                  "});",
+                  "console.log(j.tabId, j.sections.map(s => (s.label || s.sectionId) + ': ' + s.records.length + ' row(s), ' + s.fields.length + ' field(s)').join(' | '));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Livestock register: Import batches, audit log",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"LIVESTOCK_REGISTRY\",\n  \"registerId\": \"{{livestock_livestock_register_id}}\",\n  \"recordId\": \"{{livestock_livestock_record_id}}\",\n  \"tabId\": \"livestock_import_batch_tab\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/tab",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "tab"
+              ]
+            },
+            "description": "Tab `livestock_import_batch_tab` of the record saved by the search (`{{livestock_livestock_record_id}}`)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('one tab: sections with fields and records', () => {",
+                  "  pm.expect(j.schemaVersion).to.equal('1');",
+                  "  pm.expect(j.sections).to.be.an('array');",
+                  "  j.sections.forEach(s => { pm.expect(s.fields).to.be.an('array'); pm.expect(s.records).to.be.an('array'); if (s.isList) pm.expect(s.pagination).to.be.an('object'); });",
+                  "});",
+                  "console.log(j.tabId, j.sections.map(s => (s.label || s.sectionId) + ': ' + s.records.length + ' row(s), ' + s.fields.length + ' field(s)').join(' | '));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "4 Crop sown registry - tabs",
+      "description": "One request per tab of CROPSOWN_REGISTRY as the local registries define them. A deployment can add, remove or rename tabs; folder 5 opens whatever the search returned instead. An absent tab answers `400 unknown_tab`.",
+      "item": [
+        {
+          "name": "Crop sown record (identity, address)",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"cropsown_cropsown_tab\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/tab",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "tab"
+              ]
+            },
+            "description": "Tab `cropsown_cropsown_tab` of the record saved by the search (`{{cropsown_cropsown_record_id}}`)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('one tab: sections with fields and records', () => {",
+                  "  pm.expect(j.schemaVersion).to.equal('1');",
+                  "  pm.expect(j.sections).to.be.an('array');",
+                  "  j.sections.forEach(s => { pm.expect(s.fields).to.be.an('array'); pm.expect(s.records).to.be.an('array'); if (s.isList) pm.expect(s.pagination).to.be.an('object'); });",
+                  "});",
+                  "console.log(j.tabId, j.sections.map(s => (s.label || s.sectionId) + ': ' + s.records.length + ' row(s), ' + s.fields.length + ' field(s)').join(' | '));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Planning, clusters",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"cropsown_planning_tab\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/tab",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "tab"
+              ]
+            },
+            "description": "Tab `cropsown_planning_tab` of the record saved by the search (`{{cropsown_cropsown_record_id}}`)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('one tab: sections with fields and records', () => {",
+                  "  pm.expect(j.schemaVersion).to.equal('1');",
+                  "  pm.expect(j.sections).to.be.an('array');",
+                  "  j.sections.forEach(s => { pm.expect(s.fields).to.be.an('array'); pm.expect(s.records).to.be.an('array'); if (s.isList) pm.expect(s.pagination).to.be.an('object'); });",
+                  "});",
+                  "console.log(j.tabId, j.sections.map(s => (s.label || s.sectionId) + ': ' + s.records.length + ' row(s), ' + s.fields.length + ' field(s)').join(' | '));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Cultivation, cultivation clusters",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"cropsown_cultivation_tab\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/tab",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "tab"
+              ]
+            },
+            "description": "Tab `cropsown_cultivation_tab` of the record saved by the search (`{{cropsown_cropsown_record_id}}`)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('one tab: sections with fields and records', () => {",
+                  "  pm.expect(j.schemaVersion).to.equal('1');",
+                  "  pm.expect(j.sections).to.be.an('array');",
+                  "  j.sections.forEach(s => { pm.expect(s.fields).to.be.an('array'); pm.expect(s.records).to.be.an('array'); if (s.isList) pm.expect(s.pagination).to.be.an('object'); });",
+                  "});",
+                  "console.log(j.tabId, j.sections.map(s => (s.label || s.sectionId) + ': ' + s.records.length + ' row(s), ' + s.fields.length + ' field(s)').join(' | '));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Sowing, infestation",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"cropsown_sowing_tab\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/tab",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "tab"
+              ]
+            },
+            "description": "Tab `cropsown_sowing_tab` of the record saved by the search (`{{cropsown_cropsown_record_id}}`)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('one tab: sections with fields and records', () => {",
+                  "  pm.expect(j.schemaVersion).to.equal('1');",
+                  "  pm.expect(j.sections).to.be.an('array');",
+                  "  j.sections.forEach(s => { pm.expect(s.fields).to.be.an('array'); pm.expect(s.records).to.be.an('array'); if (s.isList) pm.expect(s.pagination).to.be.an('object'); });",
+                  "});",
+                  "console.log(j.tabId, j.sections.map(s => (s.label || s.sectionId) + ': ' + s.records.length + ' row(s), ' + s.fields.length + ' field(s)').join(' | '));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Harvest",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"cropsown_harvest_tab\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/tab",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "tab"
+              ]
+            },
+            "description": "Tab `cropsown_harvest_tab` of the record saved by the search (`{{cropsown_cropsown_record_id}}`)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('one tab: sections with fields and records', () => {",
+                  "  pm.expect(j.schemaVersion).to.equal('1');",
+                  "  pm.expect(j.sections).to.be.an('array');",
+                  "  j.sections.forEach(s => { pm.expect(s.fields).to.be.an('array'); pm.expect(s.records).to.be.an('array'); if (s.isList) pm.expect(s.pagination).to.be.an('object'); });",
+                  "});",
+                  "console.log(j.tabId, j.sections.map(s => (s.label || s.sectionId) + ': ' + s.records.length + ' row(s), ' + s.fields.length + ' field(s)').join(' | '));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Production",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"cropsown_production_tab\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/tab",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "tab"
+              ]
+            },
+            "description": "Tab `cropsown_production_tab` of the record saved by the search (`{{cropsown_cropsown_record_id}}`)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('one tab: sections with fields and records', () => {",
+                  "  pm.expect(j.schemaVersion).to.equal('1');",
+                  "  pm.expect(j.sections).to.be.an('array');",
+                  "  j.sections.forEach(s => { pm.expect(s.fields).to.be.an('array'); pm.expect(s.records).to.be.an('array'); if (s.isList) pm.expect(s.pagination).to.be.an('object'); });",
+                  "});",
+                  "console.log(j.tabId, j.sections.map(s => (s.label || s.sectionId) + ': ' + s.records.length + ' row(s), ' + s.fields.length + ' field(s)').join(' | '));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "5 Every tab from the search answer (dynamic)",
+      "description": "What a client does: send each tab's `request.body` exactly as the search gave it. No tab id is written here; this request loops over the tabs saved by **1 Search / All registries** (run the folder, or the whole collection, in the Runner / Newman).",
+      "item": [
+        {
+          "name": "Open the next tab",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{{tab_body}}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/tab",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "tab"
+              ]
+            },
+            "description": "Sends the next saved tab request; repeats until none is left."
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const queue = JSON.parse(pm.collectionVariables.get('tab_queue') || '[]');",
+                  "if (!queue.length) { throw new Error('no tab saved: run 1 Search / All registries first'); }",
+                  "pm.collectionVariables.set('tab_body', JSON.stringify(queue.shift()));",
+                  "pm.collectionVariables.set('tab_queue', JSON.stringify(queue));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('one tab: sections with fields and records', () => {",
+                  "  pm.expect(j.schemaVersion).to.equal('1');",
+                  "  pm.expect(j.sections).to.be.an('array');",
+                  "  j.sections.forEach(s => { pm.expect(s.fields).to.be.an('array'); pm.expect(s.records).to.be.an('array'); if (s.isList) pm.expect(s.pagination).to.be.an('object'); });",
+                  "});",
+                  "console.log(j.tabId, j.sections.map(s => (s.label || s.sectionId) + ': ' + s.records.length + ' row(s), ' + s.fields.length + ' field(s)').join(' | '));",
+                  "const left = JSON.parse(pm.collectionVariables.get('tab_queue') || '[]');",
+                  "if (left.length) { pm.execution.setNextRequest(pm.info.requestName); }"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "6 Paging a list section",
+      "description": "List sections answer page by page: `page` (1-based) and `pageSize` (default and cap set by the service: `AGGREGATION_LAYER_STAFF_TAB_PAGE_SIZE` / `_MAX_PAGE_SIZE`).",
+      "item": [
+        {
+          "name": "Planning, page 1 of size 1",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"cropsown_planning_tab\",\n  \"page\": 1,\n  \"pageSize\": 1\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/tab",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "tab"
+              ]
+            },
+            "description": "Tab `cropsown_planning_tab` of the record saved by the search (`{{cropsown_cropsown_record_id}}`)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('one tab: sections with fields and records', () => {",
+                  "  pm.expect(j.schemaVersion).to.equal('1');",
+                  "  pm.expect(j.sections).to.be.an('array');",
+                  "  j.sections.forEach(s => { pm.expect(s.fields).to.be.an('array'); pm.expect(s.records).to.be.an('array'); if (s.isList) pm.expect(s.pagination).to.be.an('object'); });",
+                  "});",
+                  "console.log(j.tabId, j.sections.map(s => (s.label || s.sectionId) + ': ' + s.records.length + ' row(s), ' + s.fields.length + ' field(s)').join(' | '));",
+                  "pm.test('list sections paged by 1', () => j.sections.filter(s => s.isList).forEach(s => { pm.expect(s.pagination.pageSize).to.equal(1); pm.expect(s.records.length).to.be.at.most(1); }));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "7 Guard rails",
+      "item": [
+        {
+          "name": "Record the search did not return - 400",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"not-from-this-search\",\n  \"tabId\": \"cropsown_planning_tab\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/tab",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "tab"
+              ]
+            },
+            "description": "A tab request is accepted only for a record its search returned."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 record_not_in_search', () => { pm.response.to.have.status(400); pm.expect(pm.response.json().error).to.equal('record_not_in_search'); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Unknown tab - 400",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"no_such_tab\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/tab",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "tab"
+              ]
+            },
+            "description": "Not an active tab of the register (or listed in the catalog's `staff_api.hidden_tabs`)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 unknown_tab', () => { pm.response.to.have.status(400); pm.expect(pm.response.json().error).to.equal('unknown_tab'); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Registry not in the search - 400",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"FARMER_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"cropsown_planning_tab\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/tab",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "tab"
+              ]
+            },
+            "description": "A record id of one registry sent with another registry's code."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 record_not_in_search', () => { pm.response.to.have.status(400); pm.expect(pm.response.json().error).to.equal('record_not_in_search'); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Unknown searchId - 404",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"searchId\": \"00000000-0000-0000-0000-000000000000\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"cropsown_planning_tab\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/tab",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "tab"
+              ]
+            },
+            "description": "Also the answer for another staff user's search. After `AGGREGATION_LAYER_STAFF_SEARCH_TTL_SEC` the answer is `410 search_expired`: search again."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404 search_not_found', () => { pm.response.to.have.status(404); pm.expect(pm.response.json().error).to.equal('search_not_found'); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Unknown registry in registryFilter - 400",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{staff_access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"foundationalId\": \"{{foundational_id}}\",\n  \"registryFilter\": [\"NO_SUCH_REGISTRY\"]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/search",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "search"
+              ]
+            },
+            "description": "A registry code without a `staff_api` in the catalog."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 unknown_registry', () => { pm.response.to.have.status(400); pm.expect(pm.response.json().error).to.equal('unknown_registry'); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "No token - 401",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"cropsown_planning_tab\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/staff/registry/tab",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "staff",
+                "registry",
+                "tab"
+              ]
+            },
+            "description": "Both routes need a staff token."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401', () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ]
+        }
+      ],
+      "description": "Refusals. Folder 1 must have run (they use its `{{search_id}}` and saved ids)."
+    }
+  ],
+  "variable": [
+    {
+      "key": "agg_url",
+      "value": "http://localhost:8110"
+    },
+    {
+      "key": "keycloak_url",
+      "value": "http://localhost:8080"
+    },
+    {
+      "key": "staff_realm",
+      "value": "staff"
+    },
+    {
+      "key": "staff_client_id",
+      "value": "consent-manager-ui"
+    },
+    {
+      "key": "staff_username",
+      "value": "staff"
+    },
+    {
+      "key": "staff_password",
+      "value": ""
+    },
+    {
+      "key": "foundational_id",
+      "value": "2222444466668888"
+    },
+    {
+      "key": "staff_access_token",
+      "value": ""
+    },
+    {
+      "key": "search_id",
+      "value": ""
+    },
+    {
+      "key": "tab_queue",
+      "value": "[]"
+    },
+    {
+      "key": "tab_body",
+      "value": "{}"
+    }
+  ]
+}

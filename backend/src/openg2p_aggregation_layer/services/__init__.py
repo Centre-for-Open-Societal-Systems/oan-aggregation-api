@@ -4,6 +4,8 @@ from .crypto_service import CryptoService
 from .otp_publisher import OtpPublisher
 from .otp_service import OtpService
 from .registry_client import RegistryClient, RegistryError
+from .staff_api_client import StaffApiClient
+from .staff_search_service import StaffSearchService
 
 __all__ = [
     "AggregatorService",
@@ -15,4 +17,6 @@ __all__ = [
     "OtpService",
     "RegistryClient",
     "RegistryError",
+    "StaffApiClient",
+    "StaffSearchService",
 ]

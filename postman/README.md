@@ -34,3 +34,33 @@ in `reg_records[0]`) to whatever `sender_uri` says. `deploy/docker-compose.yml` 
 curl http://localhost:9099/last    # the most recent envelope
 curl http://localhost:9099/all     # every one
 ```
+
+## Staff search collection
+
+`OpenG2P-Aggregator-Staff.postman_collection.json` drives the staff search (no consent): one
+search, then tab by tab, as a staff portal or mobile client would. See
+[Staff search](../README.md#staff-search) for the API.
+
+| Folder | What |
+|---|---|
+| 0 Login | staff token (Keycloak realm `staff`) |
+| 1 Search | all registries, then Farmer, Livestock and Crop sown alone; saves `{{search_id}}` and per record `{{<registry>_<register>_register_id}}` / `_record_id` |
+| 2 Farmer registry - tabs | one request per tab of the Farmer register |
+| 3 Livestock registry - tabs | the Farmer register's tab, then each tab of the Livestock register |
+| 4 Crop sown registry - tabs | one request per tab of the CropSown register |
+| 5 Every tab from the search answer | sends each tab's `request.body` exactly as the search gave it, looping until none is left: no tab id written in the collection, so a tab added in a registry is covered too |
+| 6 Paging a list section | `page` / `pageSize` |
+| 7 Guard rails | record not from the search, unknown tab, unknown search, unknown registry, no token |
+
+Folders 2-4 name the tab ids of the reference registries; a deployment that adds or renames
+tabs answers `400 unknown_tab` there, and folder 5 is the one that follows the registry.
+
+Set `staff_username` and `staff_password` (the user needs a role from
+`AGGREGATION_LAYER_STAFF_SEARCH_ROLES`), or import
+`OpenG2P-Aggregator-Staff.postman_environment.json` and fill every value. Run the folders in
+order; folder 1 saves what the others need.
+
+```bash
+newman run postman/OpenG2P-Aggregator-Staff.postman_collection.json \
+  --env-var staff_username=staff --env-var staff_password=<password>
+```

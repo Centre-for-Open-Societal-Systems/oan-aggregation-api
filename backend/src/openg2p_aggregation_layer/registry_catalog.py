@@ -21,6 +21,11 @@ Per registry, keyed by its bene-360 ``registryCode`` (a free string):
     consent works at. Each says where the block lands in the bene-360 response
     (a ``register``, or a ``table`` under a ``parent``) and which attribute
     paths may leave this service (``fields``).
+``staff_api`` (optional)
+    The registry's staff-api, for the staff search
+    (``POST /aggregation/v1/staff/registry/search``): which registers to search
+    and which hit fields carry the foundational ID. No consent on that path;
+    see ``services/staff_search_service.py``.
 
 **Data minimisation happens here.** A registry clamps its record to whole
 top-level blocks (the consent scope); ``fields`` then keeps only the listed
@@ -308,6 +313,66 @@ class Search(_Strict):
     page_size: Optional[int] = Field(default=None, ge=1, le=100)
 
 
+class StaffApiAuth(_Strict):
+    """Keycloak client the service calls one registry's staff-api with.
+
+    Only needed where the registry's staff portal sits on a different Keycloak
+    than the default (``AGGREGATION_LAYER_STAFF_API_TOKEN_URL`` / ``_CLIENT_ID``
+    / ``_CLIENT_SECRET``). The secret itself is read from the environment
+    variable named here; no secret belongs in the catalog.
+    """
+
+    token_url: str
+    client_id: str = Field(min_length=1)
+    client_secret_env: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _url(self):
+        if not self.token_url.lower().startswith(("http://", "https://")):
+            raise ValueError("token_url must be an http(s) URL")
+        return self
+
+
+class StaffApi(_Strict):
+    """The registry's staff-api (the staff portal's backend), for the staff search.
+
+    No consent is involved on this path: the staff-api checks only the
+    caller's roles (through IAM), and the caller is this service's own service
+    account with a view-only role on the registry's staff-portal client. Which
+    staff may use it is decided by this service (``staff_search_roles``).
+    """
+
+    base_url: str = Field(description="Base URL of the registry's staff-api")
+    # The registers searched for the beneficiary, by register_mnemonic (as in
+    # the registry's register definitions). Mnemonics, not ids: the ids differ
+    # per deployment and are looked up once from /register-metadata.
+    registers: List[str] = Field(min_length=1)
+    # Fields of a search hit that must carry the foundational ID (after
+    # search.match.strip_prefixes). The staff-api search is a substring match
+    # too, so a hit is kept only if one of these equals the ID exactly.
+    match_fields: List[str] = Field(
+        default_factory=lambda: ["foundational_id", "link_foundational_id"], min_length=1)
+    # Tabs (tab_id) never offered to staff through this service. Every other
+    # active tab of a searched register is, as the registry defines it: a tab
+    # added in the registry appears without a catalog change.
+    hidden_tabs: List[str] = Field(default_factory=list)
+    page_size: Optional[int] = Field(default=None, ge=1, le=100)
+    timeout_sec: Optional[float] = Field(default=None, gt=0)
+    auth: Optional[StaffApiAuth] = None
+
+    @model_validator(mode="after")
+    def _check(self):
+        if not self.base_url.lower().startswith(("http://", "https://")):
+            raise ValueError("base_url must be an http(s) URL")
+        for key in self.match_fields:
+            if not _SEGMENT_RE.match(key):
+                raise ValueError("invalid match field '%s'" % key)
+        return self
+
+    def shows_tab(self, tab_id: Optional[str]) -> bool:
+        return bool(tab_id) and tab_id not in self.hidden_tabs
+
+
 class RegisterDef(_Strict):
     name: Optional[str] = None
     # Paths into the registry's whole rendered record. Values read here leave
@@ -419,6 +484,8 @@ class RegistryEntry(_Strict):
     search: Search
     registers: Dict[str, RegisterDef] = Field(min_length=1)
     scopes: Dict[str, ScopeDef] = Field(min_length=1)
+    # Optional: without it the registry is not part of the staff search.
+    staff_api: Optional[StaffApi] = None
 
     @model_validator(mode="after")
     def _structure(self):
@@ -488,6 +555,14 @@ class RegistryEntry(_Strict):
                 return True
         return False
 
+    def staff_hit_identifies(self, hit: Any, foundational_id: str) -> bool:
+        """True if a staff-api search hit belongs to ``foundational_id``, exactly."""
+        wanted = self.search.match.normalise(foundational_id)
+        if not wanted or not isinstance(hit, dict) or self.staff_api is None:
+            return False
+        return any(self.search.match.normalise(hit.get(key)) == wanted
+                   for key in self.staff_api.match_fields)
+
     def scope_for_table(self, mnemonic: str) -> Optional[str]:
         for scope, sdef in self.scopes.items():
             if sdef.table == mnemonic:
@@ -533,6 +608,10 @@ class RegistryCatalog(_Strict):
 
     def get(self, code: str) -> Optional[RegistryEntry]:
         return self.registries.get(code)
+
+    def staff_codes(self) -> List[str]:
+        """The registries the staff search may reach (those with a staff_api)."""
+        return [code for code, entry in self.registries.items() if entry.staff_api]
 
     def same_identifier(self, a: Any, b: Any) -> bool:
         """Whether two spellings are the same foundational ID, ignoring any

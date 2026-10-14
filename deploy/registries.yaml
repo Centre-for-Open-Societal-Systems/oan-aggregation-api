@@ -39,6 +39,23 @@
 #                         removed from both sides and from the search value
 #   search.page_size      optional, overrides AGGREGATION_LAYER_AGGREGATOR_PAGE_SIZE
 #
+#   staff_api             optional: the registry's staff-api, for the staff search
+#                         (POST /aggregation/v1/staff/registry/search, no consent).
+#                         Called with the AL's own service account
+#                         (AGGREGATION_LAYER_STAFF_API_*), which needs a view-only
+#                         role (Data Supervisor) on the registry's staff-portal client.
+#     base_url              the staff-api
+#     registers             register_mnemonics searched for the beneficiary (ids
+#                           are read from the staff-api, they differ per deployment)
+#     match_fields          hit fields that must equal the foundational ID after
+#                           search.match.strip_prefixes (default foundational_id,
+#                           link_foundational_id)
+#     hidden_tabs           optional tab_ids never offered to staff; every other
+#                           active tab is offered as the registry defines it
+#     page_size / timeout_sec   optional
+#     auth                  optional {token_url, client_id, client_secret_env}, for a
+#                           registry whose staff portal is on another Keycloak
+#
 #   registers.<MNEMONIC>  a bene-360 register the record maps onto:
 #     name                    registerName
 #     internal_record_id      paths into the whole record (any block). Values
@@ -73,6 +90,9 @@ registries:
     partner_api:
       base_url: http://openg2p-farmer-registry-partner-api:8000
       receiver_id: farmer-registry
+    staff_api:
+      base_url: http://farmer-registry-staff-api:8000
+      registers: [Farmer]
     binding:
       audience: agg-layer-farmer
       controller_id: farmer_registry
@@ -120,6 +140,9 @@ registries:
     partner_api:
       base_url: http://livestock-registry-partner-api:8000
       receiver_id: livestock-registry
+    staff_api:
+      base_url: http://livestock-registry-staff-api:8000
+      registers: [Farmer, Livestock]   # the farmer profile, then the holdings
     binding:
       audience: agg-layer-livestock
       controller_id: livestock_registry
@@ -180,6 +203,9 @@ registries:
     partner_api:
       base_url: http://cropsown-registry-partner-api:8000
       receiver_id: cropsown-registry
+    staff_api:
+      base_url: http://cropsown-registry-staff-api:8000
+      registers: [CropSown]            # no Farmer register in crop sown
     binding:
       audience: agg-layer-cropsown
       controller_id: cropsown_registry
