@@ -5,17 +5,20 @@
     POST /callback                    the partner's on-search receiver
     GET  /received                    what the callback has been sent
     GET  /searches                    the DCI searches the registry received
+    POST /delay {"seconds": n}        make the registry answer n seconds late
 
 The registry is the part that matters: it validates the aggregator's consent
 JWS with the CM's /validate exactly as a real registry does, and clamps its
 record to the permitted top-level blocks. The aggregator's binding is
 legitimate_interest, so the CM permits the hop on the binding's policy
-ceiling; the subject's consent is enforced by the aggregation layer before it
-calls.
+ceiling; the subject's consent is checked by the aggregation layer (CM
+/validate of the partner's object) before it calls. The delay lets a test
+withdraw a consent while an async search is still being answered.
 
     E2E_KEYS=<dir of *.pub.pem> E2E_CM=http://127.0.0.1:18000 \
         uvicorn fakes:app --port 18090
 """
+import asyncio
 import os
 import pathlib
 
@@ -46,6 +49,13 @@ RECORD = {
 app = FastAPI()
 received = []
 searches = []
+DELAY = {"seconds": 0.0}
+
+
+@app.post("/delay")
+async def set_delay(request: Request):
+    DELAY["seconds"] = float((await request.json()).get("seconds") or 0)
+    return DELAY
 
 
 @app.get("/keys/{reference_id}")
@@ -63,6 +73,8 @@ async def search(request: Request):
     item = body["message"]["search_request"][0]
     criteria = item["search_criteria"]
     searches.append({"query": criteria["query"], "reg_type": criteria.get("reg_type")})
+    if DELAY["seconds"]:
+        await asyncio.sleep(DELAY["seconds"])
     consent_jws = criteria["authorize"]["consent_jws"]
     claims = jwt.decode(consent_jws, options={"verify_signature": False})
     async with httpx.AsyncClient(timeout=10) as client:

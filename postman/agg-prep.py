@@ -19,7 +19,7 @@ Run it from the host (all services are reached on their published ports):
 
     python postman/agg-prep.py
     python postman/agg-prep.py --scopes FARMER_REGISTRY.farmer_personal_details
-    python postman/agg-prep.py --no-grant   # the seek raises a consent request instead
+    python postman/agg-prep.py --no-grant   # no consent: the search is refused (403)
 
     G2P_PARTNER_AUDIENCE   partner binding audience          (default demo-partner)
     G2P_PARTNER_PM_ID      its Partner Management partner id  (default PARTNER_DEMO)
@@ -30,12 +30,9 @@ Run it from the host (all services are reached on their published ports):
 Then import the environment into Postman, select it, and run the collection
 top to bottom.
 
-TWO THINGS EXPIRE, and they are the usual cause of a confusing failure:
-
-  * the consent object    - CM enforces replay_freshness_window_sec = 300
-  * the OTP               - otp_ttl_sec, also 300 by default
-
-so re-run this if a seek starts coming back `replay`.
+The consent object expires (the CM enforces replay_freshness_window_sec = 300)
+and the CM answers each object once, so re-run this if a search starts coming
+back `replay` or `consent_object_reused`.
 
 One more trap worth knowing: the Consent Manager caches Partner Management keys
 for 300s. This script registers a NEW kid each run, so if the CM has cached that
@@ -113,7 +110,7 @@ def grant(H, subject, partner_uuid, scopes):
 
 
 def withdraw_grants(H, partner_uuid):
-    """Revoke the subject's active consents to this partner, so the seek raises a request."""
+    """Revoke the subject's active consents to this partner, so the search is refused."""
     my = httpx.get(CM + "/consent/v1/my/consents", headers=H, timeout=30,
                    params={"status": "active", "size": 100})
     my.raise_for_status()
@@ -124,7 +121,8 @@ def withdraw_grants(H, partner_uuid):
                    json={"originated_by": "subject", "reason": "agg-prep --no-grant"}
                    ).raise_for_status()
     print("[no grant] %d active consent(s) to %s withdrawn, none granted (a consent-basis "
-          "partner's seek raises a consent request; a legitimate_interest one needs none)"
+          "partner's search is refused with no_subject_consent; a legitimate_interest one "
+          "needs none)"
           % (len(active), AUDIENCE))
 
 
@@ -135,8 +133,7 @@ def main() -> int:
                                      "in the catalog)")
     ap.add_argument("--no-grant", action="store_true",
                     help="withdraw the subject's active consents to this partner instead of "
-                         "granting one: the seek then raises a consent request, approved on "
-                         "the CM consent screen (consent_url in the ack)")
+                         "granting one: the search is then refused with no_subject_consent")
     args = ap.parse_args()
     try:
         catalog = load_catalog(args.catalog)
@@ -229,9 +226,7 @@ def main() -> int:
         {"key": "scopes", "value": json.dumps(granted)},
         {"key": "kid", "value": kid},
         # filled in by the collection as it runs
-        {"key": "aggregation_id", "value": ""},
         {"key": "correlation_id", "value": ""},
-        {"key": "otp", "value": ""},
     ]
     env = {
         "id": str(uuid.uuid4()),

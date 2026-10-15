@@ -4,27 +4,23 @@ Mirrors the OpenG2P AWE service: bearer tokens are verified against the Keycloak
 JWKS and roles are read from both ``realm_access`` and every
 ``resource_access.*`` client block. Service-to-service callers
 (client-credentials tokens) authenticate the same way and are detected by the
-absence of an ``email`` claim.
-
-The subject routes also accept the CM farmer token (``subject_auth_*``): the
-CM beneficiary API issues it after a Fayda / eSignet login and publishes its
-key in its JWKS. Which issuer applies is read from the token's ``iss``.
+absence of an ``email`` claim. Only the staff routes take a token; the
+partner routes are trusted through the consent object the CM validates.
 """
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import jwt
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Header, HTTPException, status
 
 from .config import Settings
 
 _config = Settings.get_config()
 _logger = logging.getLogger(_config.logging_default_logger_name)
 
-# Lazily-built, cached JWKS clients (PyJWKClient caches keys internally).
+# Lazily-built, cached JWKS client (PyJWKClient caches keys internally).
 _jwk_client: Optional[jwt.PyJWKClient] = None
-_subject_jwk_client: Optional[jwt.PyJWKClient] = None
 
 
 @dataclass
@@ -130,87 +126,3 @@ async def current_identity(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Token missing subject"
         )
     return _identity_from_claims(claims)
-
-
-def _is_farmer_token(token: str) -> bool:
-    if not _config.subject_auth_issuer:
-        return False
-    try:
-        claims = jwt.decode(token, options={"verify_signature": False})
-    except jwt.PyJWTError:
-        return False
-    return claims.get("iss") == _config.subject_auth_issuer
-
-
-def _get_subject_jwk_client() -> jwt.PyJWKClient:
-    global _subject_jwk_client
-    if _subject_jwk_client is None:
-        _subject_jwk_client = jwt.PyJWKClient(_config.subject_auth_jwks_url)
-    return _subject_jwk_client
-
-
-def _verify_farmer_token(token: str) -> dict:
-    """Claims of a valid CM farmer token. Always signature-checked, also in dev."""
-    try:
-        signing_key = _get_subject_jwk_client().get_signing_key_from_jwt(token)
-        claims = jwt.decode(
-            token,
-            signing_key.key,
-            algorithms=_config.subject_auth_algorithms,
-            issuer=_config.subject_auth_issuer,
-            audience=_config.subject_auth_audience,
-        )
-    except jwt.PyJWTError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid or expired farmer token: {exc}",
-        )
-    except Exception as exc:  # JWKS unreachable
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Could not reach the CM beneficiary JWKS: {exc}",
-        )
-    if claims.get("user_type") != "beneficiary" or not claims.get("subject_id_value"):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Not a farmer token"
-        )
-    return claims
-
-
-async def current_subject_caller(
-    authorization: Optional[str] = Header(default=None, alias="Authorization"),
-) -> CallerIdentity:
-    """A CM farmer token or a Keycloak token (subject routes only)."""
-    if authorization and authorization.startswith("Bearer "):
-        token = authorization[len("Bearer ") :]
-        if _is_farmer_token(token):
-            claims = _verify_farmer_token(token)
-            return CallerIdentity(
-                subject=claims.get("sub"),
-                subject_id_type=claims.get("subject_id_type") or _config.subject_default_id_type,
-                subject_id_value=claims["subject_id_value"],
-                name=claims.get("name"),
-                roles=[],
-                is_service_account=False,
-                raw_claims=claims,
-            )
-    if _config.subject_auth_required and _config.auth_enabled:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Farmer login required"
-        )
-    return await current_identity(authorization)
-
-
-async def get_current_subject(
-    identity: CallerIdentity = Depends(current_subject_caller),
-) -> Dict[str, str]:
-    """The subject behind the caller's token, for the subject-facing routes."""
-    if not identity.subject_id_value:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token does not identify a subject",
-        )
-    return {
-        "subject_id_type": identity.subject_id_type,
-        "subject_id_value": identity.subject_id_value,
-    }

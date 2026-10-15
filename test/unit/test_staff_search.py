@@ -6,7 +6,9 @@ No staff-api is called: StaffApiClient._post is replaced by a fake that answers
 from the shapes the real staff-apis return (seen on the local stack)."""
 import asyncio
 import copy
-from datetime import datetime, timedelta, timezone
+import json
+import logging
+import time
 
 import pytest
 
@@ -269,32 +271,22 @@ def test_role_check(monkeypatch):
 
 
 def _service(monkeypatch, catalog, client):
-    """The service over ``client`` with an in-memory audit store."""
+    """The service over ``client``; ``saved`` collects its audit log lines."""
     monkeypatch.setattr(staff_search_service, "get_catalog", lambda: catalog)
     svc = object.__new__(StaffSearchService)
     svc.staff_api = client
     svc._calls = {}
+    svc._mac_key = b"k" * 32
     saved = []
 
-    class Session:
-        async def __aenter__(self):
-            return self
+    class Collect(logging.Handler):
+        def emit(self, record):
+            saved.append(json.loads(record.getMessage()))
 
-        async def __aexit__(self, *exc):
-            return False
-
-        def add(self, row):
-            if getattr(row, "created_at", None) is None:
-                row.created_at = datetime.now(timezone.utc)
-            saved.append(row)
-
-        async def get(self, model, key):
-            return next((r for r in saved if isinstance(r, model) and r.id == key), None)
-
-        async def commit(self):
-            pass
-
-    monkeypatch.setattr(staff_search_service, "async_session", lambda: Session)
+    handler = Collect()
+    audit = staff_search_service._audit
+    monkeypatch.setattr(audit, "level", logging.INFO)
+    monkeypatch.setattr(audit, "handlers", [handler])
     return svc, saved
 
 
@@ -322,11 +314,12 @@ def test_search_audits_and_isolates_a_failing_registry(monkeypatch):
     assert (reg["status"], reg["error"]["reason"]) == ("error", "staff_api_forbidden")
     assert out["searchedBy"] == "staff" and out["foundationalId"] == FID
     [audit] = saved
-    assert audit.id == out["searchId"]
-    assert (audit.staff_username, audit.foundational_id, audit.purpose) == (
-        "staff", FID, "field_verification")
-    assert audit.outcome == {CODE: {
-        "status": "error", "records": 0, "found": [],
+    assert audit["event"] == "staff_search"
+    assert (audit["staff_username"], audit["purpose"]) == ("staff", "field_verification")
+    # The ID is masked in the log; only the last four characters are kept.
+    assert audit["foundational_id"].endswith(FID[-4:]) and FID not in json.dumps(audit)
+    assert audit["outcome"] == {CODE: {
+        "status": "error", "records": 0,
         "error": {"reason": "staff_api_forbidden", "detail": "HTTP 403"}}}
     with pytest.raises(AggregationError):
         asyncio.run(svc.search(STAFF, "  "))
@@ -350,7 +343,7 @@ def test_search_answers_summary_and_tabs_without_tab_data(monkeypatch):
                                                   "registerId": REG, "recordId": "ls-1",
                                                   "tabId": "main_tab"}}
     assert not any(c[0] == "/register-data/get_tab_records" for c in calls)
-    assert saved[0].outcome[CODE]["found"] == [{"registerId": REG, "recordId": "ls-1"}]
+    assert saved[0]["outcome"][CODE]["records"] == 1
 
 
 def _search_then(monkeypatch, **catalog):
@@ -375,8 +368,9 @@ def test_tab_answers_one_tab_and_audits(monkeypatch):
     assert section["records"] == [{"tag": "A0"}, {"tag": "A1"}]
     assert section["pagination"]["totalItems"] == 5
     view = saved[-1]
-    assert (view.search_id, view.tab_id, view.record_id, view.outcome["status"]) == (
-        out["searchId"], "animal_tab", "ls-1", "ok")
+    assert (view["event"], view["search"], view["tab_id"], view["record_id"],
+            view["outcome"]["status"]) == (
+        "staff_tab_view", saved[0]["search"], "animal_tab", "ls-1", "ok")
 
 
 @pytest.mark.parametrize("change, status, reason", [
@@ -385,6 +379,7 @@ def test_tab_answers_one_tab_and_audits(monkeypatch):
     ({"registry_code": "FARMER_REGISTRY"}, 400, "unknown_registry"),
     ({"tab_id": "hidden_tab"}, 400, "unknown_tab"),
     ({"search_id": "nope"}, 404, "search_not_found"),
+    ({"search_id": "e30.forged"}, 404, "search_not_found"),
     ({"identity": _identity(["AGGREGATION_STAFF_VIEWER"], subject="u-2")}, 404,
      "search_not_found"),
 ])
@@ -405,9 +400,25 @@ def test_hidden_tab_cannot_be_opened(monkeypatch):
     assert caught.value.reason == "unknown_tab"
 
 
+def test_a_ticket_cannot_be_altered(monkeypatch):
+    svc, _, _, out = _search_then(monkeypatch)
+    body, mac = out["searchId"].split(".")
+    search = svc._search_of(STAFF, out["searchId"])
+    search["found"][CODE].append(["anything", "ls-other"])
+    forged = svc._ticket(search).split(".")[0] + "." + mac
+    with pytest.raises(AggregationError) as caught:
+        asyncio.run(svc.tab(STAFF, forged, CODE, "anything", "ls-other", "main_tab"))
+    assert caught.value.reason == "search_not_found"
+    # Another key (another deployment) cannot read it either.
+    svc._mac_key = b"x" * 32
+    with pytest.raises(AggregationError):
+        svc._search_of(STAFF, out["searchId"])
+
+
 def test_expired_search_cannot_open_tabs(monkeypatch):
     svc, saved, _, out = _search_then(monkeypatch)
-    saved[0].created_at = datetime.now(timezone.utc) - timedelta(hours=2)
+    real = time.time
+    monkeypatch.setattr(staff_search_service.time, "time", lambda: real() + 7200)
     with pytest.raises(AggregationError) as caught:
         asyncio.run(svc.tab(STAFF, out["searchId"], CODE, REG, "ls-1", "main_tab"))
     assert (caught.value.status, caught.value.reason) == (410, "search_expired")

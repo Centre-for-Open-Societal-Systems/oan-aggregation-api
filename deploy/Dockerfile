@@ -22,14 +22,12 @@ ENV AGGREGATION_LAYER_APP_HOST=0.0.0.0
 ENV AGGREGATION_LAYER_APP_PORT=8100
 ENV AGGREGATION_LAYER_NO_OF_WORKERS=2
 
-# Migrate, then serve. `&&` so a failed migrate crashes the pod instead of
-# serving against a missing table.
+# No database, so no migrate step.
 #
 # One signing key for all workers: set AGGREGATION_LAYER_SIGNING_P12_PATH (or
 # _PRIVATE_KEY_PEM). Without it each worker generates its own ephemeral key and
 # the registries reject every hop signed by a key PM does not hold.
-CMD python3 -m openg2p_aggregation_layer.main migrate && \
-    gunicorn "openg2p_aggregation_layer.main:app" \
+CMD gunicorn "openg2p_aggregation_layer.main:app" \
       --workers ${AGGREGATION_LAYER_NO_OF_WORKERS} \
       --worker-class uvicorn.workers.UvicornWorker \
       --bind ${AGGREGATION_LAYER_APP_HOST}:${AGGREGATION_LAYER_APP_PORT} \

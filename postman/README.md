@@ -1,11 +1,23 @@
 # Postman — Aggregation Layer
 
 `OpenG2P-Aggregator.postman_collection.json` drives the Beneficiary-360 fetch against this
-service (`agg_url`, default http://localhost:8110): catalog discovery, the seek, the
-subject's OTP release, status, the delivered on-search, and the guard rails.
+service (`agg_url`, default http://localhost:8110):
+
+| Folder | What |
+|---|---|
+| 0 Health & discovery | `/ping`, `GET /aggregation/v1/registries` |
+| 1 Partner - sync search (default) | `POST /dci/registry/sync/search`: `200`, the signed on-search with the Beneficiary-360 response in `reg_records[0]`; saves `{{correlation_id}}` |
+| 2 Partner - async search and callback | `POST /dci/registry/async/search`: `202` ack; then the on-search the callback receiver got |
+| 3 Guard rails | subject mismatch (403), property bene-360 does not define (400), only PROGRAMS (422), registry not in the catalog (422), async without `sender_uri` (400) |
+| 4 One registry only | optional: a sync search per registry (`registryFilter`); re-run `agg-prep.py` before each |
+
+The subject's consent is obtained before any of this, in the Consent Manager: the partner
+raises a consent request, the CM sends the subject a one-time code, the partner confirms it
+with the CM. `agg-prep.py` does that part for you (as the subject, directly on the CM):
 
 ```bash
-python postman/agg-prep.py      # signs a fresh partner consent object, writes the local environment
+python postman/agg-prep.py              # active consent + a fresh partner consent object, writes the local environment
+python postman/agg-prep.py --no-grant   # no consent: the searches answer 403 no_subject_consent
 ```
 
 `agg-prep.py` writes `OpenG2P-Aggregator.local.postman_environment.json` (gitignored: it holds
@@ -13,22 +25,16 @@ a live token and consent object). `OpenG2P-Aggregator.postman_environment.json` 
 template it is based on. See the script's docstring for the partner / subject it uses
 (`G2P_PARTNER_AUDIENCE`, `G2P_SUBJECT_USER`, ...).
 
-The consent object is valid for the CM's replay window (300s by default): re-run
-`agg-prep.py` when a seek answers `replay`. The same window applies to a consent the
-aggregation layer raises for the subject — approve it on the CM consent screen within 300s
-of the object's `issued_at`, or the aggregation is rejected with
-`consent_approved_after_replay_window` and the partner has to seek again.
-
-Approval, denial and withdrawal on the CM are not pushed to the aggregation layer; it polls
-the CM every `AGGREGATION_LAYER_CM_POLL_INTERVAL_SEC` (15s by default). Allow for that before
-expecting the callback or a `rejected` status.
+The consent object is valid for the CM's replay window (300s by default), and the CM answers
+it once: re-run `agg-prep.py` (and re-import the environment) when a search answers `replay`
+or `409 consent_object_reused`.
 
 ## Callback receiver
 
-`callback_receiver.py` is a stand-in partner endpoint, so the callback half of the flow is
-observable. The aggregation layer POSTs its `on-search` envelope (a Beneficiary-360 response
-in `reg_records[0]`) to whatever `sender_uri` says. `deploy/docker-compose.yml` runs it as
-`agg-callback` on :9099.
+`callback_receiver.py` is a stand-in partner endpoint, so the async route is observable. The
+aggregation layer POSTs its `on-search` envelope (a Beneficiary-360 response in
+`reg_records[0]`) to whatever `sender_uri` says, once, as soon as the registries have
+answered (no retry). `deploy/docker-compose.yml` runs it as `agg-callback` on :9099.
 
 ```bash
 curl http://localhost:9099/last    # the most recent envelope

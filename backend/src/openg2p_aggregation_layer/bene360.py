@@ -248,9 +248,6 @@ def map_registry(code: str, entry: RegistryEntry, records: List[Dict[str, Any]],
 _WARNINGS = {
     "not_consented": ("NOT_CONSENTED",
                       "no scope of this registry is within the consent; not queried"),
-    "no_active_grant": ("NO_ACTIVE_GRANT",
-                        "the subject's authorisation for this registry is no longer "
-                        "active; not queried"),
 }
 
 
@@ -265,8 +262,8 @@ def build_response(*, catalog: RegistryCatalog, query: Dict[str, Any],
 
     ``outcomes`` is ``{registryCode: {"status": ..., ...}}`` where status is
     ``ok`` (with ``membership``, possibly None, and ``discarded``: records the
-    registry returned that failed the exact identifier check), ``not_consented``,
-    ``no_active_grant`` or ``error`` (with ``reason`` / ``detail``). Every
+    registry returned that failed the exact identifier check), ``not_consented``
+    or ``error`` (with ``reason`` / ``detail``). Every
     registry that was asked for and gave nothing back is explained in
     ``meta.warnings`` - a short answer never looks like "no data".
     """

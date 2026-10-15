@@ -33,11 +33,11 @@ class StaffSearchRequest(_Camel):
         description="Registry codes to search; all staff-enabled registries when absent")
     purpose: Optional[str] = Field(
         default=None, max_length=255,
-        description="Why the beneficiary is looked up; recorded in the audit row")
+        description="Why the beneficiary is looked up; recorded in the audit log")
 
 
 class StaffTabRequest(_Camel):
-    search_id: str = Field(alias="searchId", min_length=1, max_length=64)
+    search_id: str = Field(alias="searchId", min_length=1, max_length=8192)
     registry_code: str = Field(alias="registryCode", min_length=1, max_length=128)
     register_id: str = Field(alias="registerId", min_length=1, max_length=128)
     record_id: str = Field(alias="recordId", min_length=1, max_length=255)
@@ -103,7 +103,9 @@ class StaffRegistryResult(_Camel):
 
 class StaffSearchResponse(_Camel):
     schema_version: str = Field(default=SCHEMA_VERSION, alias="schemaVersion")
-    search_id: str = Field(alias="searchId", description="Id of the audit row; opens tabs")
+    search_id: str = Field(
+        alias="searchId",
+        description="Signed search ticket (staff user, records found, expiry); opens tabs")
     foundational_id: str = Field(alias="foundationalId")
     searched_at: str = Field(alias="searchedAt")
     searched_by: str = Field(alias="searchedBy")

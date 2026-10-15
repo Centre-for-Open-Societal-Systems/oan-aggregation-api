@@ -75,7 +75,7 @@ class StaffController(BaseController):
 
         No consent, consent object or OTP: the caller's role is the authority
         here and each registry's staff-api checks this service's own service
-        account. Every call is audited (``searchId``). A registry that fails is
+        account. Every call is audited (a log line). A registry that fails is
         reported in its own entry (``status: error``); the others still answer.
         Each tab carries the ``request`` that opens it; tab data is not included.
         """

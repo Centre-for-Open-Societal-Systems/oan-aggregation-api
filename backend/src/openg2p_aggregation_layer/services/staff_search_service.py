@@ -24,15 +24,25 @@ What is deliberately absent, compared with the partner path:
   registry, the same one the staff portal relies on;
 - no partner callback: the answer is the HTTP response.
 
-What replaces it: the role check at this service's door, an audit row per
-search and per tab opened (``models/staff_search.py``), and the binding of a
-tab request to its search: only a record that search returned, only for the
-staff user who ran it, only for ``staff_search_ttl_sec``.
+What replaces it: the role check at this service's door, an audit log line
+per search and per tab opened (logger ``<logging_default_logger_name>.audit``, i.e. ``app.audit``, one JSON
+object each), and the binding of a tab request to its search: only a record
+that search returned, only for the staff user who ran it, only for
+``staff_search_ttl_sec``.
+
+Nothing is stored. The ``searchId`` IS that binding: a ticket carrying the
+staff user, the records found and its expiry, with a MAC by this service's
+key (``CryptoService.mac_key``). A tab request is checked against the ticket
+alone, so any worker or pod can answer it.
 
 Registries are called in parallel. One registry failing does not fail the
 search: its entry carries ``status: error`` and the reason, the others answer.
 """
 import asyncio
+import base64
+import hashlib
+import hmac
+import json
 import logging
 import math
 import time
@@ -45,15 +55,15 @@ from openg2p_fastapi_common.service import BaseService
 
 from ..auth import CallerIdentity
 from ..config import Settings
-from ..db import async_session
-from ..models import StaffSearchAudit, StaffTabViewAudit
 from ..registry_catalog import get_catalog
 from .aggregator_service import AggregationError
+from .crypto_service import CryptoService
 from .registry_client import RegistryError
 from .staff_api_client import StaffApiClient
 
 _config = Settings.get_config()
 _logger = logging.getLogger(_config.logging_default_logger_name)
+_audit = logging.getLogger(_config.logging_default_logger_name + ".audit")
 
 TAB_PATH = "/aggregation/v1/staff/registry/tab"
 
@@ -62,6 +72,7 @@ class StaffSearchService(BaseService):
     def __init__(self, name="", **kwargs):
         super().__init__(name if name else "StaffSearchService", **kwargs)
         self.staff_api = StaffApiClient.get_component()
+        self._mac_key = CryptoService.get_component().mac_key()
         self._calls: Dict[str, Deque[float]] = {}
 
     @staticmethod
@@ -109,50 +120,44 @@ class StaffSearchService(BaseService):
             raise AggregationError(400, "missing_foundational_id", "foundationalId is required")
         codes = self.registries_for(registry_filter)
         catalog = get_catalog()
-        search_id = str(uuid.uuid4())
-
+        nonce = uuid.uuid4().hex
         results = await asyncio.gather(*[
-            self._one(search_id, code, catalog.get(code), foundational_id) for code in codes])
+            self._one(code, catalog.get(code), foundational_id) for code in codes])
 
         searched_at = datetime.now(timezone.utc)
-        outcome = {}
+        expires_at = searched_at + timedelta(seconds=_config.staff_search_ttl_sec)
+        found = {r["registryCode"]: [[x["registerId"], x["recordId"]] for x in r["records"]]
+                 for r in results}
+        search_id = self._ticket({
+            "n": nonce, "sub": identity.subject or "unknown",
+            "exp": int(expires_at.timestamp()), "found": found})
         for r in results:
-            outcome[r["registryCode"]] = {k: r[k] for k in ("status", "error") if r.get(k)} | {
-                "records": len(r["records"]),
-                "found": [{"registerId": x["registerId"], "recordId": x["recordId"]}
-                          for x in r["records"]]}
+            for record in r["records"]:
+                for t in record["tabs"]:
+                    t["request"]["body"]["searchId"] = search_id
+
         claims = identity.raw_claims or {}
-        audit = StaffSearchAudit(
-            id=search_id,
-            staff_subject=identity.subject or "unknown",
-            staff_username=claims.get("preferred_username"),
-            staff_name=identity.name,
-            staff_roles=self.allowed_roles(identity),
-            foundational_id=foundational_id,
-            registries=codes,
-            purpose=purpose,
-            outcome=outcome,
-        )
-        async with async_session()() as session:
-            session.add(audit)
-            await session.commit()
-        _logger.info("Staff search %s by %s (%s) for %s: %s", search_id,
-                     audit.staff_username or audit.staff_subject, ",".join(audit.staff_roles),
-                     _masked(foundational_id),
-                     ", ".join("%s=%s" % (c, o["status"]) for c, o in outcome.items()))
+        outcome = {r["registryCode"]: {k: r[k] for k in ("status", "error") if r.get(k)}
+                   | {"records": len(r["records"])} for r in results}
+        _audit.info(json.dumps({
+            "event": "staff_search", "search": nonce,
+            "staff_subject": identity.subject or "unknown",
+            "staff_username": claims.get("preferred_username"),
+            "staff_name": identity.name, "staff_roles": self.allowed_roles(identity),
+            "foundational_id": _masked(foundational_id), "registries": codes,
+            "purpose": purpose, "outcome": outcome}, default=str))
 
         return {
             "searchId": search_id,
             "foundationalId": foundational_id,
             "searchedAt": searched_at.isoformat(),
-            "searchedBy": audit.staff_username or audit.staff_subject,
-            "expiresAt": (searched_at + timedelta(seconds=_config.staff_search_ttl_sec)).isoformat(),
+            "searchedBy": claims.get("preferred_username") or identity.subject,
+            "expiresAt": expires_at.isoformat(),
             "purpose": purpose,
             "registries": results,
         }
 
-    async def _one(self, search_id: str, code: str, entry,
-                   foundational_id: str) -> Dict[str, Any]:
+    async def _one(self, code: str, entry, foundational_id: str) -> Dict[str, Any]:
         base = {"registryCode": code, "registryName": entry.name}
         try:
             found = await self.staff_api.search(code, entry, foundational_id)
@@ -169,7 +174,8 @@ class StaffSearchService(BaseService):
             _logger.exception("Staff search: registry %s failed unexpectedly", code)
             return {**base, "status": "error", "records": [],
                     "error": {"reason": "internal_error", "detail": str(exc)}}
-        records = [_record(search_id, code, f, tabs[f["registerId"]]) for f in found]
+        # The searchId is filled into each tab request once the ticket exists.
+        records = [_record("", code, f, tabs[f["registerId"]]) for f in found]
         return {**base, "status": "found" if records else "not_found", "records": records}
 
     # ── tab ─────────────────────────────────────────────────────────────────
@@ -177,22 +183,23 @@ class StaffSearchService(BaseService):
     async def tab(self, identity: CallerIdentity, search_id: str, registry_code: str,
                   register_id: str, record_id: str, tab_id: str, page: int = 1,
                   page_size: Optional[int] = None) -> Dict[str, Any]:
-        search = await self._search_of(identity, search_id)
+        search = self._search_of(identity, search_id)
         entry = get_catalog().get(registry_code)
-        if entry is None or entry.staff_api is None or registry_code not in (search.registries or []):
+        found = search["found"].get(registry_code)
+        if entry is None or entry.staff_api is None or found is None:
             raise AggregationError(400, "unknown_registry",
                                    "registry %s was not part of this search" % registry_code)
-        found = ((search.outcome or {}).get(registry_code) or {}).get("found") or []
-        if {"registerId": register_id, "recordId": record_id} not in found:
+        if [register_id, record_id] not in found:
             raise AggregationError(400, "record_not_in_search",
                                    "this search did not return that record")
         size = min(page_size or _config.staff_tab_page_size, _config.staff_tab_max_page_size)
 
         claims = identity.raw_claims or {}
-        audit = StaffTabViewAudit(
-            search_id=search_id, staff_subject=identity.subject or "unknown",
-            staff_username=claims.get("preferred_username"), registry_code=registry_code,
-            register_id=register_id, record_id=record_id, tab_id=tab_id)
+        audit = {"event": "staff_tab_view", "search": search["n"],
+                 "staff_subject": identity.subject or "unknown",
+                 "staff_username": claims.get("preferred_username"),
+                 "registry_code": registry_code, "register_id": register_id,
+                 "record_id": record_id, "tab_id": tab_id}
         try:
             tab = await self.staff_api.find_tab(registry_code, entry, register_id, tab_id)
             if tab is None or not entry.staff_api.shows_tab(tab_id):
@@ -203,19 +210,16 @@ class StaffSearchService(BaseService):
                 self.staff_api.tab_records(registry_code, entry, register_id, record_id, tab_id),
                 self.staff_api.registers(registry_code, entry))
         except RegistryError as exc:
-            audit.outcome = {"status": "error", "error": {"reason": exc.reason,
-                                                          "detail": exc.detail}}
-            await _save(audit)
+            _log_audit(audit, {"status": "error", "error": {"reason": exc.reason,
+                                                            "detail": exc.detail}})
             raise AggregationError(502, exc.reason, exc.detail) from exc
         except AggregationError as exc:
-            audit.outcome = {"status": "error", "error": {"reason": exc.reason}}
-            await _save(audit)
+            _log_audit(audit, {"status": "error", "error": {"reason": exc.reason}})
             raise
 
         sections = _sections(metas, groups, {v: k for k, v in names.items()}, page, size)
-        audit.outcome = {"status": "ok", "sections": len(sections),
-                         "records": sum(len(s["records"]) for s in sections)}
-        await _save(audit)
+        _log_audit(audit, {"status": "ok", "sections": len(sections),
+                           "records": sum(len(s["records"]) for s in sections)})
         return {
             "searchId": search_id,
             "registryCode": registry_code,
@@ -226,19 +230,32 @@ class StaffSearchService(BaseService):
             "sections": sections,
         }
 
-    async def _search_of(self, identity: CallerIdentity, search_id: str) -> StaffSearchAudit:
-        async with async_session()() as session:
-            search = await session.get(StaffSearchAudit, search_id)
+    # ── the search ticket ───────────────────────────────────────────────────
+
+    def _mac(self, body: str) -> str:
+        digest = hmac.new(self._mac_key, body.encode("ascii"), hashlib.sha256).digest()
+        return _b64(digest)
+
+    def _ticket(self, payload: Dict[str, Any]) -> str:
+        body = _b64(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+        return body + "." + self._mac(body)
+
+    def _search_of(self, identity: CallerIdentity, search_id: str) -> Dict[str, Any]:
+        """The search a ticket stands for, if it is genuine, the caller's and fresh."""
+        body, _, mac = (search_id or "").partition(".")
+        search = None
+        if body and mac and hmac.compare_digest(mac, self._mac(body)):
+            try:
+                search = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+            except ValueError:
+                search = None
         # Someone else's search is reported as missing, not as forbidden.
-        if search is None or search.staff_subject != (identity.subject or "unknown"):
+        if (not isinstance(search, dict)
+                or search.get("sub") != (identity.subject or "unknown")
+                or not isinstance(search.get("found"), dict)):
             raise AggregationError(404, "search_not_found", "no such search for this user")
-        created = search.created_at
-        if created is not None:
-            if created.tzinfo is None:
-                created = created.replace(tzinfo=timezone.utc)
-            if datetime.now(timezone.utc) - created > timedelta(
-                    seconds=_config.staff_search_ttl_sec):
-                raise AggregationError(410, "search_expired", "search again to open tabs")
+        if time.time() > int(search.get("exp") or 0):
+            raise AggregationError(410, "search_expired", "search again to open tabs")
         return search
 
 
@@ -391,10 +408,12 @@ def _fields(ui_schema: Any, section_register_id: str) -> List[Dict[str, Any]]:
     return out
 
 
-async def _save(row):
-    async with async_session()() as session:
-        session.add(row)
-        await session.commit()
+def _log_audit(audit: Dict[str, Any], outcome: Dict[str, Any]) -> None:
+    _audit.info(json.dumps({**audit, "outcome": outcome}, default=str))
+
+
+def _b64(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
 
 def _text(value: Any) -> Optional[str]:

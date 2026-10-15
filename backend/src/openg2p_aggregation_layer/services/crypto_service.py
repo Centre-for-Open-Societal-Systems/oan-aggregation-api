@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import os
 
@@ -25,7 +26,8 @@ class CryptoService(BaseService):
     every registry hop, and the on-search it POSTs to the partner - is signed
     here. The public half is registered in Partner Management
     (scripts/register-aggregator.py), which is where registries and partners
-    verify it; nothing is verified with this key.
+    verify it. The only thing this service checks itself is the staff
+    search ticket, with a MAC key derived from this key (``mac_key``).
     """
 
     def __init__(self, name="", **kwargs):
@@ -110,3 +112,18 @@ class CryptoService(BaseService):
         else:
             raise ValueError(f"Unsupported aggregation-layer signing key type: {type(key)}")
         return b64url_encode(sig)
+
+    def mac_key(self) -> bytes:
+        """A secret for this service's own MACs (the staff search ticket).
+
+        ``staff_search_ticket_secret`` when set, else derived from the signing
+        key, so every worker and pod holding the same key agrees on it. An
+        ephemeral (dev) key gives each worker its own.
+        """
+        secret = _config.staff_search_ticket_secret.strip()
+        if secret:
+            return hashlib.sha256(secret.encode("utf-8")).digest()
+        der = self._private_key.private_bytes(
+            serialization.Encoding.DER, serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption())
+        return hashlib.sha256(b"aggregation-layer/mac/v1:" + der).digest()

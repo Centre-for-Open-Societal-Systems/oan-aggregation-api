@@ -1,5 +1,17 @@
 # Split plan: Aggregation Layer out of Consent Management
 
+> **Superseded in part (2026-10-15): the Aggregation Layer is now stateless.** The parts of
+> this plan about its own Postgres (`aggregation_requests`, `aggregation_grants`), polling the
+> CM (`cm_poller.py`), Kafka (`kafka_bus/`, `worker.py`, `reap.py`), the OTP copied from the
+> CM (`otp_*.py`, `fayda_otp.py`), raising consent requests and the replay-window rule for a
+> raised consent no longer apply; that code is removed. The subject's consent is now obtained
+> by the partner in the CM before it calls the AL (consent request + one-time code), the AL
+> asks the CM's `/validate` on every call and answers sync (default) or async, and the
+> service account needs no CM admin role. What still holds: the CM carries no aggregation
+> code, the registry hops run on `legitimate_interest`, and the Beneficiary-360 contract and
+> registry catalog. Current state: [README](../README.md),
+> [CM-API-CONTRACT.md](CM-API-CONTRACT.md). The plan below is kept as written.
+
 Status: **revised** (2026-10-08). The first plan (approved 2026-10-07) added five
 aggregation-specific APIs to the Consent Manager (CM PR #2: `/grants`, `/granted-scopes`,
 `/partners/by-audience`, extra `/validate` fields, a CM → AL webhook). That PR is closed.
