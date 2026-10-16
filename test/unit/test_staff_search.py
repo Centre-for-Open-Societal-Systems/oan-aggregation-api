@@ -286,6 +286,9 @@ def _service(monkeypatch, catalog, client):
     handler = Collect()
     audit = staff_search_service._audit
     monkeypatch.setattr(audit, "level", logging.INFO)
+    # Setting .level directly skips setLevel's cache reset: a test that logged
+    # an audit line earlier would leave "INFO disabled" cached.
+    audit._cache.clear()
     monkeypatch.setattr(audit, "handlers", [handler])
     return svc, saved
 

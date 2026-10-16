@@ -120,6 +120,22 @@ class CMClient(BaseService):
             "request_context": {"requested_scopes": requested_scopes},
         })
 
+    async def validate_stored(self, consent_id: str, partner_id: str,
+                              requested_scopes: List[str]) -> Dict[str, Any]:
+        """The PDP decision for a consent the CM holds, presented by its id.
+
+        OpenG2P's ``/validate`` with ``consent_id``: the CM checks the consent
+        is active and was given to ``partner_id`` (``partner_mismatch``
+        otherwise), and answers the grant for this service's controller
+        narrowed to the partner's current policy and ``requested_scopes``.
+        """
+        return await self._call("POST", "/consent/v1/validate", body={
+            "consent_id": consent_id,
+            "consent_partner_id": partner_id,
+            "data_controller": _config.cm_data_controller,
+            "request_context": {"requested_scopes": requested_scopes},
+        })
+
     async def consent_status(self, consent_id: str) -> Optional[str]:
         """``active`` | ``revoked`` | ``expired`` for a CM consent record, or
         None when the CM does not know it. Unauthenticated partner API."""

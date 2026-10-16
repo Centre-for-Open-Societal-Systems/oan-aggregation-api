@@ -50,6 +50,20 @@ class Settings(BaseSettings):
     cm_client_id: str = "aggregation-layer"
     cm_client_secret: str = ""
     cm_static_token: str = ""
+    # This service's controller id at the CM: a partner's stored consent
+    # (``authorize.consent_id``) must carry a grant for it.
+    cm_data_controller: str = "aggregation_layer"
+
+    # ── Partner authentication for ``authorize.consent_id`` ─────────────────
+    # A consent id is only a reference, so the caller must also prove it is the
+    # partner the consent was given to: a bearer token from the CM's partner
+    # realm whose ``partner_id`` claim names that partner. Empty issuer = the
+    # consent_id route is refused (consent_jws, which the partner signs, needs
+    # no token).
+    partner_auth_issuer: str = ""
+    partner_auth_jwks_url: str = ""
+    partner_auth_audience: str = ""
+    partner_auth_partner_claim: str = "partner_id"
 
     # ── Caller authentication (Keycloak / OIDC bearer) ──────────────────────
     # Used by the staff routes (realm ``staff``).

@@ -1,7 +1,12 @@
 """Routes for the aggregated fetch.
 
-    POST /dci/registry/sync/search     partner, consent-signed: the on-search is the response (default)
-    POST /dci/registry/async/search    partner, consent-signed: 202 ack, on-search POSTed to sender_uri
+    POST /dci/registry/sync/search     partner: the on-search is the response (default)
+    POST /dci/registry/async/search    partner: 202 ack, on-search POSTed to sender_uri
+
+The partner authorises a search with either its signed consent object
+(``authorize.consent_jws``) or a consent the CM holds for it
+(``authorize.consent_id``, e.g. granted by the subject's one-time code) plus
+its partner-realm bearer token.
     GET  /aggregation/v1/registries    the registry catalog
 
 The partner routes sit under ``/dci/registry`` to mirror the registries' own
@@ -10,10 +15,13 @@ query is a Beneficiary-360 request. The subject's consent is obtained before
 either is called (consent request + one-time code, in the Consent Manager).
 """
 import logging
+from typing import Optional
 
+from fastapi import Header
 from fastapi.responses import JSONResponse
 from openg2p_fastapi_common.controller import BaseController
 
+from ..auth import partner_from_token
 from ..config import Settings
 from ..registry_catalog import get_catalog
 from ..schemas.aggregation import SeekAck, SeekEnvelope
@@ -30,11 +38,24 @@ def _err(exc: AggregationError) -> JSONResponse:
                         content={"error": exc.reason, "detail": exc.detail})
 
 
-def _call(envelope: SeekEnvelope) -> dict:
+def _call(envelope: SeekEnvelope, authorization: Optional[str]) -> dict:
     item = envelope.message.search_request[0]
     criteria = item.search_criteria
+    consent_id = criteria.authorize.consent_id
+    partner_id = None
+    if consent_id:
+        # A consent id is only a reference: the token names the partner, and
+        # the CM permits only if the consent was given to that partner.
+        partner_id = partner_from_token(authorization)
+        sender = envelope.header.sender_id
+        if sender and sender != partner_id:
+            raise AggregationError(
+                403, "sender_mismatch",
+                "header.sender_id is not the partner named by the bearer token")
     return {
         "consent_jws": criteria.authorize.consent_jws,
+        "consent_id": consent_id,
+        "partner_id": partner_id,
         "query": criteria.query.wire(),
         "transaction_id": envelope.message.transaction_id,
         "reference_id": item.reference_id,
@@ -61,7 +82,10 @@ class AggregatorController(BaseController):
 
     # ── partner ─────────────────────────────────────────────────────────────
 
-    async def search_sync(self, envelope: SeekEnvelope):
+    async def search_sync(
+        self, envelope: SeekEnvelope,
+        authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    ):
         """Answer a Beneficiary-360 request in the response.
 
         The body is the signed DCI on-search whose ``reg_records[0]`` is the
@@ -69,11 +93,14 @@ class AggregatorController(BaseController):
         partner in the Consent Manager; otherwise 403 ``no_subject_consent``.
         """
         try:
-            return await self.aggregator.search_sync(**_call(envelope))
+            return await self.aggregator.search_sync(**_call(envelope, authorization))
         except AggregationError as exc:
             return _err(exc)
 
-    async def search_async(self, envelope: SeekEnvelope):
+    async def search_async(
+        self, envelope: SeekEnvelope,
+        authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    ):
         """Accept a Beneficiary-360 request and answer it on ``header.sender_uri``.
 
         Every check (callback URL, query, consent) runs before the 202; the
@@ -82,7 +109,7 @@ class AggregatorController(BaseController):
         """
         try:
             aggregation = await self.aggregator.search_async(
-                callback_url=envelope.header.sender_uri, **_call(envelope))
+                callback_url=envelope.header.sender_uri, **_call(envelope, authorization))
         except AggregationError as exc:
             return _err(exc)
         return SeekAck(

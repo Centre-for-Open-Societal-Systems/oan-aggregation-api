@@ -126,3 +126,62 @@ async def current_identity(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Token missing subject"
         )
     return _identity_from_claims(claims)
+
+
+# ── Partner realm (``authorize.consent_id``) ─────────────────────────────────
+# A stored consent is presented by its id, so the caller must prove it is the
+# partner the consent was given to: a token from the CM's partner realm whose
+# ``partner_id`` claim names that partner. Verified with that realm's keys,
+# never the staff realm's.
+
+_partner_jwk_client: Optional[jwt.PyJWKClient] = None
+
+
+def _get_partner_jwk_client() -> jwt.PyJWKClient:
+    global _partner_jwk_client
+    if _partner_jwk_client is None:
+        url = _config.partner_auth_jwks_url or (
+            _config.partner_auth_issuer.rstrip("/") + "/protocol/openid-connect/certs")
+        _partner_jwk_client = jwt.PyJWKClient(url)
+    return _partner_jwk_client
+
+
+def partner_from_token(authorization: Optional[str]) -> str:
+    """The ``partner_id`` of a valid partner-realm bearer token.
+
+    Raises HTTPException: 401 without / with a bad token, 403 without the
+    claim, 503 if partner tokens are not configured or the JWKS is unreachable.
+    """
+    if not _config.partner_auth_issuer:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="consent_id needs partner authentication, which is not configured")
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="consent_id needs the partner's bearer token")
+    token = authorization[len("Bearer "):]
+    try:
+        key = _get_partner_jwk_client().get_signing_key_from_jwt(token)
+    except jwt.PyJWKClientConnectionError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail=f"Could not reach the partner realm JWKS: {exc}")
+    except jwt.PyJWTError as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail=f"Invalid bearer token: {exc}")
+    try:
+        claims = jwt.decode(
+            token, key.key, algorithms=_config.auth_algorithms,
+            issuer=_config.partner_auth_issuer,
+            audience=_config.partner_auth_audience or None,
+            options={"verify_aud": bool(_config.partner_auth_audience), "require": ["exp"]},
+        )
+    except jwt.PyJWTError as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail=f"Invalid or expired token: {exc}")
+    value = claims.get(_config.partner_auth_partner_claim)
+    if isinstance(value, list):
+        value = value[0] if len(value) == 1 else None
+    if not isinstance(value, str) or not value.strip():
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                            detail=f"Token has no '{_config.partner_auth_partner_claim}' claim")
+    return value.strip()

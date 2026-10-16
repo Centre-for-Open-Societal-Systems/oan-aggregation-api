@@ -123,18 +123,23 @@ class AggregatorService(BaseService):
 
     # ── entry points ────────────────────────────────────────────────────────
 
-    async def search_sync(self, *, consent_jws: str, query: Dict[str, Any],
+    async def search_sync(self, *, consent_jws: Optional[str] = None,
+                          consent_id: Optional[str] = None,
+                          partner_id: Optional[str] = None, query: Dict[str, Any],
                           transaction_id: Optional[str], reference_id: Optional[str],
                           purpose: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         """Validate, fetch, answer: the signed on-search envelope."""
         aggregation = await self.prepare(
-            consent_jws=consent_jws, query=query, transaction_id=transaction_id,
+            consent_jws=consent_jws, consent_id=consent_id, partner_id=partner_id,
+            query=query, transaction_id=transaction_id,
             reference_id=reference_id, purpose=purpose, mode="sync")
         outcomes = await self._query_registries(aggregation)
         self._log(aggregation, outcomes, "answered")
         return self._build_envelope(aggregation, outcomes)
 
-    async def search_async(self, *, consent_jws: str, query: Dict[str, Any],
+    async def search_async(self, *, consent_jws: Optional[str] = None,
+                           consent_id: Optional[str] = None,
+                           partner_id: Optional[str] = None, query: Dict[str, Any],
                            callback_url: Optional[str], transaction_id: Optional[str],
                            reference_id: Optional[str],
                            purpose: Optional[Dict[str, Any]]) -> Aggregation:
@@ -150,7 +155,8 @@ class AggregatorService(BaseService):
         if not callback_url.lower().startswith(("http://", "https://")):
             raise AggregationError(400, "bad_callback", "sender_uri must be an http(s) URL")
         aggregation = await self.prepare(
-            consent_jws=consent_jws, query=query, transaction_id=transaction_id,
+            consent_jws=consent_jws, consent_id=consent_id, partner_id=partner_id,
+            query=query, transaction_id=transaction_id,
             reference_id=reference_id, purpose=purpose, mode="async")
         aggregation.callback_url = callback_url
         task = asyncio.get_running_loop().create_task(self._answer_on_callback(aggregation))
@@ -160,7 +166,9 @@ class AggregatorService(BaseService):
 
     # ── 1. prepare ──────────────────────────────────────────────────────────
 
-    async def prepare(self, *, consent_jws: str, query: Dict[str, Any],
+    async def prepare(self, *, consent_jws: Optional[str] = None,
+                      consent_id: Optional[str] = None,
+                      partner_id: Optional[str] = None, query: Dict[str, Any],
                       transaction_id: Optional[str], reference_id: Optional[str],
                       purpose: Optional[Dict[str, Any]], mode: str) -> Aggregation:
         """Every check made before a registry is called.
@@ -185,7 +193,10 @@ class AggregatorService(BaseService):
         requestable = catalog.scope_ids(registries)
 
         try:
-            decision = await self.cm.validate(consent_jws, requestable)
+            if consent_id:
+                decision = await self.cm.validate_stored(consent_id, partner_id, requestable)
+            else:
+                decision = await self.cm.validate(consent_jws, requestable)
         except CMError as exc:
             raise AggregationError(exc.status, exc.reason, exc.detail) from exc
         if decision.get("decision") != "permit":
@@ -199,10 +210,12 @@ class AggregatorService(BaseService):
         subject = decision.get("subject_id") or {}
         self._check_subject(query, subject.get("value"), catalog.same_identifier)
 
-        # Who the partner is: the CM looked the binding up by the object's
-        # ``aud`` and verified the signature against that partner's key, so
-        # after a permit ``aud`` IS the partner.
-        audience = self.cm.decode_claims(consent_jws).get("aud")
+        # Who the partner is. consent_id: the partner's token said so and the
+        # CM permitted only because the consent was given to that partner.
+        # consent_jws: the CM looked the binding up by the object's ``aud`` and
+        # verified the signature against that partner's key, so after a
+        # permit ``aud`` IS the partner.
+        audience = partner_id if consent_id else self.cm.decode_claims(consent_jws).get("aud")
         return Aggregation(
             correlation_id=uuid.uuid4().hex,
             query=query,

@@ -23,7 +23,7 @@ route, POSTed to ``sender_uri`` on the async one.
 """
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ..bene360 import QUERY_TYPE, Beneficiary360Request
 
@@ -48,11 +48,25 @@ class SeekHeader(BaseModel):
 
 
 class SeekAuthorize(BaseModel):
+    """Exactly one of ``consent_jws`` / ``consent_id``."""
+
     model_config = ConfigDict(extra="allow")
-    consent_jws: str = Field(
+    consent_jws: Optional[str] = Field(
+        default=None,
         description="The partner's consent object for its binding with this "
                     "service. Its data_scopes are scope ids "
                     "(<registryCode>.<scope>, see GET /aggregation/v1/registries).")
+    consent_id: Optional[str] = Field(
+        default=None, max_length=99,
+        description="A consent the Consent Manager holds for the calling partner "
+                    "(e.g. granted when the subject's one-time code was verified). "
+                    "Needs the partner's bearer token (partner realm).")
+
+    @model_validator(mode="after")
+    def _one_consent(self):
+        if bool(self.consent_jws) == bool(self.consent_id):
+            raise ValueError("authorize needs exactly one of consent_jws or consent_id")
+        return self
 
 
 class SeekCriteria(BaseModel):
