@@ -126,15 +126,19 @@ class StaffSearchService(BaseService):
 
         searched_at = datetime.now(timezone.utc)
         expires_at = searched_at + timedelta(seconds=_config.staff_search_ttl_sec)
-        found = {r["registryCode"]: [[x["registerId"], x["recordId"]] for x in r["records"]]
-                 for r in results}
-        search_id = self._ticket({
-            "n": nonce, "sub": identity.subject or "unknown",
-            "exp": int(expires_at.timestamp()), "found": found})
+        # One ticket per record, so its size never grows with the number of
+        # records found: each opens only that record's tabs. The search's own
+        # searchId names the search (and its expiry) but opens nothing.
+        base = {"n": nonce, "sub": identity.subject or "unknown",
+                "exp": int(expires_at.timestamp())}
+        search_id = self._ticket(base)
         for r in results:
             for record in r["records"]:
+                ticket = self._ticket(
+                    base | {"r": [r["registryCode"], record["registerId"], record["recordId"]]})
+                record["searchId"] = ticket
                 for t in record["tabs"]:
-                    t["request"]["body"]["searchId"] = search_id
+                    t["request"]["body"]["searchId"] = ticket
 
         claims = identity.raw_claims or {}
         outcome = {r["registryCode"]: {k: r[k] for k in ("status", "error") if r.get(k)}
@@ -160,7 +164,7 @@ class StaffSearchService(BaseService):
     async def _one(self, code: str, entry, foundational_id: str) -> Dict[str, Any]:
         base = {"registryCode": code, "registryName": entry.name}
         try:
-            found = await self.staff_api.search(code, entry, foundational_id)
+            found, complete = await self.staff_api.search(code, entry, foundational_id)
             tabs = {}
             for register_id in {f["registerId"] for f in found}:
                 tabs[register_id] = [t for t in await self.staff_api.tabs(code, entry, register_id)
@@ -176,7 +180,9 @@ class StaffSearchService(BaseService):
                     "error": {"reason": "internal_error", "detail": str(exc)}}
         # The searchId is filled into each tab request once the ticket exists.
         records = [_record("", code, f, tabs[f["registerId"]]) for f in found]
-        return {**base, "status": "found" if records else "not_found", "records": records}
+        # Pages left unread: no record is not proof of absence.
+        status = "found" if records else ("not_found" if complete else "incomplete")
+        return {**base, "status": status, "records": records, "complete": complete}
 
     # ── tab ─────────────────────────────────────────────────────────────────
 
@@ -185,11 +191,23 @@ class StaffSearchService(BaseService):
                   page_size: Optional[int] = None) -> Dict[str, Any]:
         search = self._search_of(identity, search_id)
         entry = get_catalog().get(registry_code)
-        found = search["found"].get(registry_code)
-        if entry is None or entry.staff_api is None or found is None:
+        bound = search.get("r")
+        if bound is not None:
+            # A record's ticket: exactly that record.
+            in_search = bound[0] == registry_code
+            in_found = in_search and bound[1:] == [register_id, record_id]
+        elif "found" in search:
+            # A ticket issued before per-record tickets (still within its TTL).
+            found = search["found"].get(registry_code)
+            in_search = found is not None
+            in_found = in_search and [register_id, record_id] in found
+        else:
+            raise AggregationError(400, "record_not_in_search",
+                                   "use the searchId from the record's tab request")
+        if entry is None or entry.staff_api is None or not in_search:
             raise AggregationError(400, "unknown_registry",
                                    "registry %s was not part of this search" % registry_code)
-        if [register_id, record_id] not in found:
+        if not in_found:
             raise AggregationError(400, "record_not_in_search",
                                    "this search did not return that record")
         size = min(page_size or _config.staff_tab_page_size, _config.staff_tab_max_page_size)
@@ -252,7 +270,9 @@ class StaffSearchService(BaseService):
         # Someone else's search is reported as missing, not as forbidden.
         if (not isinstance(search, dict)
                 or search.get("sub") != (identity.subject or "unknown")
-                or not isinstance(search.get("found"), dict)):
+                or ("found" in search and not isinstance(search["found"], dict))
+                or ("r" in search and not (isinstance(search["r"], list)
+                                           and len(search["r"]) == 3))):
             raise AggregationError(404, "search_not_found", "no such search for this user")
         if time.time() > int(search.get("exp") or 0):
             raise AggregationError(410, "search_expired", "search again to open tabs")

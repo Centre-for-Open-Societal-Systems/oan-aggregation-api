@@ -26,19 +26,20 @@ KEY = ec.generate_private_key(ec.SECP256R1())
 class StoredCM:
     """The CM for a stored consent: permits only for the partner it was given to."""
 
-    def __init__(self, owner="bank-a", subject=FID):
-        self.owner, self.subject, self.calls = owner, subject, []
+    def __init__(self, owner="bank-a", subject=FID, purpose="credit-assessment"):
+        self.owner, self.subject, self.purpose, self.calls = owner, subject, purpose, []
 
-    async def validate(self, consent_jws, requested_scopes):
+    async def validate(self, consent_jws, requested_scopes, purpose=None):
         raise AssertionError("consent_jws path not expected")
 
-    async def validate_stored(self, consent_id, partner_id, requested_scopes):
+    async def validate_stored(self, consent_id, partner_id, requested_scopes, purpose=None):
         self.calls.append((consent_id, partner_id, requested_scopes))
         if partner_id != self.owner:
             return {"decision": "deny", "reason_code": "partner_mismatch",
                     "detail": "consent_partner_id is not the partner the consent was given to"}
         return {"decision": "permit", "consent_id": consent_id,
                 "subject_id": {"type": "national_id", "value": self.subject},
+                "purpose": {"code": self.purpose} if self.purpose else None,
                 "effective_data_scopes": requested_scopes}
 
     async def consent_status(self, consent_id):
@@ -170,3 +171,63 @@ def test_controller_refuses_a_sender_that_is_not_the_token_partner(partner_realm
 def test_controller_consent_jws_needs_no_token():
     call = aggregator_controller._call(_envelope(consent_jws="a.b.c"), None)
     assert call["consent_jws"] == "a.b.c" and call["partner_id"] is None
+
+
+# ── purpose: the use is bound to the consent ─────────────────────────────────
+
+def _prepare(svc, purpose, **kw):
+    return asyncio.run(svc.prepare(
+        consent_id="c-77", partner_id="bank-a", query=QUERY, transaction_id="t",
+        reference_id="r", purpose=purpose, mode="sync", **kw))
+
+
+class PurposeCM(StoredCM):
+    """Records the purpose the AL asked the CM about."""
+
+    async def validate_stored(self, consent_id, partner_id, requested_scopes, purpose=None):
+        self.asked = purpose
+        return await super().validate_stored(consent_id, partner_id, requested_scopes)
+
+
+def test_purpose_is_asked_of_the_cm_and_carried_to_the_registries(service):
+    service.cm = PurposeCM()
+    agg = _prepare(service, {"code": "credit-assessment"})
+    assert service.cm.asked == {"code": "credit-assessment"}
+    # What the registry hop is signed with: the consent's purpose.
+    assert agg.purpose == {"code": "credit-assessment"}
+
+
+def test_another_purpose_is_refused(service):
+    service.cm = PurposeCM()
+    with pytest.raises(AggregationError) as exc:
+        _prepare(service, {"code": "marketing"})
+    assert (exc.value.status, exc.value.reason) == (403, "purpose_mismatch")
+
+
+def test_left_out_purpose_defaults_to_the_consents(service):
+    service.cm = PurposeCM()
+    assert _prepare(service, None).purpose == {"code": "credit-assessment"}
+    assert service.cm.asked is None
+
+
+def test_purpose_the_cm_does_not_confirm_is_refused(service):
+    service.cm = StoredCM(purpose=None)        # a CM that returns no purpose
+    with pytest.raises(AggregationError) as exc:
+        _prepare(service, {"code": "credit-assessment"})
+    assert exc.value.reason == "purpose_unverified"
+    assert _prepare(service, None).purpose == {}   # nothing claimed, nothing to check
+
+
+def test_signed_consent_purpose_comes_from_its_claims(service):
+    from test_sync_async import _jws
+
+    jws = _jws({"aud": "partner-x", "purpose": {"code": "credit-assessment"},
+                "subject_id": {"type": "national_id", "value": FID}})
+    agg = asyncio.run(service.prepare(consent_jws=jws, query=QUERY, transaction_id="t",
+                                      reference_id="r", purpose=None, mode="sync"))
+    assert agg.purpose == {"code": "credit-assessment"}
+    with pytest.raises(AggregationError) as exc:
+        asyncio.run(service.prepare(consent_jws=jws, query=QUERY, transaction_id="t",
+                                    reference_id="r", purpose={"code": "marketing"},
+                                    mode="sync"))
+    assert exc.value.reason == "purpose_mismatch"

@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "OpenG2P Aggregation Layer - Staff search (tab-wise)",
-    "description": "Registry staff look a beneficiary up across every registry with a `staff_api` in the catalog (`agg_url`, default http://localhost:8110). No consent, consent object or OTP: the staff user's role is checked by this service, and each registry's staff-api checks this service's own service account.\n\n## Two calls, tabs on demand\n\n```\n1. POST /aggregation/v1/staff/registry/search   {foundationalId, registryFilter?, purpose?}\n   -> per registry: found / not_found / error\n      per record: summary (the registry's list row) + tabs, each with the request that opens it\n2. POST /aggregation/v1/staff/registry/tab      the tab's request.body, as the search gave it\n   -> that tab only: sections (label, fields, isList) with their rows, list sections paged\n```\n\nTabs, sections and fields are the registries' own metadata: a tab added in a registry appears in the search answer without a change here. A client renders what it gets and ignores fields it does not know (`schemaVersion` \"1\").\n\nA tab request is accepted only for a record its search returned, from the staff user who ran it, until `expiresAt` (then `410 search_expired`: search again). `searchId` is a signed ticket (a long token, not a stored row): it carries the staff user, the records found and the expiry, so nothing is stored and any pod can answer a tab request. Every search and every tab opened is written to the audit log (logger `app.audit`, events `staff_search` / `staff_tab_view`).\n\n## Running it\n\n1. Set `staff_username` / `staff_password` (collection variables, or import `OpenG2P-Aggregator-Staff.postman_environment.json` and fill every value). The user needs a role from `AGGREGATION_LAYER_STAFF_SEARCH_ROLES`. Local stack: `staff`, with the password from your local setup.\n2. Run the folders in order. **1 Search** saves `{{search_id}}` and the record ids the tab folders use.\n\n| Folder | What |\n|---|---|\n| 0 Login | staff token |\n| 1 Search | all registries, then each registry alone |\n| 2-4 | every tab of each registry, one request per tab (tab ids of the reference registries) |\n| 5 | every tab the search returned, sent as given: no tab id written in the collection |\n| 6 | paging a list section |\n| 7 | refusals |\n\n```bash\nnewman run postman/OpenG2P-Aggregator-Staff.postman_collection.json \\\n  --env-var staff_username=staff --env-var staff_password=<password>\n```\n",
+    "description": "Registry staff look a beneficiary up across every registry with a `staff_api` in the catalog (`agg_url`, default http://localhost:8110). No consent, consent object or OTP: the staff user's role is checked by this service, and each registry's staff-api checks this service's own service account.\n\n## Two calls, tabs on demand\n\n```\n1. POST /aggregation/v1/staff/registry/search   {foundationalId, registryFilter?, purpose?}\n   -> per registry: found / not_found / error\n      per record: summary (the registry's list row) + tabs, each with the request that opens it\n2. POST /aggregation/v1/staff/registry/tab      the tab's request.body, as the search gave it\n   -> that tab only: sections (label, fields, isList) with their rows, list sections paged\n```\n\nTabs, sections and fields are the registries' own metadata: a tab added in a registry appears in the search answer without a change here. A client renders what it gets and ignores fields it does not know (`schemaVersion` \"1\").\n\nA tab request is accepted only for a record its search returned, from the staff user who ran it, until `expiresAt` (then `410 search_expired`: search again). `searchId` is a signed ticket (not a stored row): the search's own `searchId` names the search; each record has its own `searchId` (staff user, that record, expiry), already in its tab requests, so nothing is stored, any pod can answer a tab request, and the size does not grow with the records found. Every search and every tab opened is written to the audit log (logger `app.audit`, events `staff_search` / `staff_tab_view`).\n\n## Running it\n\n1. Set `staff_username` / `staff_password` (collection variables, or import `OpenG2P-Aggregator-Staff.postman_environment.json` and fill every value). The user needs a role from `AGGREGATION_LAYER_STAFF_SEARCH_ROLES`. Local stack: `staff`, with the password from your local setup.\n2. Run the folders in order. **1 Search** saves `{{search_id}}`, and per record its ids and its own `{{<registry>_<register>_search_id}}` that the tab folders use.\n\n| Folder | What |\n|---|---|\n| 0 Login | staff token |\n| 1 Search | all registries, then each registry alone |\n| 2-4 | every tab of each registry, one request per tab (tab ids of the reference registries) |\n| 5 | every tab the search returned, sent as given: no tab id written in the collection |\n| 6 | paging a list section |\n| 7 | refusals |\n\n```bash\nnewman run postman/OpenG2P-Aggregator-Staff.postman_collection.json \\\n  --env-var staff_username=staff --env-var staff_password=<password>\n```\n",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "item": [
@@ -139,7 +139,7 @@
                   "pm.test('summary and tabs, no tab data', () => body.registries.forEach(r => r.records.forEach(x => {",
                   "  pm.expect(x.summary).to.be.an('object');",
                   "  pm.expect(x.tabs).to.be.an('array');",
-                  "  x.tabs.forEach(t => { pm.expect(t.request.url).to.equal('/aggregation/v1/staff/registry/tab'); pm.expect(t.request.body.tabId).to.equal(t.tabId); pm.expect(t.request.body.searchId).to.equal(body.searchId); });",
+                  "  x.tabs.forEach(t => { pm.expect(t.request.url).to.equal('/aggregation/v1/staff/registry/tab'); pm.expect(t.request.body.tabId).to.equal(t.tabId); pm.expect(t.request.body.searchId).to.equal(x.searchId); });",
                   "  pm.expect(x).to.not.have.property('sections');",
                   "})));",
                   "const j = pm.response.json();",
@@ -150,6 +150,7 @@
                   "    const k = short + '_' + x.register.toLowerCase();",
                   "    pm.collectionVariables.set(k + '_register_id', x.registerId);",
                   "    pm.collectionVariables.set(k + '_record_id', x.recordId);",
+                  "    pm.collectionVariables.set(k + '_search_id', x.searchId);",
                   "  });",
                   "  console.log(r.registryCode, r.status, r.records.map(x => x.register + ' ' + x.recordId + ': ' + x.tabs.map(t => t.tabId).join(', ')).join(' | '));",
                   "});",
@@ -218,7 +219,7 @@
                   "pm.test('summary and tabs, no tab data', () => body.registries.forEach(r => r.records.forEach(x => {",
                   "  pm.expect(x.summary).to.be.an('object');",
                   "  pm.expect(x.tabs).to.be.an('array');",
-                  "  x.tabs.forEach(t => { pm.expect(t.request.url).to.equal('/aggregation/v1/staff/registry/tab'); pm.expect(t.request.body.tabId).to.equal(t.tabId); pm.expect(t.request.body.searchId).to.equal(body.searchId); });",
+                  "  x.tabs.forEach(t => { pm.expect(t.request.url).to.equal('/aggregation/v1/staff/registry/tab'); pm.expect(t.request.body.tabId).to.equal(t.tabId); pm.expect(t.request.body.searchId).to.equal(x.searchId); });",
                   "  pm.expect(x).to.not.have.property('sections');",
                   "})));",
                   "pm.test('only FARMER_REGISTRY', () => pm.expect(body.registries.map(r => r.registryCode)).to.eql([\"FARMER_REGISTRY\"]));",
@@ -230,6 +231,7 @@
                   "    const k = short + '_' + x.register.toLowerCase();",
                   "    pm.collectionVariables.set(k + '_register_id', x.registerId);",
                   "    pm.collectionVariables.set(k + '_record_id', x.recordId);",
+                  "    pm.collectionVariables.set(k + '_search_id', x.searchId);",
                   "  });",
                   "  console.log(r.registryCode, r.status, r.records.map(x => x.register + ' ' + x.recordId + ': ' + x.tabs.map(t => t.tabId).join(', ')).join(' | '));",
                   "});"
@@ -295,7 +297,7 @@
                   "pm.test('summary and tabs, no tab data', () => body.registries.forEach(r => r.records.forEach(x => {",
                   "  pm.expect(x.summary).to.be.an('object');",
                   "  pm.expect(x.tabs).to.be.an('array');",
-                  "  x.tabs.forEach(t => { pm.expect(t.request.url).to.equal('/aggregation/v1/staff/registry/tab'); pm.expect(t.request.body.tabId).to.equal(t.tabId); pm.expect(t.request.body.searchId).to.equal(body.searchId); });",
+                  "  x.tabs.forEach(t => { pm.expect(t.request.url).to.equal('/aggregation/v1/staff/registry/tab'); pm.expect(t.request.body.tabId).to.equal(t.tabId); pm.expect(t.request.body.searchId).to.equal(x.searchId); });",
                   "  pm.expect(x).to.not.have.property('sections');",
                   "})));",
                   "pm.test('only LIVESTOCK_REGISTRY', () => pm.expect(body.registries.map(r => r.registryCode)).to.eql([\"LIVESTOCK_REGISTRY\"]));",
@@ -307,6 +309,7 @@
                   "    const k = short + '_' + x.register.toLowerCase();",
                   "    pm.collectionVariables.set(k + '_register_id', x.registerId);",
                   "    pm.collectionVariables.set(k + '_record_id', x.recordId);",
+                  "    pm.collectionVariables.set(k + '_search_id', x.searchId);",
                   "  });",
                   "  console.log(r.registryCode, r.status, r.records.map(x => x.register + ' ' + x.recordId + ': ' + x.tabs.map(t => t.tabId).join(', ')).join(' | '));",
                   "});"
@@ -372,7 +375,7 @@
                   "pm.test('summary and tabs, no tab data', () => body.registries.forEach(r => r.records.forEach(x => {",
                   "  pm.expect(x.summary).to.be.an('object');",
                   "  pm.expect(x.tabs).to.be.an('array');",
-                  "  x.tabs.forEach(t => { pm.expect(t.request.url).to.equal('/aggregation/v1/staff/registry/tab'); pm.expect(t.request.body.tabId).to.equal(t.tabId); pm.expect(t.request.body.searchId).to.equal(body.searchId); });",
+                  "  x.tabs.forEach(t => { pm.expect(t.request.url).to.equal('/aggregation/v1/staff/registry/tab'); pm.expect(t.request.body.tabId).to.equal(t.tabId); pm.expect(t.request.body.searchId).to.equal(x.searchId); });",
                   "  pm.expect(x).to.not.have.property('sections');",
                   "})));",
                   "pm.test('only CROPSOWN_REGISTRY', () => pm.expect(body.registries.map(r => r.registryCode)).to.eql([\"CROPSOWN_REGISTRY\"]));",
@@ -384,6 +387,7 @@
                   "    const k = short + '_' + x.register.toLowerCase();",
                   "    pm.collectionVariables.set(k + '_register_id', x.registerId);",
                   "    pm.collectionVariables.set(k + '_record_id', x.recordId);",
+                  "    pm.collectionVariables.set(k + '_search_id', x.searchId);",
                   "  });",
                   "  console.log(r.registryCode, r.status, r.records.map(x => x.register + ' ' + x.recordId + ': ' + x.tabs.map(t => t.tabId).join(', ')).join(' | '));",
                   "});"
@@ -449,7 +453,7 @@
                   "pm.test('summary and tabs, no tab data', () => body.registries.forEach(r => r.records.forEach(x => {",
                   "  pm.expect(x.summary).to.be.an('object');",
                   "  pm.expect(x.tabs).to.be.an('array');",
-                  "  x.tabs.forEach(t => { pm.expect(t.request.url).to.equal('/aggregation/v1/staff/registry/tab'); pm.expect(t.request.body.tabId).to.equal(t.tabId); pm.expect(t.request.body.searchId).to.equal(body.searchId); });",
+                  "  x.tabs.forEach(t => { pm.expect(t.request.url).to.equal('/aggregation/v1/staff/registry/tab'); pm.expect(t.request.body.tabId).to.equal(t.tabId); pm.expect(t.request.body.searchId).to.equal(x.searchId); });",
                   "  pm.expect(x).to.not.have.property('sections');",
                   "})));",
                   "const j = pm.response.json();",
@@ -460,6 +464,7 @@
                   "    const k = short + '_' + x.register.toLowerCase();",
                   "    pm.collectionVariables.set(k + '_register_id', x.registerId);",
                   "    pm.collectionVariables.set(k + '_record_id', x.recordId);",
+                  "    pm.collectionVariables.set(k + '_search_id', x.searchId);",
                   "  });",
                   "  console.log(r.registryCode, r.status, r.records.map(x => x.register + ' ' + x.recordId + ': ' + x.tabs.map(t => t.tabId).join(', ')).join(' | '));",
                   "});"
@@ -496,7 +501,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"FARMER_REGISTRY\",\n  \"registerId\": \"{{farmer_farmer_register_id}}\",\n  \"recordId\": \"{{farmer_farmer_record_id}}\",\n  \"tabId\": \"farmer_farmer_tab\"\n}",
+              "raw": "{\n  \"searchId\": \"{{farmer_farmer_search_id}}\",\n  \"registryCode\": \"FARMER_REGISTRY\",\n  \"registerId\": \"{{farmer_farmer_register_id}}\",\n  \"recordId\": \"{{farmer_farmer_record_id}}\",\n  \"tabId\": \"farmer_farmer_tab\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -559,7 +564,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"FARMER_REGISTRY\",\n  \"registerId\": \"{{farmer_farmer_register_id}}\",\n  \"recordId\": \"{{farmer_farmer_record_id}}\",\n  \"tabId\": \"farmer_household_link_tab\"\n}",
+              "raw": "{\n  \"searchId\": \"{{farmer_farmer_search_id}}\",\n  \"registryCode\": \"FARMER_REGISTRY\",\n  \"registerId\": \"{{farmer_farmer_register_id}}\",\n  \"recordId\": \"{{farmer_farmer_record_id}}\",\n  \"tabId\": \"farmer_household_link_tab\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -622,7 +627,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"FARMER_REGISTRY\",\n  \"registerId\": \"{{farmer_farmer_register_id}}\",\n  \"recordId\": \"{{farmer_farmer_record_id}}\",\n  \"tabId\": \"farmer_location_tab\"\n}",
+              "raw": "{\n  \"searchId\": \"{{farmer_farmer_search_id}}\",\n  \"registryCode\": \"FARMER_REGISTRY\",\n  \"registerId\": \"{{farmer_farmer_register_id}}\",\n  \"recordId\": \"{{farmer_farmer_record_id}}\",\n  \"tabId\": \"farmer_location_tab\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -685,7 +690,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"FARMER_REGISTRY\",\n  \"registerId\": \"{{farmer_farmer_register_id}}\",\n  \"recordId\": \"{{farmer_farmer_record_id}}\",\n  \"tabId\": \"farmer_land_tab\"\n}",
+              "raw": "{\n  \"searchId\": \"{{farmer_farmer_search_id}}\",\n  \"registryCode\": \"FARMER_REGISTRY\",\n  \"registerId\": \"{{farmer_farmer_register_id}}\",\n  \"recordId\": \"{{farmer_farmer_record_id}}\",\n  \"tabId\": \"farmer_land_tab\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -748,7 +753,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"FARMER_REGISTRY\",\n  \"registerId\": \"{{farmer_farmer_register_id}}\",\n  \"recordId\": \"{{farmer_farmer_record_id}}\",\n  \"tabId\": \"farmer_crop_tab\"\n}",
+              "raw": "{\n  \"searchId\": \"{{farmer_farmer_search_id}}\",\n  \"registryCode\": \"FARMER_REGISTRY\",\n  \"registerId\": \"{{farmer_farmer_register_id}}\",\n  \"recordId\": \"{{farmer_farmer_record_id}}\",\n  \"tabId\": \"farmer_crop_tab\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -811,7 +816,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"FARMER_REGISTRY\",\n  \"registerId\": \"{{farmer_farmer_register_id}}\",\n  \"recordId\": \"{{farmer_farmer_record_id}}\",\n  \"tabId\": \"farmer_livestock_tab\"\n}",
+              "raw": "{\n  \"searchId\": \"{{farmer_farmer_search_id}}\",\n  \"registryCode\": \"FARMER_REGISTRY\",\n  \"registerId\": \"{{farmer_farmer_register_id}}\",\n  \"recordId\": \"{{farmer_farmer_record_id}}\",\n  \"tabId\": \"farmer_livestock_tab\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -874,7 +879,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"FARMER_REGISTRY\",\n  \"registerId\": \"{{farmer_farmer_register_id}}\",\n  \"recordId\": \"{{farmer_farmer_record_id}}\",\n  \"tabId\": \"farmer_ids_tab\"\n}",
+              "raw": "{\n  \"searchId\": \"{{farmer_farmer_search_id}}\",\n  \"registryCode\": \"FARMER_REGISTRY\",\n  \"registerId\": \"{{farmer_farmer_register_id}}\",\n  \"recordId\": \"{{farmer_farmer_record_id}}\",\n  \"tabId\": \"farmer_ids_tab\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -937,7 +942,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"FARMER_REGISTRY\",\n  \"registerId\": \"{{farmer_farmer_register_id}}\",\n  \"recordId\": \"{{farmer_farmer_record_id}}\",\n  \"tabId\": \"farmer_enumerator_tab\"\n}",
+              "raw": "{\n  \"searchId\": \"{{farmer_farmer_search_id}}\",\n  \"registryCode\": \"FARMER_REGISTRY\",\n  \"registerId\": \"{{farmer_farmer_register_id}}\",\n  \"recordId\": \"{{farmer_farmer_record_id}}\",\n  \"tabId\": \"farmer_enumerator_tab\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -1006,7 +1011,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"LIVESTOCK_REGISTRY\",\n  \"registerId\": \"{{livestock_farmer_register_id}}\",\n  \"recordId\": \"{{livestock_farmer_record_id}}\",\n  \"tabId\": \"livestock_farmer_tab\"\n}",
+              "raw": "{\n  \"searchId\": \"{{livestock_farmer_search_id}}\",\n  \"registryCode\": \"LIVESTOCK_REGISTRY\",\n  \"registerId\": \"{{livestock_farmer_register_id}}\",\n  \"recordId\": \"{{livestock_farmer_record_id}}\",\n  \"tabId\": \"livestock_farmer_tab\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -1069,7 +1074,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"LIVESTOCK_REGISTRY\",\n  \"registerId\": \"{{livestock_livestock_register_id}}\",\n  \"recordId\": \"{{livestock_livestock_record_id}}\",\n  \"tabId\": \"livestock_livestock_tab\"\n}",
+              "raw": "{\n  \"searchId\": \"{{livestock_livestock_search_id}}\",\n  \"registryCode\": \"LIVESTOCK_REGISTRY\",\n  \"registerId\": \"{{livestock_livestock_register_id}}\",\n  \"recordId\": \"{{livestock_livestock_record_id}}\",\n  \"tabId\": \"livestock_livestock_tab\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -1132,7 +1137,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"LIVESTOCK_REGISTRY\",\n  \"registerId\": \"{{livestock_livestock_register_id}}\",\n  \"recordId\": \"{{livestock_livestock_record_id}}\",\n  \"tabId\": \"livestock_animal_tab\"\n}",
+              "raw": "{\n  \"searchId\": \"{{livestock_livestock_search_id}}\",\n  \"registryCode\": \"LIVESTOCK_REGISTRY\",\n  \"registerId\": \"{{livestock_livestock_register_id}}\",\n  \"recordId\": \"{{livestock_livestock_record_id}}\",\n  \"tabId\": \"livestock_animal_tab\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -1195,7 +1200,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"LIVESTOCK_REGISTRY\",\n  \"registerId\": \"{{livestock_livestock_register_id}}\",\n  \"recordId\": \"{{livestock_livestock_record_id}}\",\n  \"tabId\": \"livestock_health_event_tab\"\n}",
+              "raw": "{\n  \"searchId\": \"{{livestock_livestock_search_id}}\",\n  \"registryCode\": \"LIVESTOCK_REGISTRY\",\n  \"registerId\": \"{{livestock_livestock_register_id}}\",\n  \"recordId\": \"{{livestock_livestock_record_id}}\",\n  \"tabId\": \"livestock_health_event_tab\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -1258,7 +1263,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"LIVESTOCK_REGISTRY\",\n  \"registerId\": \"{{livestock_livestock_register_id}}\",\n  \"recordId\": \"{{livestock_livestock_record_id}}\",\n  \"tabId\": \"livestock_vital_event_tab\"\n}",
+              "raw": "{\n  \"searchId\": \"{{livestock_livestock_search_id}}\",\n  \"registryCode\": \"LIVESTOCK_REGISTRY\",\n  \"registerId\": \"{{livestock_livestock_register_id}}\",\n  \"recordId\": \"{{livestock_livestock_record_id}}\",\n  \"tabId\": \"livestock_vital_event_tab\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -1321,7 +1326,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"LIVESTOCK_REGISTRY\",\n  \"registerId\": \"{{livestock_livestock_register_id}}\",\n  \"recordId\": \"{{livestock_livestock_record_id}}\",\n  \"tabId\": \"livestock_import_batch_tab\"\n}",
+              "raw": "{\n  \"searchId\": \"{{livestock_livestock_search_id}}\",\n  \"registryCode\": \"LIVESTOCK_REGISTRY\",\n  \"registerId\": \"{{livestock_livestock_register_id}}\",\n  \"recordId\": \"{{livestock_livestock_record_id}}\",\n  \"tabId\": \"livestock_import_batch_tab\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -1390,7 +1395,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"cropsown_cropsown_tab\"\n}",
+              "raw": "{\n  \"searchId\": \"{{cropsown_cropsown_search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"cropsown_cropsown_tab\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -1453,7 +1458,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"cropsown_planning_tab\"\n}",
+              "raw": "{\n  \"searchId\": \"{{cropsown_cropsown_search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"cropsown_planning_tab\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -1516,7 +1521,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"cropsown_cultivation_tab\"\n}",
+              "raw": "{\n  \"searchId\": \"{{cropsown_cropsown_search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"cropsown_cultivation_tab\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -1579,7 +1584,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"cropsown_sowing_tab\"\n}",
+              "raw": "{\n  \"searchId\": \"{{cropsown_cropsown_search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"cropsown_sowing_tab\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -1642,7 +1647,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"cropsown_harvest_tab\"\n}",
+              "raw": "{\n  \"searchId\": \"{{cropsown_cropsown_search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"cropsown_harvest_tab\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -1705,7 +1710,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"cropsown_production_tab\"\n}",
+              "raw": "{\n  \"searchId\": \"{{cropsown_cropsown_search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"cropsown_production_tab\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -1857,7 +1862,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"cropsown_planning_tab\",\n  \"page\": 1,\n  \"pageSize\": 1\n}",
+              "raw": "{\n  \"searchId\": \"{{cropsown_cropsown_search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"cropsown_planning_tab\",\n  \"page\": 1,\n  \"pageSize\": 1\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -1926,7 +1931,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"not-from-this-search\",\n  \"tabId\": \"cropsown_planning_tab\"\n}",
+              "raw": "{\n  \"searchId\": \"{{cropsown_cropsown_search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"not-from-this-search\",\n  \"tabId\": \"cropsown_planning_tab\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -1982,7 +1987,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"no_such_tab\"\n}",
+              "raw": "{\n  \"searchId\": \"{{cropsown_cropsown_search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"no_such_tab\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -2038,7 +2043,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"FARMER_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"cropsown_planning_tab\"\n}",
+              "raw": "{\n  \"searchId\": \"{{cropsown_cropsown_search_id}}\",\n  \"registryCode\": \"FARMER_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"cropsown_planning_tab\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -2199,7 +2204,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"searchId\": \"{{search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"cropsown_planning_tab\"\n}",
+              "raw": "{\n  \"searchId\": \"{{cropsown_cropsown_search_id}}\",\n  \"registryCode\": \"CROPSOWN_REGISTRY\",\n  \"registerId\": \"{{cropsown_cropsown_register_id}}\",\n  \"recordId\": \"{{cropsown_cropsown_record_id}}\",\n  \"tabId\": \"cropsown_planning_tab\"\n}",
               "options": {
                 "raw": {
                   "language": "json"

@@ -41,7 +41,7 @@ class FakeCM:
         self.status = status
         self.validated = []
 
-    async def validate(self, consent_jws, requested_scopes):
+    async def validate(self, consent_jws, requested_scopes, purpose=None):
         self.validated.append(requested_scopes)
         if self.decision is not None:
             return self.decision
@@ -189,3 +189,37 @@ def test_async_sends_no_data_once_the_consent_is_gone(service, status, code):
     assert body["header"]["status_reason_code"] == code
     [item] = body["message"]["search_response"]
     assert item["status"] == "rjct" and "data" not in item
+
+
+@pytest.mark.parametrize("status, http, code", [
+    ("revoked", 403, "consent_withdrawn"),
+    ("expired", 403, "consent_withdrawn"),
+    (None, 403, "consent_withdrawn"),                       # the CM no longer knows it
+    (CMError(503, "cm_unavailable"), 503, "consent_check_failed"),
+])
+def test_sync_releases_no_data_once_the_consent_is_gone(service, status, http, code):
+    """The same last check as async, after the registries answered and
+    before the answer leaves (e.g. revoked while the registries were asked)."""
+    service.cm.status = status
+    with pytest.raises(AggregationError) as exc:
+        _sync(service)
+    assert (exc.value.status, exc.value.reason) == (http, code)
+    assert service.fanned_out  # the registries were asked; their data was not released
+
+
+def test_sync_checks_the_consent_after_the_fan_out(service):
+    order = []
+    real_query = service._query_registries
+
+    async def query(aggregation):
+        order.append("registries")
+        return await real_query(aggregation)
+
+    async def status(consent_id):
+        order.append("final check")
+        return "active"
+
+    service._query_registries = query
+    service.cm.consent_status = status
+    assert _sync(service)["header"]["status"] == "succ"
+    assert order == ["registries", "final check"]

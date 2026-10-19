@@ -145,7 +145,17 @@ class StaffApiClient(BaseService):
     async def _post(self, registry: str, entry: RegistryEntry, path: str,
                     payload: Dict[str, Any], page_size: int = 100,
                     search_text: Optional[str] = None) -> Any:
-        """POST one staff-api request; return ``response_body.response_payload``."""
+        """POST one staff-api request; return ``response_body.response_payload``
+        (first page only — lists go through ``_post_all``)."""
+        return (await self._post_page(registry, entry, path, payload, page_size,
+                                      search_text))[0]
+
+    async def _post_page(self, registry: str, entry: RegistryEntry, path: str,
+                         payload: Dict[str, Any], page_size: int = 100,
+                         search_text: Optional[str] = None,
+                         current_page: int = 1) -> Tuple[Any, Optional[Dict[str, Any]]]:
+        """One page: ``(response_payload, pagination_response)``; the latter
+        is ``{number_of_items, number_of_pages}`` or None."""
         slot = self._slot(registry)
         try:
             await asyncio.wait_for(slot.acquire(), timeout=_config.staff_api_queue_timeout_sec)
@@ -153,14 +163,35 @@ class StaffApiClient(BaseService):
             raise RegistryError(registry, "registry_busy",
                                 "too many staff-api calls in flight to this registry") from exc
         try:
-            return await self._post_now(registry, entry, path, payload, page_size, search_text)
+            return await self._post_now(registry, entry, path, payload, page_size, search_text,
+                                        current_page)
         finally:
             slot.release()
 
-    async def _post_now(self, registry, entry, path, payload, page_size, search_text):
+    async def _post_all(self, registry: str, entry: RegistryEntry, path: str,
+                        payload: Dict[str, Any], page_size: int = 100,
+                        search_text: Optional[str] = None) -> Tuple[List[Any], bool]:
+        """Every page of a list call, up to ``staff_api_max_pages``:
+        ``(rows, complete)``; ``complete`` is False when pages were left unread.
+        Without a pagination_response the first page is taken as the whole list."""
+        rows: List[Any] = []
+        max_pages = max(1, _config.staff_api_max_pages)
+        for page in range(1, max_pages + 1):
+            payload_rows, pagination = await self._post_page(
+                registry, entry, path, payload, page_size, search_text, current_page=page)
+            rows.extend(payload_rows or [])
+            pages = (pagination or {}).get("number_of_pages") or 0
+            if page >= pages or not payload_rows:
+                return rows, True
+        _logger.warning("Staff API %s %s: read %d of %s pages (staff_api_max_pages); "
+                        "the list is incomplete", registry, path, max_pages, pages)
+        return rows, False
+
+    async def _post_now(self, registry, entry, path, payload, page_size, search_text,
+                        current_page=1):
         token = await self._bearer(registry, entry)
         csrf = secrets.token_urlsafe(24)
-        pagination: Dict[str, Any] = {"current_page": 1, "page_size": page_size}
+        pagination: Dict[str, Any] = {"current_page": current_page, "page_size": page_size}
         if search_text is not None:
             pagination["search_text"] = search_text
         body = {
@@ -201,7 +232,8 @@ class StaffApiClient(BaseService):
         if header.get("response_status") not in (None, "SUCCESS"):
             raise RegistryError(registry, header.get("response_error_code") or "error",
                                 header.get("response_error_message") or "")
-        return (data.get("response_body") or {}).get("response_payload")
+        body = data.get("response_body") or {}
+        return body.get("response_payload"), body.get("pagination_response")
 
     # ── metadata (cached, TTL) ──────────────────────────────────────────────
 
@@ -211,8 +243,8 @@ class StaffApiClient(BaseService):
         cached = self._registers_cache.get(registry, ttl)
         if cached is not None:
             return cached
-        rows = await self._post(registry, entry, "/register-metadata/get_all_registers",
-                                {}, page_size=100) or []
+        rows, _ = await self._post_all(registry, entry, "/register-metadata/get_all_registers",
+                                       {}, page_size=100)
         return self._registers_cache.put(registry, {
             r.get("register_mnemonic"): r.get("register_id")
             for r in rows if r.get("register_mnemonic") and r.get("register_id")})
@@ -233,8 +265,8 @@ class StaffApiClient(BaseService):
         cached = None if refresh else self._tabs_cache.get(key, _config.staff_api_metadata_ttl_sec)
         if cached is not None:
             return cached
-        rows = await self._post(registry, entry, "/register-tab-metadata/get_all_tabs",
-                                {"register_id": register_id}, page_size=100) or []
+        rows, _ = await self._post_all(registry, entry, "/register-tab-metadata/get_all_tabs",
+                                       {"register_id": register_id}, page_size=100)
         return self._tabs_cache.put(key, sorted(
             (t for t in rows if t.get("tab_id") and t.get("is_active", True)),
             key=lambda t: t.get("tab_order") or 0))
@@ -255,8 +287,8 @@ class StaffApiClient(BaseService):
         cached = self._sections_cache.get(key, _config.staff_api_metadata_ttl_sec)
         if cached is not None:
             return cached
-        rows = await self._post(registry, entry, "/register-tab-metadata/get_sections",
-                                {"tab_id": tab_id}, page_size=100) or []
+        rows, _ = await self._post_all(registry, entry, "/register-tab-metadata/get_sections",
+                                       {"tab_id": tab_id}, page_size=100)
         return self._sections_cache.put(key, sorted(
             (r for r in rows if r.get("register_id") in (None, register_id)),
             key=lambda r: r.get("section_order") or 0))
@@ -264,22 +296,28 @@ class StaffApiClient(BaseService):
     # ── data ────────────────────────────────────────────────────────────────
 
     async def search(self, registry: str, entry: RegistryEntry,
-                     foundational_id: str) -> List[Dict[str, Any]]:
+                     foundational_id: str) -> Tuple[List[Dict[str, Any]], bool]:
         """Every record of ``foundational_id`` in this registry's staff_api registers.
 
-        ``[{register, registerId, hit}]``, ``hit`` being the staff-api list row.
-        One staff-api call per register. Raises RegistryError on anything but an
-        answer, so the caller can report one registry's failure and keep the others.
+        ``([{register, registerId, hit}], complete)``, ``hit`` being the
+        staff-api list row. The search is a substring match, so every page is
+        read (up to ``staff_api_max_pages``): an exact match may sit on a later
+        page. ``complete`` is False when pages were left unread. Raises
+        RegistryError on anything but an answer, so the caller can report one
+        registry's failure and keep the others.
         """
         ids = await self.register_ids(registry, entry)
         search_value = entry.search_value(foundational_id)
         page_size = entry.staff_api.page_size or _config.aggregator_page_size
+        complete = True
 
         async def one(mnemonic: str, register_id: str):
-            hits = await self._post(
+            nonlocal complete
+            hits, all_read = await self._post_all(
                 registry, entry, "/register-data/search_in_a_register",
                 {"register_id": register_id}, page_size=page_size,
-                search_text=search_value) or []
+                search_text=search_value)
+            complete = complete and all_read
             exact = [h for h in hits if entry.staff_hit_identifies(h, foundational_id)
                      and h.get("internal_record_id")]
             if len(hits) != len(exact):
@@ -289,7 +327,7 @@ class StaffApiClient(BaseService):
             return [{"register": mnemonic, "registerId": register_id, "hit": h} for h in exact]
 
         per_register = await asyncio.gather(*[one(m, r) for m, r in ids.items()])
-        return [record for records in per_register for record in records]
+        return [record for records in per_register for record in records], complete
 
     async def tab_records(self, registry: str, entry: RegistryEntry, register_id: str,
                           record_id: str, tab_id: str) -> List[Dict[str, Any]]:

@@ -15,7 +15,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.responses import JSONResponse
 from openg2p_fastapi_common.controller import BaseController
 
-from ..auth import CallerIdentity, current_identity
+from ..auth import CallerIdentity, auth_config_problem, current_identity
 from ..config import Settings
 from ..schemas.staff import (
     StaffSearchRequest,
@@ -57,6 +57,9 @@ class StaffController(BaseController):
         super().__init__(**kwargs)
         self.staff_search = StaffSearchService.get_component()
         self.router.tags += ["Aggregation Layer (staff search, no consent)"]
+        problem = auth_config_problem()
+        if problem:
+            _logger.error("Staff search routes will refuse every token (503): %s", problem)
 
         self.router.add_api_route(
             _PREFIX + "/registry/search", self.search,

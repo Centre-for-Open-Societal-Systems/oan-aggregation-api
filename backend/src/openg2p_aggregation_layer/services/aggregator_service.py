@@ -134,6 +134,11 @@ class AggregatorService(BaseService):
             query=query, transaction_id=transaction_id,
             reference_id=reference_id, purpose=purpose, mode="sync")
         outcomes = await self._query_registries(aggregation)
+        refusal = await self._final_consent_check(aggregation)
+        if refusal is not None:
+            status_code, code, text = refusal
+            self._log(aggregation, outcomes, code)
+            raise AggregationError(status_code, code, text)
         self._log(aggregation, outcomes, "answered")
         return self._build_envelope(aggregation, outcomes)
 
@@ -194,9 +199,10 @@ class AggregatorService(BaseService):
 
         try:
             if consent_id:
-                decision = await self.cm.validate_stored(consent_id, partner_id, requestable)
+                decision = await self.cm.validate_stored(
+                    consent_id, partner_id, requestable, purpose=purpose)
             else:
-                decision = await self.cm.validate(consent_jws, requestable)
+                decision = await self.cm.validate(consent_jws, requestable, purpose=purpose)
         except CMError as exc:
             raise AggregationError(exc.status, exc.reason, exc.detail) from exc
         if decision.get("decision") != "permit":
@@ -209,6 +215,7 @@ class AggregatorService(BaseService):
         granted = self._granted_scopes(requestable, decision.get("effective_data_scopes"))
         subject = decision.get("subject_id") or {}
         self._check_subject(query, subject.get("value"), catalog.same_identifier)
+        consented_purpose = self._consented_purpose(decision, consent_jws, purpose)
 
         # Who the partner is. consent_id: the partner's token said so and the
         # CM permitted only because the consent was given to that partner.
@@ -222,7 +229,9 @@ class AggregatorService(BaseService):
             requested_scopes=granted,
             subject_id_type=subject.get("type", ""),
             subject_id_value=subject.get("value", ""),
-            purpose=purpose or {},
+            # What the subject consented to, never the caller's word for it:
+            # it is what the registries are told the data is for.
+            purpose=consented_purpose,
             partner_audience=audience,
             lawful_basis=decision.get("lawful_basis") or "consent",
             # The CM record this permit was minted as. The CM revokes it with
@@ -232,6 +241,28 @@ class AggregatorService(BaseService):
             reference_id=reference_id,
             mode=mode,
         )
+
+    def _consented_purpose(self, decision: Dict[str, Any], consent_jws: Optional[str],
+                           requested: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """The purpose the subject consented to, from the CM's permit (or, for
+        a consent object the CM just permitted, its signed claims). A
+        ``requested`` purpose must name the same code; left out, the consent's
+        purpose is used (as the API promises)."""
+        consented = decision.get("purpose")
+        if not consented and consent_jws:
+            consented = self.cm.decode_claims(consent_jws).get("purpose")
+        consented = consented if isinstance(consented, dict) else {}
+        wanted = (requested or {}).get("code")
+        if wanted is not None:
+            if not consented.get("code"):
+                raise AggregationError(
+                    403, "purpose_unverified",
+                    "the Consent Manager did not confirm the consent's purpose")
+            if consented.get("code") != wanted:
+                raise AggregationError(
+                    403, "purpose_mismatch",
+                    "the consent is for purpose '%s', not '%s'" % (consented.get("code"), wanted))
+        return dict(consented)
 
     @staticmethod
     def _granted_scopes(requestable: List[str], effective: Optional[List[str]]) -> List[str]:
@@ -345,31 +376,35 @@ class AggregatorService(BaseService):
     async def _answer_on_callback(self, aggregation: Aggregation) -> None:
         try:
             outcomes = await self._query_registries(aggregation)
-            # Last chance to honour a withdrawal: the data is fetched but not
-            # sent. A CM that cannot answer is treated as "no": the data is
-            # never released on an unanswered check.
-            try:
-                still_active = await self.consent_still_active(aggregation)
-            except CMError as exc:
-                _logger.warning("Aggregation %s: consent not checkable before the "
-                                "callback - %s %s", aggregation.id, exc.reason, exc.detail)
-                body = self._rejection(aggregation, "consent_check_failed",
-                                       "the Consent Manager could not confirm the consent")
-                outcome = "consent_check_failed"
+            refusal = await self._final_consent_check(aggregation)
+            if refusal is None:
+                body = self._build_envelope(aggregation, outcomes)
+                outcome = "delivered"
             else:
-                if still_active:
-                    body = self._build_envelope(aggregation, outcomes)
-                    outcome = "delivered"
-                else:
-                    body = self._rejection(aggregation, "consent_withdrawn",
-                                           "the consent is no longer active")
-                    outcome = "consent_withdrawn"
+                _, outcome, text = refusal
+                body = self._rejection(aggregation, outcome, text)
             status_code = await self._post_callback(aggregation, body)
             if not (status_code and 200 <= status_code < 300):
                 outcome = "callback_failed"
             self._log(aggregation, outcomes, outcome, callback_status=status_code)
         except Exception:  # noqa: BLE001 - a background task has no caller to raise to
             _logger.exception("Aggregation %s: async answer failed", aggregation.id)
+
+    async def _final_consent_check(self, aggregation) -> Optional[tuple]:
+        """Last chance to honour a withdrawal, on both delivery paths: the data
+        is fetched but not yet released. ``(http status, code, text)`` when it
+        must not be released, else None. A CM that cannot answer counts as
+        "no": data is never released on an unanswered check."""
+        try:
+            still_active = await self.consent_still_active(aggregation)
+        except CMError as exc:
+            _logger.warning("Aggregation %s: consent not checkable before release - %s %s",
+                            aggregation.id, exc.reason, exc.detail)
+            return (503, "consent_check_failed",
+                    "the Consent Manager could not confirm the consent")
+        if not still_active:
+            return 403, "consent_withdrawn", "the consent is no longer active"
+        return None
 
     async def consent_still_active(self, aggregation) -> bool:
         """Is the consent this answer stands on still active in the CM?

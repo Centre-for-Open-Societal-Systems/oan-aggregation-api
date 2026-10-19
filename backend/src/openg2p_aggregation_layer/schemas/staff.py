@@ -84,6 +84,8 @@ class StaffRecord(_Camel):
     register: str
     register_id: str = Field(alias="registerId")
     record_id: str = Field(alias="recordId")
+    # This record's ticket (also in each tab request): opens its tabs only.
+    search_id: Optional[str] = Field(default=None, alias="searchId")
     summary: StaffRecordSummary
     tabs: List[StaffTabRef]
 
@@ -96,8 +98,13 @@ class StaffRegistryError(_Camel):
 class StaffRegistryResult(_Camel):
     registry_code: str = Field(alias="registryCode")
     registry_name: str = Field(alias="registryName")
-    status: Literal["found", "not_found", "error"]
+    # incomplete: no record found in the pages read (staff_api_max_pages), but
+    # the registry has more, so absence is not established.
+    status: Literal["found", "not_found", "incomplete", "error"]
     records: List[StaffRecord]
+    # False when the registry had more pages than were read: there may be
+    # further records of this person.
+    complete: bool = True
     error: Optional[StaffRegistryError] = None
 
 
@@ -105,7 +112,8 @@ class StaffSearchResponse(_Camel):
     schema_version: str = Field(default=SCHEMA_VERSION, alias="schemaVersion")
     search_id: str = Field(
         alias="searchId",
-        description="Signed search ticket (staff user, records found, expiry); opens tabs")
+        description="Signed search ticket (staff user, expiry): names the search. Tabs are "
+                    "opened with each record's own searchId, already in its tab requests")
     foundational_id: str = Field(alias="foundationalId")
     searched_at: str = Field(alias="searchedAt")
     searched_by: str = Field(alias="searchedBy")

@@ -37,16 +37,33 @@ class CallerIdentity:
 def _get_jwk_client() -> jwt.PyJWKClient:
     global _jwk_client
     if _jwk_client is None:
-        _jwk_client = jwt.PyJWKClient(_config.auth_jwks_url)
+        url = _config.auth_jwks_url or (
+            _config.auth_issuer.rstrip("/") + "/protocol/openid-connect/certs")
+        _jwk_client = jwt.PyJWKClient(url)
     return _jwk_client
 
 
+def auth_config_problem() -> Optional[str]:
+    """Why staff tokens cannot be verified, or None. With auth on, an unset
+    issuer must close the staff routes, never open them to unverified tokens."""
+    if _config.auth_enabled and not _config.auth_issuer:
+        return "auth_enabled is true but auth_issuer is not set"
+    return None
+
+
 def _verify_token(token: str) -> dict:
-    # Dev mode — no signature verification.
-    if not _config.auth_enabled or not _config.auth_issuer:
+    problem = auth_config_problem()
+    if problem:
+        # Fail closed: these tokens unlock no-consent staff routes.
+        _logger.error("Staff token refused: %s", problem)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="staff authentication is not configured",
+        )
+    # Dev mode (auth disabled) — no signature verification.
+    if not _config.auth_enabled:
         _logger.warning(
-            "auth disabled or auth_issuer unset — bearer token decoded WITHOUT "
-            "signature verification (dev only)."
+            "auth disabled — bearer token decoded WITHOUT signature verification (dev only)."
         )
         try:
             return jwt.decode(token, options={"verify_signature": False})

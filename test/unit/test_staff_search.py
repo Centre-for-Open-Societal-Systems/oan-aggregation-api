@@ -145,17 +145,32 @@ def _fake_staff_api(calls, hits=None, tabs=None):
     return post
 
 
-def _client(calls, **kw):
+def _client(calls, pages=None, **kw):
+    """``pages``: {path: [page1_rows, page2_rows, ...]} answered with a
+    pagination_response; other list calls are one page without one."""
     client = object.__new__(StaffApiClient)
     client._init_state()
-    client._post = _fake_staff_api(calls, **kw)
+    post = _fake_staff_api(calls, **kw)
+    client._post = post
+
+    async def post_page(registry, entry, path, payload, page_size=100, search_text=None,
+                        current_page=1):
+        if pages and path in pages:
+            calls.append((path, payload, search_text, current_page))
+            rows = pages[path]
+            return rows[current_page - 1], {"number_of_items": sum(map(len, rows)),
+                                            "number_of_pages": len(rows)}
+        return await post(registry, entry, path, payload, page_size, search_text), None
+
+    client._post_page = post_page
     return client
 
 
 def test_search_is_one_call_per_register_and_exact():
     calls = []
     entry = _catalog().get(CODE)
-    found = asyncio.run(_client(calls).search(CODE, entry, "FAN-" + FID))
+    found, complete = asyncio.run(_client(calls).search(CODE, entry, "FAN-" + FID))
+    assert complete
     search = [c for c in calls if c[0] == "/register-data/search_in_a_register"]
     # searched with the prefix stripped; the decoy hit is dropped; no record / tab calls
     assert search == [("/register-data/search_in_a_register", {"register_id": REG}, FID)]
@@ -168,7 +183,7 @@ def test_no_exact_hit_means_no_records():
     calls = []
     entry = _catalog().get(CODE)
     hits = [{"internal_record_id": "x", "link_foundational_id": FID + "1"}]
-    assert asyncio.run(_client(calls, hits=hits).search(CODE, entry, FID)) == []
+    assert asyncio.run(_client(calls, hits=hits).search(CODE, entry, FID)) == ([], True)
 
 
 def test_unknown_register_is_reported():
@@ -341,8 +356,10 @@ def test_search_answers_summary_and_tabs_without_tab_data(monkeypatch):
         "name": "kebele_name", "value": "Kebele 03", "order": 2}
     # active, in order, hidden_tabs left out; each with the request that opens it
     assert [t["tabId"] for t in rec["tabs"]] == ["main_tab"]
+    # The record's own ticket, not the search's.
+    assert rec["searchId"] and rec["searchId"] != out["searchId"]
     assert rec["tabs"][0]["request"] == {"method": "POST", "url": "/aggregation/v1/staff/registry/tab",
-                                         "body": {"searchId": out["searchId"], "registryCode": CODE,
+                                         "body": {"searchId": rec["searchId"], "registryCode": CODE,
                                                   "registerId": REG, "recordId": "ls-1",
                                                   "tabId": "main_tab"}}
     assert not any(c[0] == "/register-data/get_tab_records" for c in calls)
@@ -354,6 +371,11 @@ def _search_then(monkeypatch, **catalog):
     svc, saved = _service(monkeypatch, _catalog(**catalog), _client(calls))
     out = asyncio.run(svc.search(STAFF, FID))
     return svc, saved, calls, out
+
+
+def _ticket_of(out):
+    """The found record's ticket (the one in its tab requests)."""
+    return out["registries"][0]["records"][0]["searchId"]
 
 
 def test_tab_answers_one_tab_and_audits(monkeypatch):
@@ -385,10 +407,14 @@ def test_tab_answers_one_tab_and_audits(monkeypatch):
     ({"search_id": "e30.forged"}, 404, "search_not_found"),
     ({"identity": _identity(["AGGREGATION_STAFF_VIEWER"], subject="u-2")}, 404,
      "search_not_found"),
+    # The search's own searchId names the search; it opens no record.
+    ({"search_id": "TOP"}, 400, "record_not_in_search"),
 ])
 def test_tab_is_bound_to_its_search(monkeypatch, change, status, reason):
     svc, saved, calls, out = _search_then(monkeypatch)
-    args = {"identity": STAFF, "search_id": out["searchId"], "registry_code": CODE,
+    if change.get("search_id") == "TOP":
+        change = {"search_id": out["searchId"]}
+    args = {"identity": STAFF, "search_id": _ticket_of(out), "registry_code": CODE,
             "register_id": REG, "record_id": "ls-1", "tab_id": "main_tab"} | change
     with pytest.raises(AggregationError) as caught:
         asyncio.run(svc.tab(**args))
@@ -399,15 +425,16 @@ def test_tab_is_bound_to_its_search(monkeypatch, change, status, reason):
 def test_hidden_tab_cannot_be_opened(monkeypatch):
     svc, _, _, out = _search_then(monkeypatch, hidden_tabs=["animal_tab"])
     with pytest.raises(AggregationError) as caught:
-        asyncio.run(svc.tab(STAFF, out["searchId"], CODE, REG, "ls-1", "animal_tab"))
+        asyncio.run(svc.tab(STAFF, _ticket_of(out), CODE, REG, "ls-1", "animal_tab"))
     assert caught.value.reason == "unknown_tab"
 
 
 def test_a_ticket_cannot_be_altered(monkeypatch):
     svc, _, _, out = _search_then(monkeypatch)
-    body, mac = out["searchId"].split(".")
-    search = svc._search_of(STAFF, out["searchId"])
-    search["found"][CODE].append(["anything", "ls-other"])
+    ticket = _ticket_of(out)
+    body, mac = ticket.split(".")
+    search = svc._search_of(STAFF, ticket)
+    search["r"] = [CODE, "anything", "ls-other"]
     forged = svc._ticket(search).split(".")[0] + "." + mac
     with pytest.raises(AggregationError) as caught:
         asyncio.run(svc.tab(STAFF, forged, CODE, "anything", "ls-other", "main_tab"))
@@ -415,7 +442,86 @@ def test_a_ticket_cannot_be_altered(monkeypatch):
     # Another key (another deployment) cannot read it either.
     svc._mac_key = b"x" * 32
     with pytest.raises(AggregationError):
-        svc._search_of(STAFF, out["searchId"])
+        svc._search_of(STAFF, ticket)
+
+
+def test_ticket_size_does_not_grow_with_records(monkeypatch):
+    """At the largest page the search answers, every tab request it hands out
+    is accepted by the tab endpoint (whose searchId limit is 8,192)."""
+    from openg2p_aggregation_layer.schemas.staff import StaffTabRequest
+
+    hits = [dict(HIT, internal_record_id="ls-%03d-%s" % (i, "x" * 200)) for i in range(100)]
+    calls = []
+    svc, _ = _service(monkeypatch, _catalog(page_size=100), _client(calls, hits=hits))
+    out = asyncio.run(svc.search(STAFF, FID))
+    records = out["registries"][0]["records"]
+    assert len(records) == 100
+    sizes = {len(r["searchId"]) for r in records}
+    assert max(sizes) < 1024
+    for rec in (records[0], records[-1]):
+        body = rec["tabs"][0]["request"]["body"]
+        StaffTabRequest(**body)                       # the schema accepts it
+        tab = asyncio.run(svc.tab(STAFF, body["searchId"], body["registryCode"],
+                                  body["registerId"], body["recordId"], body["tabId"]))
+        assert tab["sections"]
+    # A record's ticket does not open another record.
+    first = records[0]["tabs"][0]["request"]["body"]
+    with pytest.raises(AggregationError) as caught:
+        asyncio.run(svc.tab(STAFF, first["searchId"], CODE, REG, records[1]["recordId"],
+                            "main_tab"))
+    assert caught.value.reason == "record_not_in_search"
+
+
+def test_ticket_from_before_the_change_still_opens_its_records(monkeypatch):
+    """A ticket listing the records found (issued before per-record tickets,
+    still within its TTL) keeps working until it expires."""
+    svc, _, _, out = _search_then(monkeypatch)
+    legacy = svc._ticket({"n": "x", "sub": STAFF.subject, "exp": int(time.time()) + 60,
+                          "found": {CODE: [[REG, "ls-1"]]}})
+    assert asyncio.run(svc.tab(STAFF, legacy, CODE, REG, "ls-1", "main_tab"))["sections"]
+    with pytest.raises(AggregationError) as caught:
+        asyncio.run(svc.tab(STAFF, legacy, CODE, REG, "ls-other", "main_tab"))
+    assert caught.value.reason == "record_not_in_search"
+
+
+# ── pagination of staff-api lists ────────────────────────────────────────────
+
+def test_search_reads_every_page_for_the_exact_match(monkeypatch):
+    """Page 1 holds only substring matches; the person is on page 2."""
+    decoy = {"internal_record_id": "ls-decoy", "link_foundational_id": FID + "0"}
+    calls = []
+    client = _client(calls, pages={"/register-data/search_in_a_register": [[decoy], [HIT]]})
+    found, complete = asyncio.run(client.search(CODE, _catalog().get(CODE), FID))
+    assert complete and [f["hit"]["internal_record_id"] for f in found] == ["ls-1"]
+    pages = [c[3] for c in calls if c[0] == "/register-data/search_in_a_register"]
+    assert pages == [1, 2]
+
+
+def test_search_cut_short_is_incomplete_not_absent(monkeypatch):
+    decoy = {"internal_record_id": "ls-decoy", "link_foundational_id": FID + "0"}
+    monkeypatch.setattr(staff_search_service._config, "staff_api_max_pages", 2)
+    calls = []
+    client = _client(calls, pages={
+        "/register-data/search_in_a_register": [[decoy], [decoy], [HIT]]})
+    svc, _ = _service(monkeypatch, _catalog(), client)
+    out = asyncio.run(svc.search(STAFF, FID))
+    [reg] = out["registries"]
+    assert (reg["status"], reg["complete"], reg["records"]) == ("incomplete", False, [])
+
+    # Found within the cap, but more pages exist: found, and says so.
+    client = _client([], pages={"/register-data/search_in_a_register": [[HIT], [decoy], [decoy]]})
+    svc, _ = _service(monkeypatch, _catalog(), client)
+    [reg] = asyncio.run(svc.search(STAFF, FID))["registries"]
+    assert (reg["status"], reg["complete"], len(reg["records"])) == ("found", False, 1)
+
+
+def test_metadata_lists_read_every_page(monkeypatch):
+    calls = []
+    client = _client(calls, pages={"/register-metadata/get_all_registers": [
+        [{"register_mnemonic": "Animal", "register_id": ANIMAL}],
+        [{"register_mnemonic": "Livestock", "register_id": REG}]]})
+    ids = asyncio.run(client.register_ids(CODE, _catalog().get(CODE)))
+    assert ids == {"Livestock": REG}
 
 
 def test_expired_search_cannot_open_tabs(monkeypatch):
@@ -423,7 +529,7 @@ def test_expired_search_cannot_open_tabs(monkeypatch):
     real = time.time
     monkeypatch.setattr(staff_search_service.time, "time", lambda: real() + 7200)
     with pytest.raises(AggregationError) as caught:
-        asyncio.run(svc.tab(STAFF, out["searchId"], CODE, REG, "ls-1", "main_tab"))
+        asyncio.run(svc.tab(STAFF, _ticket_of(out), CODE, REG, "ls-1", "main_tab"))
     assert (caught.value.status, caught.value.reason) == (410, "search_expired")
 
 

@@ -99,6 +99,10 @@ class Settings(BaseSettings):
     # registry with "registry_busy" instead of piling up.
     staff_api_max_concurrency: int = 20
     staff_api_queue_timeout_sec: float = 5.0
+    # Staff-api lists (register search, metadata) come in pages: at most this
+    # many are read per call. A search cut short by the cap is reported as
+    # incomplete, never as "not found".
+    staff_api_max_pages: int = 20
     # How long a search's searchId can open tabs. A tab request is accepted
     # only for a record that search returned, to the staff user who ran it.
     staff_search_ttl_sec: int = 1800

@@ -116,7 +116,7 @@ DCI already has a place for it:
 | `search_criteria.query_type` | Always `beneficiary360`. |
 | `search_criteria.query` | The bene-360 request. |
 | `search_criteria.authorize.consent_jws` | The partner's signed consent object for its binding with this service. Its `data_scopes` are scope ids (below). |
-| `search_criteria.purpose` | Optional; defaults to the consent object's purpose. |
+| `search_criteria.purpose` | Optional; defaults to the consent's purpose. When given, its `code` must be the purpose the subject consented to: the CM is asked (`request_context.purpose`) and returns the consent's purpose; a different code is `403 purpose_mismatch`, a purpose the CM does not confirm `403 purpose_unverified`. The registries are always told the consent's purpose, never the caller's. |
 
 One beneficiary per call (`search_request` has exactly one item). `foundationalId` must be the
 consent object's `subject_id.value`.
@@ -273,13 +273,15 @@ registries are being asked:
 The callback is the same signed on-search as the sync answer, with the same
 `correlation_id`. It is POSTed once, as soon as the registries have answered; there is no
 retry, and an answer in flight is lost if the service restarts (nothing is stored to retry
-from). Right before the callback the CM is asked again whether the consent is still active:
+from). On both routes, once the registries have answered and before anything is released,
+the CM is asked again whether the consent is still active (a withdrawal during the registry
+calls is honoured):
 
-| CM says | Callback |
-|---|---|
-| `active` | the on-search with the data |
-| anything else (withdrawn, expired) | a signed on-search with `header.status: rjct`, `status_reason_code: consent_withdrawn`, and no data |
-| no answer | the same, with `consent_check_failed` |
+| CM says | Sync answer | Async callback |
+|---|---|---|
+| `active` | `200`, the on-search with the data | the on-search with the data |
+| anything else (withdrawn, expired, unknown) | `403 consent_withdrawn`, no data | a signed on-search with `header.status: rjct`, `status_reason_code: consent_withdrawn`, and no data |
+| no answer | `503 consent_check_failed`, no data | the same, with `consent_check_failed` |
 
 ### Errors
 
@@ -293,6 +295,9 @@ validation.
 | 403 | `no_subject_consent` | the subject has not consented to this partner. The detail says what to do: raise a consent request in the CM (`POST /consent/v1/consent-requests`), have the subject confirm it with the one-time code, then call again with a new consent object |
 | 403 | other CM reason code (`signature_invalid`, `replay`, `expired`, …) | the CM refused the consent object |
 | 403 | `subject_mismatch` | `foundationalId` is not the consent's subject |
+| 403 | `purpose_mismatch`, `purpose_unverified` | `search_criteria.purpose` is not the consent's purpose, or the CM did not confirm the consent's purpose |
+| 403 | `consent_withdrawn` | sync: the consent was withdrawn or expired while the registries were asked (no data released) |
+| 503 | `consent_check_failed` | sync: the CM could not confirm the consent after the registries answered (no data released) |
 | 403 | `no_scope_permitted` | nothing of the requested registries is within the consent |
 | 409 | `consent_object_reused` | the consent object already carried a search for other registries (the CM answers an object once, with its first permit); sign a new one |
 | 422 | `section_not_supported` | only sections without a connected source were asked for |
@@ -333,13 +338,13 @@ login, CSRF, payload format and ids are this service's business.
 
 | | |
 |---|---|
-| Caller | Bearer token from the `AUTH_ISSUER` realm (`staff`) holding one of `STAFF_SEARCH_ROLES` (default realm role `AGGREGATION_STAFF_VIEWER`). Otherwise `401` / `403`, before any registry is called. Same for both routes. |
+| Caller | Bearer token from the `AUTH_ISSUER` realm (`staff`), signature verified against its JWKS, holding one of `STAFF_SEARCH_ROLES` (default realm role `AGGREGATION_STAFF_VIEWER`). Otherwise `401` / `403`, before any registry is called. With `AUTH_ENABLED=true` and no `AUTH_ISSUER`, every token is refused (`503`, logged at startup): an unconfigured issuer never means "decode without checking". Same for both routes. |
 | Registries | Every catalog entry with a `staff_api` block (or `registryFilter`), in parallel. A new registry is a catalog entry: no code change. |
-| Search, per registry | `search_in_a_register` per `staff_api.registers` (one staff-api call each) → exact match on `staff_api.match_fields`. The summary is the registry's own list row; the tabs are the register's active tabs (`get_all_tabs`, cached). |
+| Search, per registry | `search_in_a_register` per `staff_api.registers`, every page (up to `STAFF_API_MAX_PAGES`; the staff-api search is a substring match, so the exact record can be on a later page) → exact match on `staff_api.match_fields`. `status`: `found`, `not_found`, `incomplete` (nothing found in the pages read, but there are more: absence not established) or `error`; `complete: false` when pages were left unread. The summary is the registry's own list row; the tabs are the register's active tabs (`get_all_tabs`, cached; metadata lists are read in full too). |
 | Tab | One `get_tab_records` call. Section labels and fields come from the tab's section metadata (`/register-tab-metadata/get_sections`, cached). |
 | Dynamic tabs | Tabs, sections and fields are the registries' metadata, cached `STAFF_API_METADATA_TTL_SEC` (600s). A tab added in a registry appears by itself; an unknown `tabId` re-reads the tab list once before `400 unknown_tab`. `staff_api.hidden_tabs` keeps a tab away from staff. |
 | Tab bound to its search | A tab request is accepted only for a record its search returned (`400 record_not_in_search`), from the staff user who ran it (`404 search_not_found` otherwise), within `STAFF_SEARCH_TTL_SEC` (`410 search_expired`: search again). |
-| `searchId` | A signed ticket, not a stored row: it carries the staff user, the records found and the expiry, with an HMAC by this service's key (`STAFF_SEARCH_TICKET_SECRET`, or derived from the signing key when unset). Nothing is stored, so any pod can answer a tab request, provided all pods have the same key. Treat it as an opaque string; it is long. |
+| `searchId` | Signed tickets, not stored rows, with an HMAC by this service's key (`STAFF_SEARCH_TICKET_SECRET`, or derived from the signing key when unset). The search's `searchId` names the search (staff user, expiry). Each record has its own `searchId` (staff user, that record, expiry), also in each of its tab requests: it opens that record's tabs only, and its size does not grow with the number of records found. Nothing is stored, so any pod can answer a tab request, provided all pods have the same key. Treat them as opaque strings. |
 | Credentials | This service's own Keycloak client (`STAFF_API_CLIENT_ID`, client_credentials, token reused until shortly before expiry). Its service account needs a view-only role (e.g. Data Supervisor) on each `<registry>-registry-staff-portal` client; IAM turns it into `register:view`. A registry on another Keycloak sets `staff_api.auth`. |
 | Load | One pooled HTTP client; at most `STAFF_API_MAX_CONCURRENCY` calls in flight per registry (per worker); a call that waits longer than `STAFF_API_QUEUE_TIMEOUT_SEC` fails that registry with `registry_busy`; `STAFF_RATE_LIMIT_PER_MINUTE` per staff user (per worker, `429`); list sections paged (`page`, `pageSize`). |
 | Audit | One JSON log line per search (`"event": "staff_search"`: staff user, roles, masked beneficiary, registries, purpose, outcome and records found) and per tab opened (`staff_tab_view`), on the logger `app.audit`. The registries only see this service's service account, so these lines are the record of who looked: ship them to the log store. |
@@ -362,8 +367,10 @@ Response (`200`), shortened:
   "searchedBy": "staff",
   "registries": [{
     "registryCode": "CROPSOWN_REGISTRY", "registryName": "Crop Sown Registry", "status": "found",
+    "complete": true,
     "records": [{
       "register": "CropSown", "registerId": "6b06a95a-...", "recordId": "cossx-cs-abeba-0001",
+      "searchId": "eyJleHAiOjE3NjAyNzEyNDIs....Rk2p...",
       "summary": {
         "functionalId": "REG/S1/2026/90011", "name": "Abeba Tadesse REG/S1/2026/90011",
         "linkFoundationalId": "FAN-2222444466668888",
@@ -372,7 +379,7 @@ Response (`200`), shortened:
       "tabs": [{
         "tabId": "cropsown_sowing_tab", "label": "cropsown_sowing_tab", "order": 30,
         "request": {"method": "POST", "url": "/aggregation/v1/staff/registry/tab",
-                    "body": {"searchId": "eyJleHAiOjE3NjAyNzEyNDIs....Xq3vR8...", "registryCode": "CROPSOWN_REGISTRY",
+                    "body": {"searchId": "eyJleHAiOjE3NjAyNzEyNDIs....Rk2p...", "registryCode": "CROPSOWN_REGISTRY",
                              "registerId": "6b06a95a-...", "recordId": "cossx-cs-abeba-0001",
                              "tabId": "cropsown_sowing_tab"}}
       }]
@@ -387,7 +394,7 @@ Tab request: the tab's `request.body`, optionally with `page` (1-based) and `pag
 ```json
 {
   "schemaVersion": "1",
-  "searchId": "eyJleHAiOjE3NjAyNzEyNDIs....Xq3vR8...", "registryCode": "CROPSOWN_REGISTRY", "registerId": "6b06a95a-...",
+  "searchId": "eyJleHAiOjE3NjAyNzEyNDIs....Rk2p...", "registryCode": "CROPSOWN_REGISTRY", "registerId": "6b06a95a-...",
   "recordId": "cossx-cs-abeba-0001", "tabId": "cropsown_sowing_tab", "label": "cropsown_sowing_tab",
   "sections": [{
     "sectionId": "cropsown_sowing_details_section_01", "mnemonic": "cs_sowing_details",
@@ -410,7 +417,8 @@ Search errors per registry: `status: error` with `error.reason` (`staff_api_forb
 others. Other errors: `400 unknown_registry` (a `registryFilter` code without `staff_api`),
 `400` for a body with unknown properties, `429 rate_limited`, `503 staff_search_not_configured`
 (no registry has `staff_api`). Tab errors: `400 unknown_registry` / `record_not_in_search` /
-`unknown_tab`, `404 search_not_found`, `410 search_expired`, `502` with the registry's reason.
+`unknown_tab` (`record_not_in_search` also for the search's own `searchId`, which opens no
+record), `404 search_not_found`, `410 search_expired`, `502` with the registry's reason.
 
 Postman: [postman/OpenG2P-Aggregator-Staff.postman_collection.json](postman/README.md#staff-search-collection)
 (search per registry, every tab per registry, every tab the search returned, paging, refusals).
@@ -465,10 +473,11 @@ Every setting is `AGGREGATION_LAYER_<NAME>`; the full list with comments is
 | `AGGREGATOR_REGISTRY_TIMEOUT`, `AGGREGATOR_PAGE_SIZE` | Defaults for registry hops (a catalog entry may override). |
 | `AGGREGATOR_CONSENT_VALIDITY_SEC` | Validity of each registry hop's consent object. |
 | `AGGREGATOR_CALLBACK_TIMEOUT` | Async route: timeout of the one callback attempt. |
-| `AUTH_ENABLED`, `AUTH_ISSUER`, `AUTH_JWKS_URL`, `AUTH_AUDIENCE` | Verification of the staff bearer token (Keycloak realm), staff routes only. The partner routes are authenticated by the consent object. |
+| `AUTH_ENABLED`, `AUTH_ISSUER`, `AUTH_JWKS_URL`, `AUTH_AUDIENCE` | Verification of the staff bearer token (Keycloak realm), staff routes only. `AUTH_ISSUER` is required when `AUTH_ENABLED` (else the staff routes answer `503`); `AUTH_JWKS_URL` defaults to the issuer's certs endpoint. The partner routes are authenticated by the consent object or the partner token. |
 | `STAFF_SEARCH_ROLES` | Roles (JSON list) a staff caller needs for the staff search. Empty closes it. |
 | `STAFF_API_TOKEN_URL`, `STAFF_API_CLIENT_ID`, `STAFF_API_CLIENT_SECRET`, `STAFF_API_TIMEOUT` | This service's client-credentials login to the registries' staff-apis. |
 | `STAFF_API_METADATA_TTL_SEC`, `STAFF_API_MAX_CONCURRENCY`, `STAFF_API_QUEUE_TIMEOUT_SEC` | Staff-api metadata cache; per-registry concurrency limit and how long a call may wait for it. |
+| `STAFF_API_MAX_PAGES` | Pages read per staff-api list call (search, metadata), default 20. A search cut short is `incomplete`, never `not_found`. |
 | `STAFF_SEARCH_TTL_SEC`, `STAFF_TAB_PAGE_SIZE`, `STAFF_TAB_MAX_PAGE_SIZE`, `STAFF_RATE_LIMIT_PER_MINUTE` | How long a search opens tabs; list paging; per-user limit (0 = off). |
 | `STAFF_SEARCH_TICKET_SECRET` | HMAC key of the staff `searchId` ticket. Empty = derived from the signing key. All pods need the same key. |
 

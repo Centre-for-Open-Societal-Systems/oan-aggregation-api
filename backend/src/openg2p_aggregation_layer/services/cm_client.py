@@ -104,8 +104,16 @@ class CMClient(BaseService):
 
     # ── existing CM APIs ────────────────────────────────────────────────────
 
-    async def validate(self, consent_jws: str,
-                       requested_scopes: List[str]) -> Dict[str, Any]:
+    @staticmethod
+    def _context(requested_scopes: List[str], purpose: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        context: Dict[str, Any] = {"requested_scopes": requested_scopes}
+        if purpose:
+            # The CM denies purpose_mismatch unless it is the consent's purpose.
+            context["purpose"] = purpose
+        return context
+
+    async def validate(self, consent_jws: str, requested_scopes: List[str],
+                       purpose: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """The PDP decision for a partner's consent object.
 
         The same /validate the registries call, so the aggregator is trusted
@@ -117,11 +125,12 @@ class CMClient(BaseService):
         """
         return await self._call("POST", "/consent/v1/validate", body={
             "consent_jws": consent_jws,
-            "request_context": {"requested_scopes": requested_scopes},
+            "request_context": self._context(requested_scopes, purpose),
         })
 
     async def validate_stored(self, consent_id: str, partner_id: str,
-                              requested_scopes: List[str]) -> Dict[str, Any]:
+                              requested_scopes: List[str],
+                              purpose: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """The PDP decision for a consent the CM holds, presented by its id.
 
         OpenG2P's ``/validate`` with ``consent_id``: the CM checks the consent
@@ -133,7 +142,7 @@ class CMClient(BaseService):
             "consent_id": consent_id,
             "consent_partner_id": partner_id,
             "data_controller": _config.cm_data_controller,
-            "request_context": {"requested_scopes": requested_scopes},
+            "request_context": self._context(requested_scopes, purpose),
         })
 
     async def consent_status(self, consent_id: str) -> Optional[str]:
