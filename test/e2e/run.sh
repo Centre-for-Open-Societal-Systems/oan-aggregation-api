@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Self-contained end-to-end run: throwaway Postgres + CM + Aggregation Layer +
-# fakes, then e2e.py. Nothing in Docker is touched; everything is torn down.
+# Self-contained end-to-end run: throwaway Postgres (for the CM; the
+# Aggregation Layer has no database) + CM + Aggregation Layer + fakes, then
+# e2e.py. Nothing in Docker is touched; everything is torn down.
 #
 #   CM_SRC=/path/to/consent-management bash test/e2e/run.sh
 #
@@ -29,9 +30,7 @@ echo "work dir: $WORK"
 "$PG_BIN/initdb" -D "$WORK/pg" -U postgres --auth=trust >/dev/null
 "$PG_BIN/pg_ctl" -D "$WORK/pg" -o "-p $PGPORT -k $WORK -c listen_addresses=127.0.0.1" \
   -l "$WORK/pg.log" start >/dev/null
-for db in consent_manager_db aggregation_layer_db; do
-  "$PG_BIN/createdb" -h 127.0.0.1 -p $PGPORT -U postgres $db
-done
+"$PG_BIN/createdb" -h 127.0.0.1 -p $PGPORT -U postgres consent_manager_db
 
 # Keys: partners X/Y sign consent objects; the aggregation layer signs its hops.
 mkdir -p "$WORK/keys"
@@ -55,24 +54,20 @@ start() {  # name port pythonpath env... -- module
 }
 
 # ── Consent Manager (develop: no aggregation code) ──
-# The replay window is shortened so the "approved too late" case runs in
-# seconds; e2e.py reads the same number from E2E_REPLAY_WINDOW.
-REPLAY=8
+# subject_consent_required: without it /validate permits a consent-basis
+# partner on its policy ceiling alone. otp_debug: e2e.py reads the subject's
+# one-time code back from the CM.
 CM_ENV="$(common_db consent_manager) consent_manager_auth_enabled=false
   consent_manager_crypto_backend=partner-mgmt consent_manager_partner_mgmt_api_url=http://127.0.0.1:18090
   consent_manager_subject_consent_required=true
-  consent_manager_otp_debug_enabled=true consent_manager_partner_cache_ttl_sec=1
-  consent_manager_replay_freshness_window_sec=$REPLAY"
+  consent_manager_otp_debug_enabled=true consent_manager_partner_cache_ttl_sec=1"
 ( cd "$WORK" && env PYTHONPATH="$CM_SRC/backend/src" $CM_ENV "$PY" -m openg2p_consent_manager.main migrate >"$WORK/cm-migrate.log" 2>&1 )
 start cm 18000 "$CM_SRC/backend/src" $CM_ENV "$PY" -m uvicorn openg2p_consent_manager.main:app --port 18000
 
-# ── Aggregation Layer (registry catalog: test/e2e/registries.yaml) ──
-AGG_ENV="$(common_db aggregation_layer) aggregation_layer_auth_enabled=false
+# ── Aggregation Layer (no database, no migrate; catalog test/e2e/registries.yaml) ──
+AGG_ENV="aggregation_layer_auth_enabled=false
   aggregation_layer_registry_catalog_path=$HERE/registries.yaml
-  aggregation_layer_cm_base_url=http://127.0.0.1:18000
-  aggregation_layer_cm_poll_interval_sec=1
-  aggregation_layer_otp_debug_enabled=true"
-( cd "$WORK" && env PYTHONPATH="$AGG_SRC/backend/src" $AGG_ENV "$PY" -m openg2p_aggregation_layer.main migrate >"$WORK/agg-migrate.log" 2>&1 )
+  aggregation_layer_cm_base_url=http://127.0.0.1:18000"
 start agg 18100 "$AGG_SRC/backend/src" $AGG_ENV \
   aggregation_layer_signing_private_key_pem="$(cat "$WORK/keys/PARTNER_AGGREGATION_LAYER.pem")" \
   "$PY" -m uvicorn openg2p_aggregation_layer.main:app --port 18100
@@ -87,7 +82,7 @@ for url in http://127.0.0.1:18000/ping http://127.0.0.1:18100/ping http://127.0.
 done
 
 set +e
-E2E_KEYS="$WORK/keys" E2E_REPLAY_WINDOW=$REPLAY "$PY" "$HERE/e2e.py"
+E2E_KEYS="$WORK/keys" "$PY" "$HERE/e2e.py"
 rc=$?
 if [ $rc -ne 0 ]; then
   echo "--- cm.log ---";  grep -iE 'error|traceback|warn' "$WORK/cm.log"  | grep -v json_logging | tail -15

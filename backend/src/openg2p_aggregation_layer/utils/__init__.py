@@ -1,4 +1,3 @@
-from . import fayda_otp
 from .canonical import (
     b64url_decode,
     b64url_encode,
@@ -8,7 +7,6 @@ from .canonical import (
 )
 
 __all__ = [
-    "fayda_otp",
     "canonical_bytes",
     "sha256_hex",
     "b64url_encode",

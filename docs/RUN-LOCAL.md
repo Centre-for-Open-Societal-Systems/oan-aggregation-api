@@ -4,15 +4,14 @@
 
 | Service | URL | Container |
 |---|---|---|
-| Aggregation Layer | http://localhost:8110 (`/docs`) | `aggregation-layer` (+ `aggregation-db`) |
+| Aggregation Layer | http://localhost:8110 (`/docs`) | `aggregation-layer` (no database) |
 | Consent Manager (`develop`, no aggregation code, `subject_consent_required=true`) | http://localhost:8000 | from the consent-management repository |
-| CM consent UI | http://localhost:3002 | from the consent-management repository |
-| Partner callback receiver (dev) | http://localhost:9099/all | `agg-callback` |
-| Kafka / Kafka UI (optional) | localhost:9092 / http://localhost:8085 | `agg-kafka`, `agg-kafka-ui` |
+| Partner callback receiver (dev, async route) | http://localhost:9099/all | `agg-callback` |
 
 The service publishes on host port 8110 so it does not collide with an API gateway on 8100.
 The registries, Partner Management and Keycloak are separate deployments on the shared
-Docker network (`OPENG2P_NETWORK`, see `deploy/docker-compose.yml`).
+Docker network (`OPENG2P_NETWORK`, see `deploy/docker-compose.yml`). The service keeps no
+state: no database, no broker, nothing to migrate.
 
 ## One-time setup
 
@@ -25,11 +24,7 @@ $EDITOR deploy/registries.yaml
 #    partner binding so it may consent to the catalog's scope ids.
 python scripts/register-aggregator.py --partner <partner-audience>
 
-# 3. local-only switches in deploy/.env: AGGREGATION_LAYER_OTP_DEBUG_ENABLED=true
-#    (no SMS gateway locally; the OTP is readable from the API)
-
 docker compose -p aggregation-layer -f deploy/docker-compose.yml up -d --build
-docker compose -p aggregation-kafka -f deploy/docker-compose.kafka.yml up -d   # optional (KAFKA_ENABLED=true)
 ```
 
 The scripts need a virtualenv with `httpx`, `pyjwt`, `cryptography`, `pydantic` and `pyyaml`
@@ -38,13 +33,17 @@ The scripts need a virtualenv with `httpx`, `pyjwt`, `cryptography`, `pydantic` 
 ## Test
 
 ```bash
-# fresh partner consent object + local Postman environment (valid 5 min)
+# gives the subject an active consent for the partner, signs a fresh consent object,
+# writes the local Postman environment (the object is valid 5 min)
 G2P_PARTNER_AUDIENCE=<partner-audience> G2P_PARTNER_PM_ID=<pm-partner-id> \
 G2P_SUBJECT_USER=<beneficiary login> G2P_SUBJECT_PASSWORD=<password> \
   python postman/agg-prep.py
 
-python scripts/stack-check.py     # consent-held flow + raise-and-approve flow, per catalog registry
+python scripts/stack-check.py     # A sync, B async, C never asked -> consent in the CM -> sync
 ```
+
+`stack-check.py` C reads the subject's one-time code back from the CM, so it needs the CM with
+`otp_debug_enabled`.
 
 The subject's login name is the beneficiary's `foundationalId`: the registries are searched
 by it, and the Aggregation Layer refuses a query for anyone other than the consent's
@@ -52,34 +51,34 @@ subject. Pick a beneficiary the registries actually hold.
 
 Postman: import `postman/OpenG2P-Aggregator.postman_collection.json` and the environment
 `agg-prep.py` just wrote (`OpenG2P-Aggregator.local.postman_environment.json`), then run the
-folders in order. Re-run `agg-prep.py` if a seek returns `replay`.
+folders in order. Re-run `agg-prep.py` if a search returns `replay` or
+`consent_object_reused`.
 
-Manual "subject never asked" flow: sign a consent object for a subject with no consent; the
-seek ack carries `consent_url` (CM UI). Approve there with the OTP **within 300s of the
-object's `issued_at`** (the CM's replay window: the aggregation layer re-validates the
-partner's object to learn the granted scopes). The poll picks it up within
-`AGGREGATION_LAYER_CM_POLL_INTERVAL_SEC` and the partner's on-search arrives at the callback
-without another call. Approved later, the row is rejected with
-`consent_approved_after_replay_window` and the partner seeks again.
+"Subject never asked": `python postman/agg-prep.py --no-grant` withdraws the subject's
+consents to the partner; the search then answers `403 no_subject_consent`. The partner
+raises a consent request in the CM, the subject confirms it with the one-time code, and the
+partner searches again with a new consent object (`stack-check.py` C does exactly this).
 
 ## Without Docker
 
 ```bash
 pip install -e backend pytest jsonschema
-pytest test/unit                                            # catalog, filter, bene-360 mapping + schemas
-PYTHONPATH=backend/src python test/otp/test_otp_flow.py
-PYTHONPATH=backend/src python test/kafka/test_consumer_flow.py
-CM_SRC=../consent-management VENV=.venv bash test/e2e/run.sh   # real CM + Postgres, fakes around them
+pytest test/unit                                               # no services needed
+CM_SRC=../consent-management VENV=.venv bash test/e2e/run.sh   # real CM + Postgres (CM only), fakes around them
 ```
 
 ## Switches
 
-- Kafka off: `AGGREGATION_LAYER_KAFKA_ENABLED=false` in `deploy/.env`, then
-  `docker compose -p aggregation-layer -f deploy/docker-compose.yml up -d aggregation-layer`.
 - A catalog change needs a restart of the service (it is loaded once, at startup) and, for
   a new registry or scope, `scripts/register-aggregator.py` for the CM bindings.
+- More than one pod or worker: all of them need the same signing key, and the same
+  `AGGREGATION_LAYER_STAFF_SEARCH_TICKET_SECRET` (or none, then it is derived from the signing
+  key) so any of them can read a staff `searchId`.
 - Logs: `docker logs -f aggregation-layer`. The catalog is logged at startup
   (`Registry catalog ...: <codes>`); an invalid catalog stops the container with every
-  problem listed.
-- Consent decisions: the aggregation layer polls the CM; look for `released by consent
-  request` / `is no longer active` in its log. Nothing is logged on the CM side.
+  problem listed. The audit is one JSON line per partner call (`"event": "aggregation"`) and
+  per staff search / tab (`staff_search`, `staff_tab_view`), on the logger
+  `app.audit`.
+- Async: the callback is one attempt with no retry, and an async search in flight is lost if
+  the service restarts. The audit line's `outcome` says what happened (`delivered`,
+  `callback_failed`, `consent_withdrawn`, `consent_check_failed`).

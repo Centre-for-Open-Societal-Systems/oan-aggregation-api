@@ -15,19 +15,11 @@ class Settings(BaseSettings):
 
         One partner call for a beneficiary's data across several registries
         (an OpenG2P Beneficiary-360 request), gated on the subject's consent
-        (held by the Consent Manager) and, where the partner's policy asks for
-        it, an OTP. The Beneficiary-360 response is POSTed to the partner's
-        callback inside a signed DCI on-search.
+        (held by the Consent Manager). The Beneficiary-360 response comes back
+        inside a signed DCI on-search: in the HTTP response (sync, the
+        default) or POSTed to the partner's callback (async). No database.
         """
     openapi_version: str = __version__
-
-    # ── Database (the aggregator's own; it never reads the CM's) ────────────
-    db_driver: str = "postgresql+asyncpg"
-    db_username: str = "postgres"
-    db_password: str = "postgres"
-    db_hostname: str = "localhost"
-    db_port: int = 5432
-    db_dbname: str = "aggregation_layer_db"
 
     # ── Signing key ─────────────────────────────────────────────────────────
     # The aggregator's OWN key, not the CM's. It signs the consent object and
@@ -45,48 +37,85 @@ class Settings(BaseSettings):
     signing_is_demo: bool = False
 
     # ── Consent Manager (reached over HTTP only) ────────────────────────────
-    # Every consent decision is the CM's: validate, raise a consent request,
-    # read its status, read a consent's status. Only the CM's generic APIs are
-    # used - see docs/CM-API-CONTRACT.md. The CM holds nothing for this
-    # service; what the subject authorised per registry hop is kept here
-    # (models/grant.py).
+    # Every consent decision is the CM's: validate a consent object, read a
+    # consent's status. Only the CM's generic APIs are used - see
+    # docs/CM-API-CONTRACT.md.
     cm_base_url: str = "http://localhost:8000"
     cm_timeout: float = 15.0
     # Service-to-service auth: Keycloak client-credentials for the
-    # `aggregation-layer` client. Its service account needs the CM admin role
-    # (CONSENT_MANAGER_ADMIN): that is what the CM's policy read and partner
-    # list require today. A static token, when set, is sent verbatim (dev).
+    # `aggregation-layer` client. Optional: /validate and the consent status
+    # are open partner APIs today. A static token, when set, is sent verbatim
+    # (dev).
     cm_token_url: str = ""
     cm_client_id: str = "aggregation-layer"
     cm_client_secret: str = ""
     cm_static_token: str = ""
-    # CM partner id per partner audience, as JSON: {"partner-x": "<uuid>"}.
-    # The CM's /validate answers with the consent, not the partner, so the
-    # partner is read from the (CM-verified) object's ``aud`` and mapped to its
-    # CM id here. An audience missing from the map is looked up once in the
-    # CM's partner list (GET /consent/v1/partners) and cached.
-    cm_partner_ids: str = ""
-    # How often consent state is read back from the CM: raised consent
-    # requests (approved / denied / expired) and the consent each in-flight
-    # aggregation stands on (withdrawn / expired). Nothing is pushed by the
-    # CM, so this is the delay between a decision there and its effect here.
-    # 0 disables the loop; the reaper still runs one pass per invocation.
-    cm_poll_interval_sec: int = 15
-    # Run the poll loop inside the API process (dev). In production set it
-    # false and let `python -m openg2p_aggregation_layer.worker` poll.
-    cm_poll_in_app: bool = True
-    # A poller that dies holding a row releases it after this long.
-    cm_poll_claim_timeout_sec: int = 120
+    # This service's controller id at the CM: a partner's stored consent
+    # (``authorize.consent_id``) must carry a grant for it.
+    cm_data_controller: str = "aggregation_layer"
+
+    # ── Partner authentication for ``authorize.consent_id`` ─────────────────
+    # A consent id is only a reference, so the caller must also prove it is the
+    # partner the consent was given to: a bearer token from the CM's partner
+    # realm whose ``partner_id`` claim names that partner. Empty issuer = the
+    # consent_id route is refused (consent_jws, which the partner signs, needs
+    # no token).
+    partner_auth_issuer: str = ""
+    partner_auth_jwks_url: str = ""
+    partner_auth_audience: str = ""
+    partner_auth_partner_claim: str = "partner_id"
 
     # ── Caller authentication (Keycloak / OIDC bearer) ──────────────────────
-    # Used by the subject-facing routes (verify-otp, status). Same realm the
-    # CM's beneficiary API uses, so a subject's token works on both.
+    # Used by the staff routes (realm ``staff``).
     auth_enabled: bool = True
     auth_issuer: str = ""
     auth_jwks_url: str = ""
     auth_audience: str = ""
     auth_algorithms: list[str] = ["RS256", "ES256", "EdDSA"]
     subject_default_id_type: str = "national_id"
+
+    # ── Staff search (POST /aggregation/v1/staff/registry/search) ───────────
+    # Registry staff look a beneficiary up across every registry that has a
+    # staff_api in the catalog, with no consent, no consent object and no OTP.
+    # The caller is a staff user (token from the auth_* realm above) holding
+    # one of these roles (realm or client). Empty refuses every caller: the
+    # route exists but nobody may use it until a role is named.
+    staff_search_roles: list[str] = ["AGGREGATION_STAFF_VIEWER"]
+    # This service's own Keycloak client for the registries' staff-apis
+    # (client_credentials). Its service account needs a view-only role
+    # (e.g. Data Supervisor) on each registry's staff-portal client. A catalog
+    # entry's staff_api.auth overrides these for a registry on another Keycloak.
+    staff_api_token_url: str = ""
+    staff_api_client_id: str = "aggregation-layer-staff"
+    staff_api_client_secret: str = ""
+    # Per staff-api call; a catalog entry's staff_api.timeout_sec overrides it.
+    staff_api_timeout: float = 20.0
+    # Register ids, tab lists and tab sections are read from the staff-api and
+    # kept this long, so a tab or section added in a registry shows up without
+    # a restart. A tab id not in the cached list forces one early refresh.
+    staff_api_metadata_ttl_sec: int = 600
+    # At most this many staff-api calls in flight per registry (per worker);
+    # a call that cannot start within staff_api_queue_timeout_sec fails that
+    # registry with "registry_busy" instead of piling up.
+    staff_api_max_concurrency: int = 20
+    staff_api_queue_timeout_sec: float = 5.0
+    # Staff-api lists (register search, metadata) come in pages: at most this
+    # many are read per call. A search cut short by the cap is reported as
+    # incomplete, never as "not found".
+    staff_api_max_pages: int = 20
+    # How long a search's searchId can open tabs. A tab request is accepted
+    # only for a record that search returned, to the staff user who ran it.
+    staff_search_ttl_sec: int = 1800
+    # The searchId is a ticket with a MAC (nothing is stored). Its key is this
+    # secret when set, else derived from the signing key: every pod must use
+    # the same key, or a tab may land on a pod that cannot read the ticket.
+    staff_search_ticket_secret: str = ""
+    # Rows per page of a list section in a tab answer (pageSize default / cap).
+    staff_tab_page_size: int = 50
+    staff_tab_max_page_size: int = 200
+    # Staff requests (search + tab) per user per minute, per worker; 0 = off.
+    # A gateway limit (e.g. Kong) is the cluster-wide one; this is the backstop.
+    staff_rate_limit_per_minute: int = 120
 
     # ── Registry catalog ────────────────────────────────────────────────────
     # The YAML file that lists every registry this service may query: where
@@ -97,9 +126,9 @@ class Settings(BaseSettings):
     # and deploy/registries.yaml.
     registry_catalog_path: str = ""
 
-    # ── Aggregator: async, OTP-gated, cross-registry fetch ──────────────────
+    # ── Aggregator: cross-registry fetch, sync or async ─────────────────────
     # One partner call for a beneficiary across several registries, answered
-    # on a callback once the subject has authorised it. The registries' own
+    # in the response (sync) or on a callback (async). The registries' own
     # /dci/registry/sync/search is untouched; the aggregator calls each of them
     # as an ordinary partner, so consent enforcement still applies per hop.
     # Identity the aggregator signs its internal consent objects with. Its
@@ -115,265 +144,10 @@ class Settings(BaseSettings):
     # fails with signature_invalid / REQUEST_VALIDATION_ERROR.
     aggregator_sender_id: str = "aggregation-layer"
     aggregator_purpose_code: str = "loan_origination"
-    # Validity of each hop's consent object AND of the per-registry grant
-    # this service records (models/grant.py).
+    # Validity of each hop's consent object.
     aggregator_consent_validity_sec: int = 300
-    # A per-registry grant is reused, rather than minted again, only while at
-    # least this much of its validity is left. A fan-out that retries must not
-    # start on a grant that lapses under it, so this is well above one hop.
-    aggregator_grant_reuse_min_remaining_sec: int = 150
-    # When the subject has no consent for this partner, raise one for them and
-    # park the aggregation until it is approved, instead of refusing the seek
-    # with no_subject_consent. False restores the two-step behaviour where the
-    # partner must obtain consent out of band before it may call.
-    #
-    # Only reachable when the CM runs with subject_consent_required=true -
-    # otherwise /validate permits on the policy ceiling and never answers
-    # no_subject_consent. On approval the partner's object is validated again
-    # to learn what was granted, so the approval must land within the CM's
-    # replay window (replay_freshness_window_sec, 300s by default) of the
-    # object's issued_at; later, the row is rejected and the partner re-seeks.
-    aggregator_raise_consent: bool = True
-    # Where the subject's consent screen lives, used to build the consent_url
-    # the partner redirects them to. Empty omits the field rather than guessing.
-    consent_ui_base_url: str = "http://localhost:3002"
     # Defaults for a registry hop; a catalog entry may override both.
     aggregator_page_size: int = 10
     aggregator_registry_timeout: float = 30.0
+    # Async route: the one callback attempt (no retry, nothing is kept).
     aggregator_callback_timeout: float = 30.0
-
-    # ── Kafka (the fan-out and delivery queues) ────────────────────────────
-    #
-    # Without a broker, verify_otp spawns asyncio.create_task() and the
-    # registry fan-out runs inside the API worker that happened to serve the
-    # request. Fifty subjects entering an OTP in the same minute means fifty
-    # concurrent, unbounded fan-outs competing with the portal's own request
-    # handling, and a partner whose callback is down loses the data outright:
-    # one POST is attempted, and there is nothing to retry it.
-    #
-    # With a broker the HTTP handler only publishes, which is bounded and
-    # fast. Workers consume at a rate the registries can survive, and delivery
-    # is a separate topic so a slow partner cannot hold a registry worker.
-    #
-    # False keeps the in-process behaviour, so the demo stack runs unchanged
-    # with no broker to start. See KAFKA.md.
-    kafka_enabled: bool = False
-    kafka_bootstrap_servers: str = "localhost:9092"
-    kafka_client_id: str = "openg2p-aggregation-layer"
-    # Topics are derived from this prefix unless named explicitly, following
-    # the platform's Audit Manager convention (openg2p.audit.events/.dlq).
-    kafka_topic_prefix: str = "openg2p"
-    kafka_topic_fanout: str = ""    # <prefix>.aggregation.fanout
-    kafka_topic_delivery: str = ""  # <prefix>.aggregation.delivery
-    # Base name only. The retry topics are one PER BACKOFF STEP, derived from
-    # this and kafka_retry_backoff_seconds: <base>.10s, <base>.60s, and so on.
-    # See the Settings.retry_tiers docstring for why a single one cannot work.
-    kafka_topic_retry: str = ""     # <prefix>.aggregation.delivery.retry
-    kafka_topic_dlq: str = ""       # <prefix>.aggregation.dlq
-    kafka_group_fanout: str = "openg2p-aggregation-fanout"
-    kafka_group_delivery: str = "openg2p-aggregation-delivery"
-    # Base name; each tier gets "<base>-<delay>s" so their offsets stay
-    # independent and a busy tier cannot hold up an idle one.
-    kafka_group_retry: str = "openg2p-aggregation-retry"
-    # Partitions cap how many fan-outs can run at once across the whole
-    # deployment, so this is the load limit the registries actually feel.
-    # 12 mirrors the Audit Manager default.
-    kafka_topic_partitions: int = 12
-    kafka_topic_replication: int = 1
-    # Idempotent CREATE TOPICS on startup, like the Audit Manager's topicInit
-    # Job. Harmless when the topics exist; set false where the broker forbids
-    # client-side topic creation.
-    kafka_topic_init: bool = True
-    # The delivery topic carries the aggregated record itself, because
-    # retrying a callback must not mean querying the registries a second time.
-    # That is personal data at rest in Kafka for as long as the topic keeps
-    # it, so the retention is deliberately short and set on creation.
-    kafka_delivery_retention_ms: int = 3_600_000      # 1 hour
-    kafka_dlq_retention_ms: int = 604_800_000         # 7 days
-    # Run the consumers inside the API process. True is the single-process
-    # dev default; in production run `python -m openg2p_aggregation_layer.worker`
-    # and set this false, so registry fan-out cannot compete with the portal's
-    # own event loop at all.
-    kafka_consumers_in_app: bool = True
-    # In-flight work per consumer. The ceiling on registry load is this times
-    # the number of consumer instances, bounded by the partition count.
-    kafka_fanout_concurrency: int = 4
-    kafka_delivery_concurrency: int = 8
-    # How long a publish may block the HTTP handler before it gives up and
-    # falls back to an in-process task. The subject has already burnt their
-    # OTP by this point; refusing the request would lose the authorisation.
-    kafka_producer_timeout: float = 5.0
-    # Callback retries. Attempt 1 is immediate; the rest are spaced by this
-    # list, then the message goes to the DLQ.
-    kafka_delivery_max_attempts: int = 5
-    kafka_retry_backoff_seconds: str = "10,60,300,900"
-    # A row left "fetching"/"delivering" by a worker that died is re-queued
-    # after this long by `python -m openg2p_aggregation_layer.reap`.
-    kafka_claim_timeout_sec: int = 600
-
-    # ── OTP (subject's real-time authorisation for an aggregated fetch) ─────
-    otp_length: int = 6
-    otp_ttl_sec: int = 300
-    otp_max_attempts: int = 3
-    # Mixed into the OTP hash so a stolen database row cannot be brute-forced
-    # against a 6-digit space offline. Set this per environment.
-    otp_salt: str = "change-me-per-environment"
-    # DEV ONLY. Exposes GET /aggregation/v1/requests/{id}/otp. There is no SMS or
-    # email gateway in this stack, so the default sender logs the code; this
-    # endpoint reports the OTP state alongside it.
-    otp_debug_enabled: bool = False
-
-    # Which OTP backend to use. "fayda" applies Fayda's rules in-process via
-    # utils/fayda_otp; "internal" is the same without the Fayda framing.
-    # Switching is config only - nothing above services/otp_provider.py changes,
-    # which is also how a real Fayda deployment would plug in.
-    otp_provider: str = "fayda"
-    # ── OTP publishing (S3 / MinIO drop box) ──────────────────────
-    # Mirrors the OAN Gen 1 / A2C arrangement: each issued OTP is written to a
-    # bucket under otp/ so a tester can read it without an SMS gateway. DEV
-    # ONLY - anything that can read the bucket reads a live OTP beside the
-    # individual it belongs to. Off by default; see services/otp_publisher.py.
-    otp_publish_enabled: bool = False
-    otp_publish_bucket: str = "a2c-webhook"
-    otp_publish_prefix: str = "otp/"
-    otp_publish_region: str = "ap-south-1"
-    # Set to point at MinIO or any S3-compatible store; empty resolves AWS.
-    otp_publish_endpoint_url: str = ""
-    otp_publish_access_key: str = ""
-    otp_publish_secret_key: str = ""
-
-    # ── Fayda OTP rules, applied in-process (utils/fayda_otp.py) ────────────
-    # There is no HTTP call to a Fayda service, so no URL or client secret.
-    fayda_identifier_type: str = "FIN"
-    fayda_otp_channel: str = "PHONE"
-    # Only used to render the masked-mobile line in the log, so an
-    # operator can see WHERE a real Fayda would have sent the code.
-    fayda_demo_phone: str = "0911000055"
-    # Fayda keys on the individual's Fayda/FIN number, not a Keycloak username,
-    # so a demo subject has to be mapped onto one.
-    # JSON: {"staff": "6140798523698702"}
-    fayda_individual_id_map: str = ""
-
-    @property
-    def fayda_individual_ids(self) -> dict:
-        import json
-        import logging
-
-        raw = (self.fayda_individual_id_map or "").strip()
-        if not raw:
-            return {}
-        try:
-            parsed = json.loads(raw)
-        except Exception as exc:  # noqa: BLE001
-            logging.getLogger(self.logging_default_logger_name).error(
-                "fayda_individual_id_map is not valid JSON (%s); subjects will "
-                "be passed through unmapped", exc)
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
-
-
-    @property
-    def cm_partner_id_map(self) -> dict:
-        """``cm_partner_ids`` parsed; a bad value logs and yields {}."""
-        import json
-        import logging
-
-        raw = (self.cm_partner_ids or "").strip()
-        if not raw:
-            return {}
-        try:
-            parsed = json.loads(raw)
-        except Exception as exc:  # noqa: BLE001
-            logging.getLogger(self.logging_default_logger_name).error(
-                "aggregation_layer_cm_partner_ids is not valid JSON (%s); partners "
-                "will be looked up in the CM", exc)
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
-
-    # ── Kafka derived values ────────────────────────────────────────────────
-    #
-    # Each topic name is overridable, but defaults to a suffix on the prefix so
-    # a deployment only has to set one variable to namespace the whole service.
-
-    def _topic(self, explicit: str, suffix: str) -> str:
-        return (explicit or "").strip() or "%s.%s" % (
-            self.kafka_topic_prefix.rstrip("."), suffix)
-
-    @property
-    def topic_fanout(self) -> str:
-        """Work queue: one message per aggregation cleared to fetch."""
-        return self._topic(self.kafka_topic_fanout, "aggregation.fanout")
-
-    @property
-    def topic_delivery(self) -> str:
-        """Outbound queue: the signed on-search envelope, awaiting its callback."""
-        return self._topic(self.kafka_topic_delivery, "aggregation.delivery")
-
-    @property
-    def topic_retry(self) -> str:
-        """Base name for the retry tiers. Not itself consumed."""
-        return self._topic(self.kafka_topic_retry, "aggregation.delivery.retry")
-
-    @property
-    def retry_tiers(self) -> list:
-        """One topic per backoff step: ``...delivery.retry.10s``, ``.60s``, …
-
-        A single retry topic cannot work, and the reason is worth writing down
-        because it is not obvious until it bites. The wait has to live
-        somewhere, and the simple answer is to sleep in the consumer — but a
-        Kafka consumer is a **loop**: it does not fetch the next batch until
-        the current one is done. Put a 900-second hold and a 10-second hold on
-        the same topic and the 10-second one waits 900 seconds, because the
-        consumer is still asleep on the message in front of it.
-
-        Splitting by duration removes the problem rather than managing it:
-        every message on a tier waits exactly the same length of time, so a
-        message that arrived earlier is always due earlier, and first-in
-        first-out is precisely the right order to process them in. The sleep
-        blocks only messages that were going to wait that long anyway.
-
-        Each tier gets its own consumer group, so their offsets are
-        independent — a tier that is busy cannot hold up a tier that is idle.
-        """
-        return [{"delay": delay,
-                 "topic": "%s.%ds" % (self.topic_retry, delay),
-                 "group": "%s-%ds" % (self.kafka_group_retry, delay)}
-                for delay in self.retry_backoff]
-
-    def retry_tier_for(self, delay: int) -> str:
-        """The tier topic a given backoff belongs on.
-
-        An exact match normally; otherwise the nearest tier at or above it, so
-        a hand-set delay is never rounded *down* into a shorter wait.
-        """
-        tiers = self.retry_tiers
-        for tier in tiers:
-            if tier["delay"] >= delay:
-                return tier["topic"]
-        return tiers[-1]["topic"]
-
-    @property
-    def topic_dlq(self) -> str:
-        """Anything that exhausted its attempts, kept for an operator to look at."""
-        return self._topic(self.kafka_topic_dlq, "aggregation.dlq")
-
-    @property
-    def retry_backoff(self) -> list:
-        """``kafka_retry_backoff_seconds`` as a list of ints.
-
-        A malformed value must not strand deliveries, so it falls back to the
-        documented default rather than raising at import time.
-        """
-        import logging
-
-        raw = (self.kafka_retry_backoff_seconds or "").strip()
-        try:
-            values = [int(part) for part in raw.split(",") if part.strip()]
-        except ValueError:
-            values = []
-        if not values:
-            logging.getLogger(self.logging_default_logger_name).error(
-                "aggregation_layer_kafka_retry_backoff_seconds is not a list of "
-                "integers (%r); using 10,60,300,900", raw)
-            values = [10, 60, 300, 900]
-        return values

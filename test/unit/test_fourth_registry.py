@@ -67,11 +67,6 @@ def service(four, monkeypatch):
 
     svc = object.__new__(aggregator_service.AggregatorService)
     svc.registries = client
-
-    async def active_grant(request, registry_code):
-        return SimpleNamespace(id="grant-" + registry_code)
-
-    svc._active_grant = active_grant
     svc.calls = calls
     svc.decoys = decoys
     return svc
@@ -84,7 +79,7 @@ def _row(scopes):
                "timeframe": "Timeframe-Short", "sections": ["REGISTRIES"]},
         requested_scopes=scopes, subject_id_type="national_id", subject_id_value=FID,
         purpose={"code": "loan_origination"}, partner_audience="partner-x",
-        partner_id="p-1", lawful_basis="consent", otp_required=True)
+        lawful_basis="consent")
 
 
 def test_fourth_registry_needs_no_code(four, service, response_schema):

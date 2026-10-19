@@ -7,7 +7,7 @@ name = "openg2p-aggregation-layer"
 authors = [
   { name = "OpenG2P", email = "info@openg2p.org" },
 ]
-description = "OpenG2P Aggregation Layer — one consent-gated Beneficiary-360 call across several registries, delivered as a DCI on-search."
+description = "OpenG2P Aggregation Layer — one consent-gated Beneficiary-360 call across several registries, answered as a DCI on-search (sync, or async on a callback). No database."
 readme = "README.md"
 requires-python = ">=3.10"
 classifiers = [
@@ -17,20 +17,15 @@ classifiers = [
 ]
 dependencies = [
   "openg2p-fastapi-common >=1.1.4",
-  "asyncpg",
-  # 2.1 stopped installing greenlet, which the async engine needs: an
-  # unpinned build starts and then every worker dies (seen on the CM image).
+  # No database here, but the framework imports sqlalchemy.ext.asyncio; 2.1
+  # stopped installing greenlet, and an unpinned build starts and then every
+  # worker dies (seen on the CM image).
   "sqlalchemy[asyncio] >=2.0,<2.1",
-  "psycopg2-binary",
   "cryptography >=42.0.0",
   "pyjwt >=2.8.0",
   "httpx",
-  # Only used when otp_publish_enabled (dev-only OTP drop box).
-  "boto3",
   # The registry catalog (registry_catalog.py).
   "pyyaml >=6.0",
-  # Fan-out and callback queues; imported lazily, only when kafka_enabled.
-  "aiokafka >=0.10",
 ]
 dynamic = ["version"]
 
