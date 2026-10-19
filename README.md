@@ -25,6 +25,7 @@ DCI `on-search`: in the HTTP response (sync, the default) or POSTed to the partn
 - [API](#api)
 - [Consent flow](#consent-flow)
 - [Configuration](#configuration)
+- [Deployment (DevOps checklist)](#deployment-devops-checklist)
 - [Adding a new registry](#adding-a-new-registry)
 - [Running locally](#running-locally)
 - [Tests](#tests)
@@ -561,6 +562,84 @@ Rules worth knowing:
 - Register **metadata paths** (`internal_record_id`, `functional_record_id`, …) are read from
   the record and released as identifiers; point them only at data that may be released.
 - A catalog change takes effect on restart.
+
+## Deployment (DevOps checklist)
+
+What a deployment of this release needs. All variables are `AGGREGATION_LAYER_<NAME>`;
+put secrets in a Kubernetes Secret (or `deploy/.env`, which is git-ignored), never in the
+catalog or in git. [`deploy/.env.example`](deploy/.env.example) lists them with local values.
+
+### Before you start
+
+| Item | Detail |
+|---|---|
+| Image | Built from this repo: `docker build -f deploy/Dockerfile -t <registry>/oan-aggregation-api:<tag> .` (listens on `8100`). One image, no database, no Kafka: remove any old `DB_*` / `KAFKA_*` settings, the migration job and the worker from earlier deployments. |
+| Consent Manager | Must run the matching consent-management release (PR #4: OTP consent, `consent_id` at `/validate`, `request_context.purpose`, `GET /consent/v1/consents/{id}/status`). Deploy both together; this service refuses a purpose the CM does not confirm (`403 purpose_unverified`). |
+| Keycloak | The **staff** realm (staff search callers + this service's staff-api client) and the **partner** realm (partner tokens for `authorize.consent_id`; each partner's token carries a `partner_id` claim). |
+| Partner Management | This service is a partner (`PARTNER_<AGGREGATOR_SENDER_ID>`) with its signing certificate (the public half of the key below): `scripts/register-aggregator.py`. |
+| CM binding | In the CM, partners are bound to the controller `aggregation_layer` (= `CM_DATA_CONTROLLER`) with namespaced scopes (`FARMER_REGISTRY.farmer_personal_details`, …): a partner's consent must grant this controller. External banks: policy `consent_method: otp`. |
+| Registries | Each registry's partner-api (consent path) and, for staff search, staff-api; this service's PM partner bound in each registry's CM binding (the registry hop). |
+
+### Mounted files
+
+| Path (in the container) | What | Source |
+|---|---|---|
+| `REGISTRY_CATALOG_PATH`, e.g. `/config/registries.yaml` | Registry catalog (no secrets) | ConfigMap, from [`deploy/registries.yaml`](deploy/registries.yaml) adapted to the environment's URLs |
+| `SIGNING_P12_PATH`, e.g. `/keys/aggregation-layer.p12` | This service's signing key (signs on-search answers and registry hops) | Secret. The SAME key on every pod; its certificate is the one registered in PM |
+
+### Environment variables
+
+**Required** (the service fails to start, or the named feature answers `503`, without them):
+
+| Variable | Example | Notes |
+|---|---|---|
+| `REGISTRY_CATALOG_PATH` | `/config/registries.yaml` | Invalid or missing: no start. |
+| `SIGNING_P12_PATH` | `/keys/aggregation-layer.p12` | Or `SIGNING_PRIVATE_KEY_PEM`. |
+| `SIGNING_P12_PASSWORD` | *(Secret)* | Password of the `.p12`. |
+| `SIGNING_KID` | `agg-2026-01` | Must equal the kid registered in PM. |
+| `AGGREGATOR_SENDER_ID`, `AGGREGATOR_ISSUER` | `aggregation-layer` | `sender_id` must map to the PM partner `PARTNER_<SENDER_ID>`. |
+| `CM_BASE_URL` | `http://<cm-release>-partner-api` | The CM's **partner** API Service (serves `/consent/v1/validate` and the consent status), not the staff API. |
+| `CM_DATA_CONTROLLER` | `aggregation_layer` | This service's controller id in the CM; must match the partners' bindings. |
+| `PARTNER_AUTH_ISSUER` | `https://keycloak.<domain>/realms/partner` | Issuer of partner tokens. Empty: every `authorize.consent_id` call is `503`. |
+| `PARTNER_AUTH_JWKS_URL` | `http://keycloak/realms/partner/protocol/openid-connect/certs` | Reachable from the pod (internal URL is fine). Empty: derived from the issuer. |
+| `AUTH_ENABLED` | `true` | Keep `true` outside local development. |
+| `AUTH_ISSUER` | `https://keycloak.<domain>/realms/staff` | Issuer of staff tokens. **Required when `AUTH_ENABLED=true`**: without it every staff call is `503` (tokens are never decoded unverified). |
+| `AUTH_JWKS_URL` | `http://keycloak/realms/staff/protocol/openid-connect/certs` | Reachable from the pod. Empty: derived from `AUTH_ISSUER`. |
+
+**Staff search** (only if any catalog entry has `staff_api`):
+
+| Variable | Example | Notes |
+|---|---|---|
+| `STAFF_API_TOKEN_URL` | `http://keycloak/realms/staff/protocol/openid-connect/token` | This service's own client_credentials login to the staff-apis. |
+| `STAFF_API_CLIENT_ID` | `aggregation-layer-staff` | Its service account needs a view-only role (e.g. Data Supervisor) on each `<registry>-registry-staff-portal` client. |
+| `STAFF_API_CLIENT_SECRET` | *(Secret)* | |
+| `STAFF_SEARCH_ROLES` | `["AGGREGATION_STAFF_VIEWER"]` | JSON list; give the role to staff users who may search. |
+| `STAFF_SEARCH_TICKET_SECRET` | *(Secret, 32+ random bytes)* | Recommended. The same value on every pod. Empty: derived from the signing key. |
+
+**Optional** (defaults are fine to start):
+
+| Variable | Default | Notes |
+|---|---|---|
+| `PARTNER_AUTH_AUDIENCE` | empty | Set to check the partner token's `aud`. |
+| `PARTNER_AUTH_PARTNER_CLAIM` | `partner_id` | Claim naming the partner in the partner token. |
+| `AUTH_AUDIENCE` | empty | Set to check the staff token's `aud`. |
+| `CM_TOKEN_URL`, `CM_CLIENT_ID`, `CM_CLIENT_SECRET` | empty | Login to the CM; the CM APIs used are open today. |
+| `STAFF_API_MAX_PAGES` | `20` | Pages read per staff-api list; a search cut short is `incomplete`. |
+| `STAFF_API_TIMEOUT`, `STAFF_API_MAX_CONCURRENCY`, `STAFF_API_QUEUE_TIMEOUT_SEC`, `STAFF_API_METADATA_TTL_SEC` | `20`, `20`, `5`, `600` | |
+| `STAFF_SEARCH_TTL_SEC`, `STAFF_RATE_LIMIT_PER_MINUTE` | `1800`, `120` | |
+| `AGGREGATOR_REGISTRY_TIMEOUT`, `AGGREGATOR_CALLBACK_TIMEOUT`, `AGGREGATOR_CONSENT_VALIDITY_SEC` | `30`, `30`, `300` | |
+| `NO_OF_WORKERS` | image default | Gunicorn workers. |
+
+### After deploying
+
+1. `GET /aggregation/v1/registries` answers the catalog (the service started with it).
+2. Logs at startup show no `Staff search routes will refuse every token` error (that means `AUTH_ISSUER` is missing).
+3. End to end: a partner raises an OTP consent in the CM, verifies the code, then calls
+   `POST /dci/registry/sync/search` with `authorize.consent_id` and its partner token:
+   `200` with data. The same call with another `search_criteria.purpose` is `403 purpose_mismatch`.
+4. Ship the `app.audit` log lines to the log store (they are the record of every release).
+5. Async (`/dci/registry/async/search`) is best effort: one callback, no retry, lost on a restart.
+   Clients that need certainty use sync.
 
 ## Adding a new registry
 
