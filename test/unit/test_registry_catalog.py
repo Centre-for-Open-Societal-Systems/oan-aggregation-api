@@ -19,6 +19,7 @@ def test_good_catalog_loads(three):
                              "NATIONAL_SOCIAL_REGISTRY"]
     farmer = three.get("FARMER_REGISTRY")
     assert farmer.partner_api.base_url == "http://farmer.registry.test"
+    assert farmer.partner_api.search_path == "/dci/sync/search"
     assert farmer.search.id_type == "UIN"
     assert farmer.search.match.scope == "person"
     assert farmer.scopes["person"].register_mnemonic == "FARMER"
@@ -103,6 +104,10 @@ def _mutations():
             fields=["name..given"]), "invalid path"),
         m("non-http url", lambda r: farmer(r)["partner_api"].update(
             base_url="ftp://x"), "http(s) URL"),
+        m("search path without a leading slash", lambda r: farmer(r)["partner_api"].update(
+            search_path="dci/sync/search"), "search_path must be a path"),
+        m("search path as a url", lambda r: farmer(r)["partner_api"].update(
+            search_path="/http://x/dci"), "search_path must be a path"),
         m("missing search", lambda r: farmer(r).pop("search"), "search"),
         m("missing identifier match", lambda r: farmer(r)["search"].pop("match"), "match"),
         m("identifier match outside the scopes", lambda r: farmer(r)["search"]["match"]

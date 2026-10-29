@@ -129,7 +129,7 @@ class Settings(BaseSettings):
     # ── Aggregator: cross-registry fetch, sync or async ─────────────────────
     # One partner call for a beneficiary across several registries, answered
     # in the response (sync) or on a callback (async). The registries' own
-    # /dci/registry/sync/search is untouched; the aggregator calls each of them
+    # DCI sync search (/dci/sync/search) is untouched; the aggregator calls each of them
     # as an ordinary partner, so consent enforcement still applies per hop.
     # Identity the aggregator signs its internal consent objects with. Its
     # public key must be registered in Partner Management and it needs a CM

@@ -221,11 +221,16 @@ class PartnerApi(_Strict):
     base_url: str = Field(description="Base URL of the registry's OpenG2P partner API")
     receiver_id: str = Field(min_length=1, description="DCI header.receiver_id")
     timeout_sec: Optional[float] = Field(default=None, gt=0)
+    # OpenG2P registry platform 1.2 serves the DCI sync search here; the older
+    # /dci/registry/sync/search route is retired.
+    search_path: str = Field(default="/dci/sync/search", description="DCI sync search path on the partner API")
 
     @model_validator(mode="after")
     def _url(self):
         if not self.base_url.lower().startswith(("http://", "https://")):
             raise ValueError("base_url must be an http(s) URL")
+        if not self.search_path.startswith("/") or "://" in self.search_path:
+            raise ValueError("search_path must be a path starting with '/'")
         return self
 
 

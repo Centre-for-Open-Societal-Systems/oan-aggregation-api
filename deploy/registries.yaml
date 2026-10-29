@@ -15,7 +15,9 @@
 #
 #   name                  bene-360 registryName
 #   partner_api.base_url  the registry's OpenG2P partner API; the service calls
-#                         <base_url>/dci/registry/sync/search
+#                         <base_url><partner_api.search_path>
+#   partner_api.search_path   optional, default /dci/sync/search (the DCI route of
+#                         registry platform 1.2; /dci/registry/sync/search is retired)
 #   partner_api.receiver_id   DCI header.receiver_id on the hop
 #   partner_api.timeout_sec   optional, overrides AGGREGATION_LAYER_AGGREGATOR_REGISTRY_TIMEOUT
 #   binding.audience      the CM binding (aggregation layer -> this registry,

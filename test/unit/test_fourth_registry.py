@@ -90,7 +90,8 @@ def test_fourth_registry_needs_no_code(four, service, response_schema):
 
     # The hop to the new registry is built entirely from its catalog entry.
     [hop] = [c for c in service.calls if "worker.registry.test" in c["url"]]
-    assert hop["url"] == "http://worker.registry.test/dci/registry/sync/search"
+    # Default DCI sync search route of the OpenG2P registry platform.
+    assert hop["url"] == "http://worker.registry.test/dci/sync/search"
     assert hop["header"]["receiver_id"] == "worker-registry"
     assert hop["criteria"]["reg_type"] == "Worker"
     assert hop["criteria"]["reg_record_type"] == "WorkerRecord"
@@ -177,3 +178,13 @@ def test_identifier_block_is_fetched_for_the_check_but_not_released(four, servic
     assert "employment" not in register.get("attributes", {})
     assert "mason" not in json.dumps(worker["membership"])
     assert [t["tableMnemonic"] for t in register["tables"]] == ["CONTRACT"]
+
+
+def test_catalog_search_path_is_used(four, service):
+    four.get("WORKER_REGISTRY").partner_api.search_path = "/custom/dci/search"
+    try:
+        asyncio.run(service._query_registries(_row(four.scope_ids())))
+    finally:
+        four.get("WORKER_REGISTRY").partner_api.search_path = "/dci/sync/search"
+    [hop] = [c for c in service.calls if "worker.registry.test" in c["url"]]
+    assert hop["url"] == "http://worker.registry.test/custom/dci/search"

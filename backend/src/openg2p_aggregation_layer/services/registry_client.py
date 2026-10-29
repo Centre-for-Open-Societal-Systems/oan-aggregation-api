@@ -1,8 +1,8 @@
 """Calls a registry's existing DCI search on the aggregator's behalf.
 
 The partner makes one request; this is what turns it into one call per
-registry. Crucially it uses each registry's **unchanged**
-``POST /dci/registry/sync/search`` — the same endpoint the partner would have
+registry. Crucially it uses each registry's **unchanged** DCI sync search
+(``partner_api.search_path``, by default ``POST /dci/sync/search``) — the same endpoint the partner would have
 called itself, with the same two signatures and the same consent check. No
 registry is modified, and consent enforcement stays on for every internal hop.
 
@@ -160,7 +160,7 @@ class RegistryClient(BaseService):
         _jws, signature = self._jws({"header": header, "message": message})
         body = {"signature": signature, "header": header, "message": message}
 
-        url = entry.partner_api.base_url.rstrip("/") + "/dci/registry/sync/search"
+        url = entry.partner_api.base_url.rstrip("/") + entry.partner_api.search_path
         timeout = entry.partner_api.timeout_sec or _config.aggregator_registry_timeout
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
