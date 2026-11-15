@@ -1,0 +1,14 @@
+OAN Aggregation API is deploying as "{{ include "oan-aggregation-api.fullname" . }}" (release "{{ .Release.Name }}") in namespace "{{ .Release.Namespace }}".
+{{- if .Values.virtualService.enabled }}
+
+Health:  https://{{ tpl .Values.virtualService.host . }}/ping
+Catalog: https://{{ tpl .Values.virtualService.host . }}/aggregation/v1/registries
+Docs:    https://{{ tpl .Values.virtualService.host . }}/docs
+{{- else }}
+
+No route enabled. Reach it with a port-forward:
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "oan-aggregation-api.fullname" . }} 8100:{{ .Values.servicePort }}
+
+then open http://127.0.0.1:8100/ping
+{{- end }}

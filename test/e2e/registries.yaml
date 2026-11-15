@@ -1,0 +1,32 @@
+# Registry catalog for the end-to-end run: one registry, served by fakes.py.
+version: 1
+registries:
+  FARMER_REGISTRY:
+    name: Farmer Registry
+    partner_api:
+      base_url: http://127.0.0.1:18090
+      receiver_id: farmer-registry
+    binding:
+      audience: aggregation-layer-farmer
+      controller_id: farmer-registry
+    search:
+      reg_type: ns:FarmerRecord
+      reg_record_type: ns:Farmer
+      id_type: UIN
+      match:
+        path: farmer_personal_details.member_identifier[]
+    registers:
+      FARMER:
+        name: Farmer
+        functional_record_id: farmer_personal_details.member_identifier[].identifier_value
+    scopes:
+      farmer_personal_details:
+        register: FARMER
+        fields:
+          - demographic_info.name.given_name
+          - demographic_info.name.surname
+      family_details:
+        table: HOUSEHOLD
+        name: Household
+        parent: FARMER
+        fields: [group_size]

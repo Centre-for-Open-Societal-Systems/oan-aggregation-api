@@ -1,0 +1,735 @@
+{
+  "info": {
+    "name": "OpenG2P Aggregation Layer (Beneficiary-360)",
+    "description": "The consent-gated Beneficiary-360 fetch on the Aggregation Layer (`agg_url`, default http://localhost:8110).\n\n## The flow\n\nThe subject's consent comes first, outside this service:\n\n1. the partner raises a consent request in the Consent Manager (`POST /consent/v1/consent-requests`); the CM sends the subject a one-time code;\n2. the partner gets the code from the subject and confirms it with the CM; the CM records the consent;\n3. the partner calls this service with a consent object it signed (`authorize.consent_jws`):\n   - `POST /dci/registry/sync/search` (default): `200`, the body is the signed DCI on-search whose `reg_records[0]` is the Beneficiary-360 response;\n   - `POST /dci/registry/async/search`: `202` ack; the same on-search is POSTed to `header.sender_uri` as soon as the registries have answered (one attempt, no retry).\n\nNo consent from the subject: `403 no_subject_consent`.\n\n## Before you start\n\n```bash\npython postman/agg-prep.py   # gives the subject an active consent, signs the consent object, writes the local environment\n```\n\n`agg-prep.py` does steps 1-2 for you (directly on the CM, as the subject). Import `OpenG2P-Aggregator.local.postman_environment.json` (generated, gitignored), select it, then run the folders in order. `python postman/agg-prep.py --no-grant` leaves the subject without a consent: the searches then answer `403 no_subject_consent`.\n\n## The consent object\n\n| | |\n|---|---|\n| expires | 300s (`replay_freshness_window_sec`) |\n| answered once | the CM records its first permit; a later search for other registries is `409 consent_object_reused` |\n\nRe-run `agg-prep.py` (and re-import the environment) if a search comes back `replay` or `consent_object_reused`.\n\n## Why Postman cannot do all of it\n\nA consent object is an ES256 compact JWS and Postman's sandbox has no ECDSA, so `agg-prep.py` signs it outside and hands it over as `{{consent_jws}}`. Everything else is plain HTTP.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{access_token}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "agg_url",
+      "value": "http://localhost:8110"
+    },
+    {
+      "key": "keycloak_url",
+      "value": "http://localhost:8080"
+    },
+    {
+      "key": "callback_receiver",
+      "value": "http://localhost:9099"
+    },
+    {
+      "key": "bene360_context",
+      "value": "https://schemas.openg2p.org/beneficiary360/v1/context.jsonld"
+    }
+  ],
+  "item": [
+    {
+      "name": "0 Health & discovery",
+      "item": [
+        {
+          "name": "Service is up",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{agg_url}}/ping",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "ping"
+              ]
+            },
+            "description": "",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('up', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Registry catalog",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{agg_url}}/aggregation/v1/registries",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "aggregation",
+                "v1",
+                "registries"
+              ]
+            },
+            "description": "Every registry, its scopes (`scopeId` is what a partner consents to), where each block lands in the Beneficiary-360 response and which fields may leave the service. Open by design: no URL, binding or secret.",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const j = pm.response.json();",
+                  "pm.test('catalog returned', () => pm.expect(j.registries).to.be.an('array'));",
+                  "(j.registries || []).forEach(r => console.log(r.registryCode + ': ' +",
+                  "  r.scopes.map(s => s.scopeId).join(', ')));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "1 Partner - sync search (default)",
+      "item": [
+        {
+          "name": "Beneficiary-360 search (sync)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{agg_url}}/dci/registry/sync/search",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "dci",
+                "registry",
+                "sync",
+                "search"
+              ]
+            },
+            "description": "A DCI search envelope whose `search_criteria.query` is a Beneficiary-360 request; the consent object goes in `authorize.consent_jws`. The answer is the HTTP response: a signed DCI on-search whose `message.search_response[0].data.reg_records[0]` is the Beneficiary-360 response. `header.sender_uri` is not needed here. Without a subject consent: `403 no_subject_consent`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"header\": {\n    \"version\": \"1.0.0\",\n    \"message_id\": \"{{$guid}}\",\n    \"message_ts\": \"{{$isoTimestamp}}\",\n    \"action\": \"search\",\n    \"sender_id\": \"{{partner_audience}}\",\n    \"receiver_id\": \"aggregation-layer\",\n    \"sender_uri\": \"{{callback_url}}\",\n    \"total_count\": 1,\n    \"is_msg_encrypted\": false\n  },\n  \"message\": {\n    \"transaction_id\": \"txn-{{$timestamp}}\",\n    \"search_request\": [\n      {\n        \"reference_id\": \"ref-{{$timestamp}}\",\n        \"timestamp\": \"{{$isoTimestamp}}\",\n        \"search_criteria\": {\n          \"version\": \"1.0.0\",\n          \"query_type\": \"beneficiary360\",\n          \"query\": {\n            \"@context\": \"{{bene360_context}}\",\n            \"foundationalId\": \"{{foundational_id}}\",\n            \"timeframe\": \"Timeframe-Medium\",\n            \"sections\": [\n              \"REGISTRIES\"\n            ],\n            \"correlationId\": \"postman-{{$timestamp}}\"\n          },\n          \"purpose\": {\n            \"code\": \"loan_origination\"\n          },\n          \"authorize\": {\n            \"consent_jws\": \"{{consent_jws}}\"\n          }\n        }\n      }\n    ]\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('answered (200)', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "const res = ((j.message || {}).search_response || [{}])[0];",
+                  "const rec = ((res.data || {}).reg_records || [])[0] || {};",
+                  "pm.test('a signed DCI on-search', () => {",
+                  "  pm.expect(j.header.action).to.eql('on-search');",
+                  "  pm.expect(j.signature).to.be.a('string');",
+                  "});",
+                  "pm.test('reg_records[0] is a Beneficiary-360 response', () => pm.expect(rec['@type']).to.eql('Beneficiary360Response'));",
+                  "const target = pm.environment.name ? pm.environment : pm.collectionVariables;",
+                  "if (j.message && j.message.correlation_id) { target.set('correlation_id', j.message.correlation_id); }",
+                  "console.log('status      : ' + j.header.status);",
+                  "console.log('registries  : ' + (rec.registries || []).map(r => r.registryCode).join(', '));",
+                  "console.log('warnings    : ' + JSON.stringify((rec.meta || {}).warnings || []));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "2 Partner - async search and callback",
+      "item": [
+        {
+          "name": "Beneficiary-360 search (async)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{agg_url}}/dci/registry/async/search",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "dci",
+                "registry",
+                "async",
+                "search"
+              ]
+            },
+            "description": "The same envelope on the async route. `header.sender_uri` is the callback. Answered `202` with an ack once every check (callback URL, query, consent) has passed; the signed on-search is POSTed to `sender_uri` as soon as the registries have answered. One attempt, no retry, not kept across a restart. Right before the callback the CM is asked again whether the consent is still active: if not, the callback is a rejected on-search (`consent_withdrawn`, or `consent_check_failed` when the CM cannot answer) without data.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"header\": {\n    \"version\": \"1.0.0\",\n    \"message_id\": \"{{$guid}}\",\n    \"message_ts\": \"{{$isoTimestamp}}\",\n    \"action\": \"search\",\n    \"sender_id\": \"{{partner_audience}}\",\n    \"receiver_id\": \"aggregation-layer\",\n    \"sender_uri\": \"{{callback_url}}\",\n    \"total_count\": 1,\n    \"is_msg_encrypted\": false\n  },\n  \"message\": {\n    \"transaction_id\": \"txn-{{$timestamp}}\",\n    \"search_request\": [\n      {\n        \"reference_id\": \"ref-{{$timestamp}}\",\n        \"timestamp\": \"{{$isoTimestamp}}\",\n        \"search_criteria\": {\n          \"version\": \"1.0.0\",\n          \"query_type\": \"beneficiary360\",\n          \"query\": {\n            \"@context\": \"{{bene360_context}}\",\n            \"foundationalId\": \"{{foundational_id}}\",\n            \"timeframe\": \"Timeframe-Medium\",\n            \"sections\": [\n              \"REGISTRIES\"\n            ],\n            \"correlationId\": \"postman-{{$timestamp}}\"\n          },\n          \"purpose\": {\n            \"code\": \"loan_origination\"\n          },\n          \"authorize\": {\n            \"consent_jws\": \"{{consent_jws}}\"\n          }\n        }\n      }\n    ]\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('accepted (202)', () => pm.response.to.have.status(202));",
+                  "const j = pm.response.json();",
+                  "pm.test('ack fields', () => {",
+                  "  pm.expect(j.status).to.eql('pdng');",
+                  "  pm.expect(j.correlation_id).to.be.a('string');",
+                  "  pm.expect(j.accepted_scopes).to.be.an('array').that.is.not.empty;",
+                  "  pm.expect(j.registries).to.be.an('array').that.is.not.empty;",
+                  "  pm.expect(j.callback_url).to.eql(pm.variables.get('callback_url'));",
+                  "});",
+                  "const target = pm.environment.name ? pm.environment : pm.collectionVariables;",
+                  "if (j.correlation_id) { target.set('correlation_id', j.correlation_id); }",
+                  "console.log('correlation : ' + j.correlation_id);",
+                  "console.log('registries  : ' + (j.registries || []).join(', '));",
+                  "console.log('scopes      : ' + (j.accepted_scopes || []).length);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Last on-search received (dev receiver)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{callback_receiver}}/last",
+              "host": [
+                "{{callback_receiver}}"
+              ],
+              "path": [
+                "last"
+              ]
+            },
+            "description": "`postman/callback_receiver.py` (`agg-callback` in docker-compose). The pre-request script waits a few seconds for the registries to answer.",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// the async answer is sent as soon as the registries have answered",
+                  "setTimeout(() => {}, 3000);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const j = pm.response.json();",
+                  "const body = j.body || j;",
+                  "const msg = body.message || {};",
+                  "const rec = (((msg.search_response || [{}])[0]).data || {}).reg_records || [];",
+                  "pm.test('the on-search of the async search', () => {",
+                  "  pm.expect((body.header || {}).action).to.eql('on-search');",
+                  "  pm.expect(msg.correlation_id).to.eql(pm.variables.get('correlation_id'));",
+                  "});",
+                  "pm.test('a Beneficiary-360 response', () =>",
+                  "  pm.expect((rec[0] || {})['@type']).to.eql('Beneficiary360Response'));",
+                  "console.log(JSON.stringify(rec[0], null, 2));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "3 Guard rails",
+      "item": [
+        {
+          "name": "Another beneficiary than the consent subject - 403",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{agg_url}}/dci/registry/sync/search",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "dci",
+                "registry",
+                "sync",
+                "search"
+              ]
+            },
+            "description": "`foundationalId` must be the consent object's subject: a consent for one person never fetches another.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"header\": {\n    \"version\": \"1.0.0\",\n    \"message_id\": \"{{$guid}}\",\n    \"message_ts\": \"{{$isoTimestamp}}\",\n    \"action\": \"search\",\n    \"sender_id\": \"{{partner_audience}}\",\n    \"receiver_id\": \"aggregation-layer\",\n    \"sender_uri\": \"{{callback_url}}\",\n    \"total_count\": 1,\n    \"is_msg_encrypted\": false\n  },\n  \"message\": {\n    \"transaction_id\": \"txn-{{$timestamp}}\",\n    \"search_request\": [\n      {\n        \"reference_id\": \"ref-{{$timestamp}}\",\n        \"timestamp\": \"{{$isoTimestamp}}\",\n        \"search_criteria\": {\n          \"version\": \"1.0.0\",\n          \"query_type\": \"beneficiary360\",\n          \"query\": {\n            \"@context\": \"{{bene360_context}}\",\n            \"foundationalId\": \"someone-else\",\n            \"timeframe\": \"Timeframe-Medium\",\n            \"sections\": [\n              \"REGISTRIES\"\n            ],\n            \"correlationId\": \"postman-{{$timestamp}}\"\n          },\n          \"purpose\": {\n            \"code\": \"loan_origination\"\n          },\n          \"authorize\": {\n            \"consent_jws\": \"{{consent_jws}}\"\n          }\n        }\n      }\n    ]\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('403 subject_mismatch', () => {",
+                  "  pm.response.to.have.status(403);",
+                  "  pm.expect(pm.response.json().error).to.eql('subject_mismatch');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Property bene-360 does not define - 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{agg_url}}/dci/registry/sync/search",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "dci",
+                "registry",
+                "sync",
+                "search"
+              ]
+            },
+            "description": "The query must validate against the published request.schema.json, which forbids extra properties.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"header\": {\n    \"version\": \"1.0.0\",\n    \"message_id\": \"{{$guid}}\",\n    \"message_ts\": \"{{$isoTimestamp}}\",\n    \"action\": \"search\",\n    \"sender_id\": \"{{partner_audience}}\",\n    \"receiver_id\": \"aggregation-layer\",\n    \"sender_uri\": \"{{callback_url}}\",\n    \"total_count\": 1,\n    \"is_msg_encrypted\": false\n  },\n  \"message\": {\n    \"transaction_id\": \"txn-{{$timestamp}}\",\n    \"search_request\": [\n      {\n        \"reference_id\": \"ref-{{$timestamp}}\",\n        \"timestamp\": \"{{$isoTimestamp}}\",\n        \"search_criteria\": {\n          \"version\": \"1.0.0\",\n          \"query_type\": \"beneficiary360\",\n          \"query\": {\n            \"@context\": \"{{bene360_context}}\",\n            \"foundationalId\": \"{{foundational_id}}\",\n            \"timeframe\": \"Timeframe-Medium\",\n            \"sections\": [\n              \"REGISTRIES\"\n            ],\n            \"correlationId\": \"postman-{{$timestamp}}\",\n            \"fields\": [\n              \"anything\"\n            ]\n          },\n          \"purpose\": {\n            \"code\": \"loan_origination\"\n          },\n          \"authorize\": {\n            \"consent_jws\": \"{{consent_jws}}\"\n          }\n        }\n      }\n    ]\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('rejected', () => pm.expect(pm.response.code).to.be.oneOf([400, 422]));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Only PROGRAMS - 422",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{agg_url}}/dci/registry/sync/search",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "dci",
+                "registry",
+                "sync",
+                "search"
+              ]
+            },
+            "description": "No PBMS is connected, so a query with nothing this service can answer is refused before the CM is asked.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"header\": {\n    \"version\": \"1.0.0\",\n    \"message_id\": \"{{$guid}}\",\n    \"message_ts\": \"{{$isoTimestamp}}\",\n    \"action\": \"search\",\n    \"sender_id\": \"{{partner_audience}}\",\n    \"receiver_id\": \"aggregation-layer\",\n    \"sender_uri\": \"{{callback_url}}\",\n    \"total_count\": 1,\n    \"is_msg_encrypted\": false\n  },\n  \"message\": {\n    \"transaction_id\": \"txn-{{$timestamp}}\",\n    \"search_request\": [\n      {\n        \"reference_id\": \"ref-{{$timestamp}}\",\n        \"timestamp\": \"{{$isoTimestamp}}\",\n        \"search_criteria\": {\n          \"version\": \"1.0.0\",\n          \"query_type\": \"beneficiary360\",\n          \"query\": {\n            \"@context\": \"{{bene360_context}}\",\n            \"foundationalId\": \"{{foundational_id}}\",\n            \"timeframe\": \"Timeframe-Medium\",\n            \"sections\": [\n              \"PROGRAMS\"\n            ],\n            \"correlationId\": \"postman-{{$timestamp}}\"\n          },\n          \"purpose\": {\n            \"code\": \"loan_origination\"\n          },\n          \"authorize\": {\n            \"consent_jws\": \"{{consent_jws}}\"\n          }\n        }\n      }\n    ]\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422 section_not_supported', () => {",
+                  "  pm.response.to.have.status(422);",
+                  "  pm.expect(pm.response.json().error).to.eql('section_not_supported');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Registry not in the catalog - 422",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{agg_url}}/dci/registry/sync/search",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "dci",
+                "registry",
+                "sync",
+                "search"
+              ]
+            },
+            "description": "A `registryFilter` naming no registry of the catalog (`GET /aggregation/v1/registries`).",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"header\": {\n    \"version\": \"1.0.0\",\n    \"message_id\": \"{{$guid}}\",\n    \"message_ts\": \"{{$isoTimestamp}}\",\n    \"action\": \"search\",\n    \"sender_id\": \"{{partner_audience}}\",\n    \"receiver_id\": \"aggregation-layer\",\n    \"sender_uri\": \"{{callback_url}}\",\n    \"total_count\": 1,\n    \"is_msg_encrypted\": false\n  },\n  \"message\": {\n    \"transaction_id\": \"txn-{{$timestamp}}\",\n    \"search_request\": [\n      {\n        \"reference_id\": \"ref-{{$timestamp}}\",\n        \"timestamp\": \"{{$isoTimestamp}}\",\n        \"search_criteria\": {\n          \"version\": \"1.0.0\",\n          \"query_type\": \"beneficiary360\",\n          \"query\": {\n            \"@context\": \"{{bene360_context}}\",\n            \"foundationalId\": \"{{foundational_id}}\",\n            \"timeframe\": \"Timeframe-Medium\",\n            \"sections\": [\n              \"REGISTRIES\"\n            ],\n            \"registryFilter\": [\n              \"NO_SUCH_REGISTRY\"\n            ],\n            \"correlationId\": \"postman-{{$timestamp}}\"\n          },\n          \"purpose\": {\n            \"code\": \"loan_origination\"\n          },\n          \"authorize\": {\n            \"consent_jws\": \"{{consent_jws}}\"\n          }\n        }\n      }\n    ]\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422 no_registry', () => {",
+                  "  pm.response.to.have.status(422);",
+                  "  pm.expect(pm.response.json().error).to.eql('no_registry');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Async without sender_uri - 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{agg_url}}/dci/registry/async/search",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "dci",
+                "registry",
+                "async",
+                "search"
+              ]
+            },
+            "description": "The async route needs `header.sender_uri` for the on-search; checked before anything else.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"header\": {\n    \"version\": \"1.0.0\",\n    \"message_id\": \"{{$guid}}\",\n    \"message_ts\": \"{{$isoTimestamp}}\",\n    \"action\": \"search\",\n    \"sender_id\": \"{{partner_audience}}\",\n    \"receiver_id\": \"aggregation-layer\",\n    \"total_count\": 1,\n    \"is_msg_encrypted\": false\n  },\n  \"message\": {\n    \"transaction_id\": \"txn-{{$timestamp}}\",\n    \"search_request\": [\n      {\n        \"reference_id\": \"ref-{{$timestamp}}\",\n        \"timestamp\": \"{{$isoTimestamp}}\",\n        \"search_criteria\": {\n          \"version\": \"1.0.0\",\n          \"query_type\": \"beneficiary360\",\n          \"query\": {\n            \"@context\": \"{{bene360_context}}\",\n            \"foundationalId\": \"{{foundational_id}}\",\n            \"timeframe\": \"Timeframe-Medium\",\n            \"sections\": [\n              \"REGISTRIES\"\n            ],\n            \"correlationId\": \"postman-{{$timestamp}}\"\n          },\n          \"purpose\": {\n            \"code\": \"loan_origination\"\n          },\n          \"authorize\": {\n            \"consent_jws\": \"{{consent_jws}}\"\n          }\n        }\n      }\n    ]\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 no_callback', () => {",
+                  "  pm.response.to.have.status(400);",
+                  "  pm.expect(pm.response.json().error).to.eql('no_callback');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "4 One registry only",
+      "description": "Optional. A Beneficiary-360 request may name the registries it wants in `registryFilter` (codes from `GET /aggregation/v1/registries`); without it every catalog registry is queried. A code that is not in the catalog comes back as a REGISTRY_NOT_CONFIGURED warning; a filter naming no catalog registry is 422 no_registry. Re-run agg-prep.py (and re-import the environment) before EACH request here: a consent object that already carried a search for other registries is answered 409 consent_object_reused. Not part of a top-to-bottom run.",
+      "item": [
+        {
+          "name": "Search - Farmer only",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{agg_url}}/dci/registry/sync/search",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "dci",
+                "registry",
+                "sync",
+                "search"
+              ]
+            },
+            "description": "The sync search with `registryFilter: [\"FARMER_REGISTRY\"]`: only that registry is queried and only its scopes are released.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"header\": {\n    \"version\": \"1.0.0\",\n    \"message_id\": \"{{$guid}}\",\n    \"message_ts\": \"{{$isoTimestamp}}\",\n    \"action\": \"search\",\n    \"sender_id\": \"{{partner_audience}}\",\n    \"receiver_id\": \"aggregation-layer\",\n    \"sender_uri\": \"{{callback_url}}\",\n    \"total_count\": 1,\n    \"is_msg_encrypted\": false\n  },\n  \"message\": {\n    \"transaction_id\": \"txn-{{$timestamp}}\",\n    \"search_request\": [\n      {\n        \"reference_id\": \"ref-{{$timestamp}}\",\n        \"timestamp\": \"{{$isoTimestamp}}\",\n        \"search_criteria\": {\n          \"version\": \"1.0.0\",\n          \"query_type\": \"beneficiary360\",\n          \"query\": {\n            \"@context\": \"{{bene360_context}}\",\n            \"foundationalId\": \"{{foundational_id}}\",\n            \"timeframe\": \"Timeframe-Medium\",\n            \"sections\": [\n              \"REGISTRIES\"\n            ],\n            \"registryFilter\": [\n              \"FARMER_REGISTRY\"\n            ],\n            \"correlationId\": \"postman-{{$timestamp}}\"\n          },\n          \"purpose\": {\n            \"code\": \"loan_origination\"\n          },\n          \"authorize\": {\n            \"consent_jws\": \"{{consent_jws}}\"\n          }\n        }\n      }\n    ]\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('answered (200)', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "const res = ((j.message || {}).search_response || [{}])[0];",
+                  "const rec = ((res.data || {}).reg_records || [])[0] || {};",
+                  "pm.test('a signed DCI on-search', () => {",
+                  "  pm.expect(j.header.action).to.eql('on-search');",
+                  "  pm.expect(j.signature).to.be.a('string');",
+                  "});",
+                  "pm.test('reg_records[0] is a Beneficiary-360 response', () => pm.expect(rec['@type']).to.eql('Beneficiary360Response'));",
+                  "const target = pm.environment.name ? pm.environment : pm.collectionVariables;",
+                  "if (j.message && j.message.correlation_id) { target.set('correlation_id', j.message.correlation_id); }",
+                  "pm.test('only FARMER_REGISTRY queried', () => pm.expect((rec.meta || {}).sourceSystemsQueried).to.eql(['FARMER_REGISTRY']));",
+                  "console.log(JSON.stringify(rec, null, 2));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Search - Livestock only",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{agg_url}}/dci/registry/sync/search",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "dci",
+                "registry",
+                "sync",
+                "search"
+              ]
+            },
+            "description": "The sync search with `registryFilter: [\"LIVESTOCK_REGISTRY\"]`: only that registry is queried and only its scopes are released.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"header\": {\n    \"version\": \"1.0.0\",\n    \"message_id\": \"{{$guid}}\",\n    \"message_ts\": \"{{$isoTimestamp}}\",\n    \"action\": \"search\",\n    \"sender_id\": \"{{partner_audience}}\",\n    \"receiver_id\": \"aggregation-layer\",\n    \"sender_uri\": \"{{callback_url}}\",\n    \"total_count\": 1,\n    \"is_msg_encrypted\": false\n  },\n  \"message\": {\n    \"transaction_id\": \"txn-{{$timestamp}}\",\n    \"search_request\": [\n      {\n        \"reference_id\": \"ref-{{$timestamp}}\",\n        \"timestamp\": \"{{$isoTimestamp}}\",\n        \"search_criteria\": {\n          \"version\": \"1.0.0\",\n          \"query_type\": \"beneficiary360\",\n          \"query\": {\n            \"@context\": \"{{bene360_context}}\",\n            \"foundationalId\": \"{{foundational_id}}\",\n            \"timeframe\": \"Timeframe-Medium\",\n            \"sections\": [\n              \"REGISTRIES\"\n            ],\n            \"registryFilter\": [\n              \"LIVESTOCK_REGISTRY\"\n            ],\n            \"correlationId\": \"postman-{{$timestamp}}\"\n          },\n          \"purpose\": {\n            \"code\": \"loan_origination\"\n          },\n          \"authorize\": {\n            \"consent_jws\": \"{{consent_jws}}\"\n          }\n        }\n      }\n    ]\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('answered (200)', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "const res = ((j.message || {}).search_response || [{}])[0];",
+                  "const rec = ((res.data || {}).reg_records || [])[0] || {};",
+                  "pm.test('a signed DCI on-search', () => {",
+                  "  pm.expect(j.header.action).to.eql('on-search');",
+                  "  pm.expect(j.signature).to.be.a('string');",
+                  "});",
+                  "pm.test('reg_records[0] is a Beneficiary-360 response', () => pm.expect(rec['@type']).to.eql('Beneficiary360Response'));",
+                  "const target = pm.environment.name ? pm.environment : pm.collectionVariables;",
+                  "if (j.message && j.message.correlation_id) { target.set('correlation_id', j.message.correlation_id); }",
+                  "pm.test('only LIVESTOCK_REGISTRY queried', () => pm.expect((rec.meta || {}).sourceSystemsQueried).to.eql(['LIVESTOCK_REGISTRY']));",
+                  "console.log(JSON.stringify(rec, null, 2));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Search - Cropsown only",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{agg_url}}/dci/registry/sync/search",
+              "host": [
+                "{{agg_url}}"
+              ],
+              "path": [
+                "dci",
+                "registry",
+                "sync",
+                "search"
+              ]
+            },
+            "description": "The sync search with `registryFilter: [\"CROPSOWN_REGISTRY\"]`: only that registry is queried and only its scopes are released.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"header\": {\n    \"version\": \"1.0.0\",\n    \"message_id\": \"{{$guid}}\",\n    \"message_ts\": \"{{$isoTimestamp}}\",\n    \"action\": \"search\",\n    \"sender_id\": \"{{partner_audience}}\",\n    \"receiver_id\": \"aggregation-layer\",\n    \"sender_uri\": \"{{callback_url}}\",\n    \"total_count\": 1,\n    \"is_msg_encrypted\": false\n  },\n  \"message\": {\n    \"transaction_id\": \"txn-{{$timestamp}}\",\n    \"search_request\": [\n      {\n        \"reference_id\": \"ref-{{$timestamp}}\",\n        \"timestamp\": \"{{$isoTimestamp}}\",\n        \"search_criteria\": {\n          \"version\": \"1.0.0\",\n          \"query_type\": \"beneficiary360\",\n          \"query\": {\n            \"@context\": \"{{bene360_context}}\",\n            \"foundationalId\": \"{{foundational_id}}\",\n            \"timeframe\": \"Timeframe-Medium\",\n            \"sections\": [\n              \"REGISTRIES\"\n            ],\n            \"registryFilter\": [\n              \"CROPSOWN_REGISTRY\"\n            ],\n            \"correlationId\": \"postman-{{$timestamp}}\"\n          },\n          \"purpose\": {\n            \"code\": \"loan_origination\"\n          },\n          \"authorize\": {\n            \"consent_jws\": \"{{consent_jws}}\"\n          }\n        }\n      }\n    ]\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('answered (200)', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "const res = ((j.message || {}).search_response || [{}])[0];",
+                  "const rec = ((res.data || {}).reg_records || [])[0] || {};",
+                  "pm.test('a signed DCI on-search', () => {",
+                  "  pm.expect(j.header.action).to.eql('on-search');",
+                  "  pm.expect(j.signature).to.be.a('string');",
+                  "});",
+                  "pm.test('reg_records[0] is a Beneficiary-360 response', () => pm.expect(rec['@type']).to.eql('Beneficiary360Response'));",
+                  "const target = pm.environment.name ? pm.environment : pm.collectionVariables;",
+                  "if (j.message && j.message.correlation_id) { target.set('correlation_id', j.message.correlation_id); }",
+                  "pm.test('only CROPSOWN_REGISTRY queried', () => pm.expect((rec.meta || {}).sourceSystemsQueried).to.eql(['CROPSOWN_REGISTRY']));",
+                  "console.log(JSON.stringify(rec, null, 2));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

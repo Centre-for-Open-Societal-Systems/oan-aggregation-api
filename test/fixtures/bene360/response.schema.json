@@ -1,0 +1,396 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.openg2p.org/beneficiary360/v1/response.schema.json",
+  "title": "Beneficiary360Response",
+  "description": "Consolidated 360-degree view of a beneficiary across an arbitrary number of Registries (each with an arbitrary, recursively nested set of Registers/Tables), an arbitrary number of PBMS Benefit Programs (each with its enrolment history and its disbursement history), and the matching G2P-Bridge downstream processing status for each disbursement envelope. The schema intentionally leaves registry/register/table identity as open strings (registryName/registerMnemonic/tableMnemonic) and record payloads as an open 'attributes' bag, so that new Registries (e.g. a future Worker-Registry) or new Registers/Tables inside an existing Registry require zero schema changes.",
+  "type": "object",
+  "required": ["@context", "@type", "beneficiary", "meta"],
+  "additionalProperties": false,
+  "properties": {
+    "@context": {
+      "oneOf": [
+        { "type": "string", "const": "https://schemas.openg2p.org/beneficiary360/v1/context.jsonld" },
+        { "type": "object" }
+      ]
+    },
+    "@type": { "type": "string", "const": "Beneficiary360Response" },
+    "@id": {
+      "type": "string",
+      "format": "uri",
+      "description": "Dereferenceable/opaque identifier for this response instance, e.g. urn:g2p:beneficiary360:{foundationalId}:{generatedAt}."
+    },
+
+    "beneficiary": {
+      "description": "The core cross-system identity the response was resolved for. Deliberately thin: registry-specific person attributes belong under registries[].registers[].attributes, not here, since different registries may hold conflicting or partial demographic data for the same person.",
+      "type": "object",
+      "required": ["foundationalId"],
+      "additionalProperties": false,
+      "properties": {
+        "foundationalId": { "type": "string" },
+        "matchedRegistryCount": { "type": "integer", "minimum": 0 },
+        "matchedProgramCount": { "type": "integer", "minimum": 0 }
+      }
+    },
+
+    "registries": {
+      "description": "One entry per Registry (Disability-Registry, Farmer-Registry, National-Social-Registry, and any future registry such as Worker-Registry) in which this beneficiary has at least one record. Open-ended array; unknown registries simply add another array element, no schema change required.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/RegistryMembership" }
+    },
+
+    "programs": {
+      "description": "One entry per PBMS Benefit Program the beneficiary is/was enrolled in within the resolved timeframe. Open-ended array.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/ProgramEnrolment" }
+    },
+
+    "bridgeProcessing": {
+      "description": "One entry per Disbursement-Envelope (Program x Benefit-Code x Disbursement-Cycle) that G2P-Bridge processed and that this beneficiary's disbursements[] belong to. Cross-referenced from programs[].disbursements[].disbursementEnvelopeId. Kept as a flat, de-duplicated top-level list (rather than nested under each disbursement) because a single envelope commonly covers many beneficiaries and multiple disbursement line items can point at the same envelope.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/BridgeEnvelopeProcessing" }
+    },
+
+    "meta": {
+      "type": "object",
+      "required": ["generatedAt", "requestParameters", "resolvedTimeframe"],
+      "additionalProperties": false,
+      "properties": {
+        "generatedAt": { "type": "string", "format": "date-time" },
+        "correlationId": { "type": "string" },
+        "requestParameters": {
+          "type": "object",
+          "required": ["foundationalId", "timeframe"],
+          "additionalProperties": false,
+          "properties": {
+            "foundationalId": { "type": "string" },
+            "timeframe": {
+              "type": "string",
+              "enum": ["Timeframe-Short", "Timeframe-Medium", "Timeframe-Long"]
+            },
+            "asOfDate": { "type": "string", "format": "date" },
+            "sections": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": ["REGISTRIES", "PROGRAMS", "DISBURSEMENTS", "BRIDGE_PROCESSING"]
+              }
+            }
+          }
+        },
+        "resolvedTimeframe": {
+          "description": "The concrete lookback window each source-system category resolved the Timeframe enum to. Present so that a Timeframe-Long lookback in a fast-changing PBMS cycle table and a slow-changing registry history table can legitimately differ.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "start": { "type": "string", "format": "date" },
+            "end": { "type": "string", "format": "date" },
+            "perSourceSystem": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["system", "start", "end"],
+                "additionalProperties": false,
+                "properties": {
+                  "system": { "type": "string" },
+                  "start": { "type": "string", "format": "date" },
+                  "end": { "type": "string", "format": "date" }
+                }
+              }
+            }
+          }
+        },
+        "sourceSystemsQueried": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "warnings": {
+          "description": "Partial-failure / degraded-response reporting, e.g. one registry timed out. Lets the API return best-effort results instead of an all-or-nothing failure across an unbounded number of downstream systems.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["system", "message"],
+            "additionalProperties": false,
+            "properties": {
+              "system": { "type": "string" },
+              "code": { "type": "string" },
+              "message": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  },
+
+  "$defs": {
+    "RegistryMembership": {
+      "type": "object",
+      "required": ["registryCode", "registryName", "registers"],
+      "additionalProperties": false,
+      "properties": {
+        "registryCode": {
+          "type": "string",
+          "description": "Short stable system code, e.g. DISABILITY_REGISTRY, FARMER_REGISTRY, NATIONAL_SOCIAL_REGISTRY, WORKER_REGISTRY. Open string, not a closed enum, so new registries need no schema change."
+        },
+        "registryName": {
+          "type": "string",
+          "description": "Human-readable registry name, e.g. \"Disability-Registry\", \"Farmer-Registry\", \"National Social Registry\"."
+        },
+        "registrySystem": {
+          "type": "object",
+          "description": "Optional provenance pointer to the deployed instance that answered this section.",
+          "additionalProperties": false,
+          "properties": {
+            "baseUrl": { "type": "string", "format": "uri" },
+            "version": { "type": "string" }
+          }
+        },
+        "registers": {
+          "description": "Every Register (root record, e.g. Farmer, Household, Disability-Case) this beneficiary has inside this Registry. A Registry can have any number of Registers; each Register can have any number of nested Tables (see RegisterEntry/TableEntry).",
+          "type": "array",
+          "items": { "$ref": "#/$defs/RegisterEntry" }
+        }
+      }
+    },
+
+    "RegisterEntry": {
+      "type": "object",
+      "required": ["registerMnemonic", "foundationalId", "recordStatus"],
+      "additionalProperties": false,
+      "properties": {
+        "registerMnemonic": {
+          "type": "string",
+          "description": "e.g. FARMER, HOUSEHOLD, DISABILITY_CASE. Maps to the concrete G2PRegister subclass in Registry-Platform (e.g. G2PRegisterFarmer)."
+        },
+        "registerName": { "type": "string" },
+        "internalRecordId": { "type": "string", "description": "reg:internal_record_id (UUID PK)." },
+        "functionalRecordId": { "type": "string", "description": "reg:functional_record_id." },
+        "foundationalId": { "type": "string" },
+        "linkFoundationalId": {
+          "type": ["string", "null"],
+          "description": "Parent record's foundational ID, when this Register is itself a child of another Register (reg:link_foundational_id)."
+        },
+        "recordStatus": {
+          "type": "string",
+          "description": "reg:record_status (RecordStatusEnum), e.g. ACTIVE, INACTIVE, PENDING_APPROVAL, REJECTED. Left open-string since each registry extension may add statuses."
+        },
+        "recordStatusReason": { "type": "string" },
+        "lastApprovedAt": { "type": "string", "format": "date-time" },
+        "attributes": {
+          "description": "The Register's registry-extension-specific fields (e.g. Farmer's disability_type/source_of_income, or a future registry's own fields) passed through verbatim. Deliberately unconstrained (additionalProperties:true / JSON-LD @json type) because every Registry defines its own schema and Beneficiary-360 must not hard-code it.",
+          "type": "object",
+          "additionalProperties": true
+        },
+        "tables": {
+          "description": "Child Tables hierarchically nested under this Register (e.g. Land, Crop under Farmer), each of which may itself nest further Tables (e.g. Crop under Land under Farmer). Recursive to support arbitrarily deep register/table hierarchies.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/TableEntry" }
+        }
+      }
+    },
+
+    "TableEntry": {
+      "type": "object",
+      "required": ["tableMnemonic", "internalRecordId"],
+      "additionalProperties": false,
+      "properties": {
+        "tableMnemonic": {
+          "type": "string",
+          "description": "e.g. LAND, CROP, HOUSEHOLD_MEMBER. Maps to the concrete child G2PRegister/table subclass (e.g. G2PRegisterLand, G2PRegisterCrop)."
+        },
+        "tableName": { "type": "string" },
+        "internalRecordId": { "type": "string" },
+        "linkInternalRecordId": {
+          "type": "string",
+          "description": "reg:link_internal_record_id — the internal_record_id of the parent Register/Table this row hangs off."
+        },
+        "recordStatus": { "type": "string" },
+        "attributes": {
+          "description": "This Table's own fields (e.g. Land's land_size/land_ownership_type, Crop's commodity/planted_date), passed through verbatim and unconstrained for the same reason as RegisterEntry.attributes.",
+          "type": "object",
+          "additionalProperties": true
+        },
+        "tables": {
+          "description": "Further-nested child Tables (e.g. a Crop row under a Land row). Self-referential to allow any depth of hierarchy.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/TableEntry" }
+        }
+      }
+    },
+
+    "ProgramEnrolment": {
+      "type": "object",
+      "required": ["programMnemonic", "programName", "enrolments", "disbursements"],
+      "additionalProperties": false,
+      "properties": {
+        "programId": { "type": "string" },
+        "programMnemonic": { "type": "string" },
+        "programName": { "type": "string" },
+        "programStatus": {
+          "type": "string",
+          "description": "pbms:program_status, e.g. ACTIVE, PAUSED, CLOSED."
+        },
+        "targetRegistry": {
+          "type": "string",
+          "description": "The Registry this Program's beneficiary lists are sourced from (pbms:target_registry), e.g. FARMER_REGISTRY."
+        },
+        "enrolments": {
+          "description": "Every Enrolment-List (Beneficiary List) within the resolved timeframe that this beneficiary appeared on for this Program — i.e. length N here means the beneficiary was part of N enrolment cycles under this Program. Ordered most-recent-first by listDate; the first element is therefore the latest enrolment.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/EnrolmentListEntry" }
+        },
+        "disbursements": {
+          "description": "Every disbursement cycle within the resolved timeframe that this beneficiary was part of under this Program — i.e. length N here means N disbursements received/attempted under this Program.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/Disbursement" }
+        }
+      }
+    },
+
+    "EnrolmentListEntry": {
+      "type": "object",
+      "required": ["beneficiaryListId", "enrolmentStatus"],
+      "additionalProperties": false,
+      "properties": {
+        "beneficiaryListId": { "type": "string" },
+        "listMnemonic": { "type": "string" },
+        "enrollmentCycleId": { "type": "string" },
+        "listDate": { "type": "string", "format": "date" },
+        "eligibilityProcessStatus": { "type": "string" },
+        "entitlementProcessStatus": { "type": "string" },
+        "enrolmentStatus": {
+          "type": "string",
+          "description": "Beneficiary-360-level rollup of eligibility/entitlement status, e.g. ENROLLED, PENDING, REJECTED, EXITED."
+        }
+      }
+    },
+
+    "Disbursement": {
+      "type": "object",
+      "required": ["disbursementCycleId", "benefitCodeMnemonic", "benefitType", "disbursementQuantity"],
+      "additionalProperties": false,
+      "properties": {
+        "disbursementId": { "type": "string", "description": "bridge:disbursement_id, once G2P-Bridge has processed the line item." },
+        "disbursementEnvelopeId": {
+          "type": "string",
+          "description": "Foreign key into the top-level bridgeProcessing[] array (BridgeEnvelopeProcessing.disbursementEnvelopeId)."
+        },
+        "disbursementCycleId": { "type": "string" },
+        "cycleMnemonic": { "type": "string" },
+        "benefitCodeMnemonic": {
+          "type": "string",
+          "description": "The GOOD/benefit code this disbursement line is for. A single Program can disburse multiple goods/services, each producing its own envelope and its own line here."
+        },
+        "benefitType": {
+          "type": "string",
+          "enum": ["COMMODITY", "SERVICE", "CASH_DIGITAL", "CASH_PHYSICAL", "COMBINATION"]
+        },
+        "disbursementQuantity": { "type": "number" },
+        "disbursementDate": { "type": "string", "format": "date" },
+        "narrative": { "type": "string" },
+        "cancellationStatus": {
+          "type": "string",
+          "description": "e.g. NOT_CANCELLED, CANCELLED."
+        }
+      }
+    },
+
+    "BridgeEnvelopeProcessing": {
+      "description": "G2P-Bridge's downstream processing state for one Disbursement-Envelope (one Program x one Benefit-Code x one Disbursement-Cycle). The concrete workflow object populated under 'workflow' depends on benefitType: GOODS -> goodsWorkflow, CASH_DIGITAL -> digitalCashWorkflow, CASH_PHYSICAL -> physicalCashWorkflow (physical cash reuses the goods logistics pipeline plus cash-specific fields).",
+      "type": "object",
+      "required": ["disbursementEnvelopeId", "benefitProgramMnemonic", "benefitCodeMnemonic", "benefitType", "workflow"],
+      "additionalProperties": false,
+      "properties": {
+        "disbursementEnvelopeId": { "type": "string" },
+        "benefitProgramMnemonic": { "type": "string" },
+        "benefitCodeMnemonic": { "type": "string" },
+        "benefitType": {
+          "type": "string",
+          "enum": ["COMMODITY", "SERVICE", "CASH_DIGITAL", "CASH_PHYSICAL", "COMBINATION"]
+        },
+        "cycleCodeMnemonic": { "type": "string" },
+        "totalDisbursementQuantity": { "type": "number" },
+        "cancellationStatus": { "type": "string" },
+        "workflow": {
+          "oneOf": [
+            { "$ref": "#/$defs/GoodsWorkflow" },
+            { "$ref": "#/$defs/DigitalCashWorkflow" },
+            { "$ref": "#/$defs/PhysicalCashWorkflow" },
+            {
+              "description": "Escape hatch for a future/unknown benefitType's workflow shape, or a COMBINATION type that composes more than one of the above.",
+              "type": "object",
+              "required": ["workflowType"],
+              "properties": {
+                "workflowType": {
+                  "type": "string",
+                  "not": { "enum": ["GOODS", "CASH_DIGITAL", "CASH_PHYSICAL"] }
+                }
+              },
+              "additionalProperties": true
+            }
+          ]
+        },
+        "disbursementRecon": {
+          "type": "object",
+          "description": "Bank-statement reconciliation outcome for this beneficiary's disbursement within the envelope, when available.",
+          "additionalProperties": false,
+          "properties": {
+            "remittanceReferenceNumber": { "type": "string" },
+            "reversalFound": { "type": "boolean" },
+            "reversalReason": { "type": "string" }
+          }
+        }
+      }
+    },
+
+    "GoodsWorkflow": {
+      "type": "object",
+      "required": ["workflowType"],
+      "additionalProperties": false,
+      "properties": {
+        "workflowType": { "const": "GOODS" },
+        "faResolutionStatus": { "$ref": "#/$defs/ProcessStatus" },
+        "geoResolutionStatus": { "$ref": "#/$defs/ProcessStatus" },
+        "warehouseAllocationStatus": { "$ref": "#/$defs/ProcessStatus" },
+        "agencyAllocationStatus": { "$ref": "#/$defs/ProcessStatus" },
+        "warehouseMnemonic": { "type": "string" },
+        "agencyMnemonic": { "type": "string" },
+        "warehouseNotificationStatus": { "$ref": "#/$defs/ProcessStatus" },
+        "agencyNotificationStatus": { "$ref": "#/$defs/ProcessStatus" }
+      }
+    },
+
+    "DigitalCashWorkflow": {
+      "type": "object",
+      "required": ["workflowType"],
+      "additionalProperties": false,
+      "properties": {
+        "workflowType": { "const": "CASH_DIGITAL" },
+        "fundsAvailableWithBank": { "type": "number" },
+        "fundsBlockedWithBank": { "type": "number" },
+        "sponsorBankDispatchStatus": { "$ref": "#/$defs/ProcessStatus" },
+        "numberOfDisbursementsShipped": { "type": "integer" },
+        "numberOfDisbursementsReconciled": { "type": "integer" },
+        "numberOfDisbursementsReversed": { "type": "integer" }
+      }
+    },
+
+    "PhysicalCashWorkflow": {
+      "type": "object",
+      "required": ["workflowType"],
+      "additionalProperties": false,
+      "properties": {
+        "workflowType": { "const": "CASH_PHYSICAL" },
+        "faResolutionStatus": { "$ref": "#/$defs/ProcessStatus" },
+        "geoResolutionStatus": { "$ref": "#/$defs/ProcessStatus" },
+        "warehouseAllocationStatus": { "$ref": "#/$defs/ProcessStatus" },
+        "agencyAllocationStatus": { "$ref": "#/$defs/ProcessStatus" },
+        "sponsorBankDispatchStatus": { "$ref": "#/$defs/ProcessStatus" }
+      }
+    },
+
+    "ProcessStatus": {
+      "type": "string",
+      "enum": ["PENDING", "PROCESSING", "PROCESSED", "ERROR"]
+    }
+  }
+}

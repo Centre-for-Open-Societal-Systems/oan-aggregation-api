@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.openg2p.org/beneficiary360/v1/request.schema.json",
+  "title": "Beneficiary360Request",
+  "description": "Request payload for the Beneficiary-360 API. Resolves a single beneficiary's Foundational ID into a consolidated view across all Registries, PBMS Programs, Disbursements, and G2P-Bridge processing status, bounded by a coarse-grained lookback timeframe.",
+  "type": "object",
+  "required": ["@context", "foundationalId", "timeframe"],
+  "additionalProperties": false,
+  "properties": {
+    "@context": {
+      "description": "JSON-LD context. Use the published context URL or the literal document.",
+      "oneOf": [
+        { "type": "string", "const": "https://schemas.openg2p.org/beneficiary360/v1/context.jsonld" },
+        { "type": "object" }
+      ]
+    },
+    "foundationalId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The beneficiary's Foundational ID as registered in Registry-Platform (reg:foundationalId, e.g. G2PPerson/G2PProgramRegister.foundational_id). This is the single cross-system key used to fan out lookups to every connected Registry."
+    },
+    "timeframe": {
+      "type": "string",
+      "enum": ["Timeframe-Short", "Timeframe-Medium", "Timeframe-Long"],
+      "description": "How far back to traverse historical records (registry record history, enrolment cycles, disbursement cycles) in each source system. Concrete windows are resolved server-side per source system (e.g. Short=90d, Medium=1y, Long=all-time) and are echoed back in meta.resolvedTimeframe."
+    },
+    "asOfDate": {
+      "type": "string",
+      "format": "date",
+      "description": "Optional anchor date the timeframe is computed backward from. Defaults to the request's processing date (today) if omitted."
+    },
+    "sections": {
+      "type": "array",
+      "description": "Optional filter to request only a subset of the response sections. Omit to receive all sections.",
+      "items": {
+        "type": "string",
+        "enum": ["REGISTRIES", "PROGRAMS", "DISBURSEMENTS", "BRIDGE_PROCESSING"]
+      },
+      "uniqueItems": true,
+      "minItems": 1
+    },
+    "registryFilter": {
+      "type": "array",
+      "description": "Optional allow-list of registry codes to restrict the fan-out (e.g. only query [\"FARMER_REGISTRY\", \"DISABILITY_REGISTRY\"]). Omit to query every registry known to the Beneficiary-360 registry catalog.",
+      "items": { "type": "string" },
+      "uniqueItems": true
+    },
+    "correlationId": {
+      "type": "string",
+      "description": "Optional client-supplied trace/correlation identifier, echoed back in the response meta block."
+    }
+  },
+  "examples": [
+    {
+      "@context": "https://schemas.openg2p.org/beneficiary360/v1/context.jsonld",
+      "foundationalId": "FID-9988776655",
+      "timeframe": "Timeframe-Medium",
+      "correlationId": "req-2026-08-20-0001"
+    }
+  ]
+}
