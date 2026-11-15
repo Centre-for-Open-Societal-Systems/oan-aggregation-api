@@ -1,0 +1,69 @@
+# OAN Aggregation API. Every variable the service reads is AGGREGATION_LAYER_<NAME>
+# (README.md, "Deployment (DevOps checklist)"). Secrets are never set here: they come
+# from the Secrets named below, created in the namespace outside this chart.
+#
+# Deployed as a subchart of openg2p-commons-services (oan-helm), alias aggregation-api: these
+# values sit under `aggregation-api:` there, and env values and virtualService.host may use
+# {{ .Values.global.baseDomain }}.
+
+# Default <release>-aggregation-api.
+fullnameOverride: ""
+
+image:
+  repository: eoan/oan-aggregation-api/aggregation-api
+  # CI writes <appVersion>-<branch>.<build>@sha256:<digest> here (e.g. 0.0.0-develop.42@sha256:...,
+  # oan-helm package_chart.py), with the full ECR registry in repository.
+  tag: ""
+  # Set to pin by digest alone; it wins over tag.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+# The namespace's ECR pull secret (kept fresh by its ecr-pull-secret-refresh CronJob).
+imagePullSecrets:
+  - name: ecr-pull-secret
+
+replicas: 1
+containerPort: 8100
+servicePort: 80
+
+# Istio route through an existing Gateway, which holds the TLS certificate.
+virtualService:
+  enabled: false
+  host: ""        # e.g. aggregation.{{ .Values.global.baseDomain }}
+  gateway: ""     # <namespace>/<name>, e.g. istio-system/development
+
+# This service's signing key: a .p12 whose certificate is registered in Partner Management.
+# The same key on every pod. Secret with the keys below; mounted at /app/keys.
+signing:
+  existingSecret: ""
+  p12Key: aggregation.p12
+  passwordKey: password
+  kid: ""         # AGGREGATION_LAYER_SIGNING_KID, the kid registered in PM
+
+# Secret loaded whole as environment (envFrom): AGGREGATION_LAYER_STAFF_API_CLIENT_SECRET,
+# AGGREGATION_LAYER_STAFF_SEARCH_TICKET_SECRET and any other secret setting. Empty: none.
+runtimeSecret: ""
+
+# The registry catalog (deploy/registries.yaml format, no secrets), mounted at
+# /app/config/registries.yaml. Either `registries` here (rendered into the ConfigMap
+# <release>-aggregation-api-catalog; a change restarts the pods) or an existing ConfigMap with
+# the key registries.yaml.
+catalog:
+  existingConfigMap: ""
+  registries: {}
+
+# Non-secret settings, AGGREGATION_LAYER_<NAME>: value. The catalog path, the signing key
+# path, password and kid are set by the chart.
+env:
+  AGGREGATION_LAYER_AUTH_ENABLED: "true"
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 768Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

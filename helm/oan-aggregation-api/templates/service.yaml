@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "oan-aggregation-api.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "oan-aggregation-api.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "oan-aggregation-api.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.servicePort }}
+      targetPort: http
+{{- if .Values.virtualService.enabled }}
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: {{ include "oan-aggregation-api.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "oan-aggregation-api.labels" . | nindent 4 }}
+spec:
+  hosts:
+    - {{ tpl (required "virtualService.host is required" .Values.virtualService.host) . | quote }}
+  gateways:
+    - {{ required "virtualService.gateway is required" .Values.virtualService.gateway | quote }}
+  http:
+    - route:
+        - destination:
+            host: {{ include "oan-aggregation-api.fullname" . }}
+            port:
+              number: {{ .Values.servicePort }}
+{{- end }}
