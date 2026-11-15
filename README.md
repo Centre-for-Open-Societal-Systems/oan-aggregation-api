@@ -565,6 +565,10 @@ Rules worth knowing:
 
 ## Deployment (DevOps checklist)
 
+Helm chart and CI/CD: [`helm/oan-aggregation-api`](helm/oan-aggregation-api/README.md) and the
+[`Jenkinsfile`](Jenkinsfile); `develop` builds, pushes the image to ECR and hands the chart to oan-helm, where it is
+bundled in `openg2p-commons-services` (release `commons-services`, namespace `commons`).
+
 What a deployment of this release needs. All variables are `AGGREGATION_LAYER_<NAME>`;
 put secrets in a Kubernetes Secret (or `deploy/.env`, which is git-ignored), never in the
 catalog or in git. [`deploy/.env.example`](deploy/.env.example) lists them with local values.
