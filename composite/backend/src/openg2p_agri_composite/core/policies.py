@@ -68,7 +68,9 @@ def _is_policy_for(policy: Dict[str, Any], use_case_ref: str) -> bool:
 def policy_limits(policy: Dict[str, Any], *, signing_algs: bool = True) -> Dict[str, Any]:
     """The limits of a use-case policy, as the Consent Manager takes them (validate ``limits``,
     consent templates): an empty list or no duration is no limit and is left out;
-    ``allow_partner_consents`` is always given (absent means false to the CM).
+    ``allow_partner_consents`` and ``allow_assisted_confirmation`` (the partner may collect consents
+    by assisted confirmation: national-ID login and one "I agree" in the CM partner portal, no signed
+    form, no approver) are always given (absent means false to the CM).
     The policy's purposes are not limits: granting a use case grants its purpose."""
     limits: Dict[str, Any] = {}
     names = ("allowed_subject_id_types", "allowed_signing_algs") if signing_algs else ("allowed_subject_id_types",)
@@ -79,6 +81,7 @@ def policy_limits(policy: Dict[str, Any], *, signing_algs: bool = True) -> Dict[
     if policy.get("max_validity_duration"):
         limits["max_validity_duration"] = str(policy["max_validity_duration"])
     limits["allow_partner_consents"] = policy.get("allow_partner_consents") is True
+    limits["allow_assisted_confirmation"] = policy.get("allow_assisted_confirmation") is True
     return limits
 
 

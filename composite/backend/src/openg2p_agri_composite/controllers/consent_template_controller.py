@@ -8,7 +8,9 @@ VirtualService) is answered 404 here too.
 
 ``partner`` is the partner's audience / sender ID (``bank-a``), mapped to its PM partner
 ID (``PARTNER_BANK_A``) as for senders. A template is listed only when the partner has an
-active PM use-case policy for it; its ``limits`` come from that policy.
+active PM use-case policy for it; its ``limits`` come from that policy: ``allowed_subject_id_types``
+and ``max_validity_duration`` when set, ``allow_partner_consents`` and ``allow_assisted_confirmation``
+always (false when the policy does not set them).
 """
 
 import asyncio

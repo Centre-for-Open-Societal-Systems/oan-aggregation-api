@@ -44,10 +44,19 @@ async def test_templates_for_a_granted_partner(client, h):
     assert t["scopes"]["farmer-registry"]["required"]
     # limits from bank-a's use-case policy (no signing algorithms, no purposes)
     assert t["limits"] == {"allowed_subject_id_types": ["FAYDA_FAN"], "max_validity_duration": "P1Y",
-                           "allow_partner_consents": False}
+                           "allow_partner_consents": False, "allow_assisted_confirmation": False}
 
     one = await client.get(f"{BASE}/loan-profile@1", params={"partner": "bank-a"})
     assert one.status_code == 200 and one.json() == t
+
+
+async def test_template_limits_carry_the_policy_consent_permissions(client, h):
+    # partner consents and assisted confirmation (scenario 0: national-ID login, one "I agree")
+    h.pm.policies["PARTNER_BANK_A"] = [use_case_policy(allow_partner_consents=True,
+                                                       allow_assisted_confirmation=True)]
+    r = await client.get(f"{BASE}/loan-profile@1", params={"partner": "bank-a"})
+    assert r.status_code == 200, r.text
+    assert r.json()["limits"] == {"allow_partner_consents": True, "allow_assisted_confirmation": True}
 
 
 async def test_a_partner_not_granted_sees_no_template(client, h):

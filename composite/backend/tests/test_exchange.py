@@ -79,7 +79,8 @@ async def test_exchange_sends_each_registry_its_receipt(x):
     assert req["request_context"]["purpose"] == "credit-assessment"
     assert req["request_context"]["template"] == "loan-profile@1"
     assert req["request_context"]["limits"] == {"allowed_signing_algs": ["EdDSA", "ES256"],
-                                                "allow_partner_consents": False}
+                                                "allow_partner_consents": False,
+                                                "allow_assisted_confirmation": False}
     # receipts carry only the use case's scopes (required and optional), nothing else the consent grants
     assert req["request_context"]["requested_scopes"] == sorted(s for scopes in SCOPES.values() for s in scopes)
     assert [authorize(c)["consent_jws"] for c in x.registries.calls_to(FR_URL)] == ["fr.receipt.jws"]
@@ -280,7 +281,8 @@ async def test_no_consent_is_looked_up_at_the_exchange_cm(x):
     ctx = req["request_context"]
     assert ctx["subject_id"] == env["message"]["subject"]
     assert "use_case" not in ctx and ctx["template"] == "loan-profile@1" and ctx["purpose"] == "credit-assessment"
-    assert ctx["limits"] == {"allowed_signing_algs": ["EdDSA", "ES256"], "allow_partner_consents": False}
+    assert ctx["limits"] == {"allowed_signing_algs": ["EdDSA", "ES256"], "allow_partner_consents": False,
+                             "allow_assisted_confirmation": False}
     assert ctx["requested_scopes"] == sorted(s for v in SCOPES.values() for s in v)
     assert [authorize(c)["consent_jws"] for c in x.registries.calls_to(FR_URL)] == ["fr.receipt.jws"]
     # the consent used is named in the (signed) response and the audit events
@@ -333,13 +335,13 @@ async def test_limits_come_from_the_partner_use_case_policy(x):
 
     x.pm.policies["PARTNER_BANK_A"] = [use_case_policy(
         allowed_subject_id_types=["FAYDA_FAN"], max_validity_duration="P1Y", allow_partner_consents=True,
-        allowed_signing_algs=["ES256"], allowed_purposes=["ignored"])]
+        allow_assisted_confirmation=True, allowed_signing_algs=["ES256"], allowed_purposes=["ignored"])]
     x.cm.response = lookup_response()
     status, body = await x.query(x.envelope(consent=None))
     assert status == 200, body
     assert x.cm.calls[0][1]["request_context"]["limits"] == {
         "allowed_subject_id_types": ["FAYDA_FAN"], "max_validity_duration": "P1Y",
-        "allow_partner_consents": True, "allowed_signing_algs": ["ES256"]}
+        "allow_partner_consents": True, "allow_assisted_confirmation": True, "allowed_signing_algs": ["ES256"]}
     # the policy's purposes are no limit and no check (granting a use case grants its purpose)
     assert x.cm.calls[0][1]["request_context"]["purpose"] == "credit-assessment"
 
