@@ -1,0 +1,73 @@
+name: Build & Publish
+
+# Thin caller: all versioning/build/publish logic lives in
+# openg2p/openg2p-packaging@v1. This file declares only what THIS repo contains:
+# the use-case composite (composite/) — one image and one chart.
+
+# ---- IDENTICAL BOILERPLATE (do not customise per repo) ----------------------
+on:
+  push:
+    branches: ["**"]
+    tags: ["**"]
+    # agri-stack is mostly design docs; only the composite is built. A push that
+    # touches only docs/ must not build or publish a new composite version.
+    # (Path filters don't apply to tag pushes, so release tags still build.)
+    paths:
+      - "composite/**"
+      - ".github/workflows/build-publish.yml"
+  workflow_dispatch:
+    inputs:
+      changelog_skip_ai:
+        description: 'Skip the AI summary — publish the changelog from commit messages only (use when AI is unavailable). Leave OFF for a normal run.'
+        type: boolean
+        default: false
+      changelog_regenerate:
+        description: 'Backfill the AI summary for a release that published without one: enter its release version e.g. 1.0.1 (a bare N.N.N, not a develop version). Leave EMPTY for a normal run.'
+        type: string
+        default: ''
+
+jobs:
+  build-publish:
+    uses: openg2p/openg2p-packaging/.github/workflows/build-publish.yml@v1
+    with:
+      # --- IDENTICAL BOILERPLATE ---
+      changelog_skip_ai: ${{ inputs.changelog_skip_ai || false }}
+      changelog_regenerate: ${{ inputs.changelog_regenerate || '' }}
+      packaging-ref: v1
+
+      # --- PER-REPO DECLARATIONS ---
+      # The Dockerfile path is from the repo root; the build context is the
+      # composite/ folder (it copies backend/ and use-cases/). FASTAPI_COMMON_REF
+      # is a git ref, resolved to a SHA here; `develop` matches the Dockerfile's
+      # default (the partner-mgmt crypto backend is not in a framework release yet).
+      images: |
+        [
+          {"name": "agri-composite-api",
+           "repo": "openg2p/openg2p-agri-composite-api",
+           "dockerfile": "composite/docker/agri-composite-api/Dockerfile",
+           "context": "composite",
+           "pins": [
+             {"arg": "FASTAPI_COMMON_REF",
+              "repo": "https://github.com/openg2p/openg2p-fastapi-common",
+              "ref": "develop"},
+             {"arg": "IAM_CORE_REF",
+              "repo": "https://github.com/openg2p/iam",
+              "ref": "develop"}
+           ]},
+          {"name": "agri-composite-ui",
+           "repo": "openg2p/openg2p-agri-composite-ui",
+           "dockerfile": "composite/docker/agri-composite-ui/Dockerfile",
+           "context": "composite"}
+        ]
+
+      chart-path: composite/charts/openg2p-agri-composite
+
+      # The sanity Job reuses the API image (.composite.image); the console UI has its own.
+      chart-image-paths: '[".composite.image.tag", ".console.ui.image.tag"]'
+
+    # ---- IDENTICAL BOILERPLATE ----
+    secrets:
+      docker_hub_actor: ${{ secrets.docker_hub_actor }}
+      docker_hub_token: ${{ secrets.docker_hub_token }}
+      OPENG2P_BOT_GITHUB_PAT: ${{ secrets.OPENG2P_BOT_GITHUB_PAT }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}

@@ -1,0 +1,78 @@
+{{- /*
+Edge rate limit at the shared Istio ingress gateway: a local (per gateway pod)
+token bucket on the Composite's named route (see virtualservice.yaml).
+One EnvoyFilter per namespace and release, in the gateway's namespace:
+  1. inserts an envoy.filters.http.local_ratelimit filter named for this release
+     into the gateway's HTTP chain; with no bucket of its own it does nothing on
+     routes that do not configure it, so one per install is harmless;
+  2. gives this release's route that filter's token bucket (100% enabled and
+     enforced; 429 with x-local-rate-limit: true when empty).
+*/ -}}
+{{- if and .Values.composite.enabled .Values.composite.istio.enabled .Values.composite.istio.virtualservice.enabled .Values.edgeRateLimit.enabled }}
+{{- $e := .Values.edgeRateLimit }}
+{{- $filter := include "agriComposite.edgeRateLimitFilter" . }}
+{{- $seconds := include "agriComposite.durationSeconds" $e.per }}
+{{- $requests := int $e.requests }}
+{{- $stat := printf "agri_composite_edge_%s_%s" .Release.Namespace .Release.Name | replace "-" "_" | replace "." "_" }}
+{{- if le $requests 0 }}{{ fail "edgeRateLimit.requests must be a positive number" }}{{ end }}
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: {{ include "agriComposite.edgeRateLimitName" . }}
+  namespace: {{ $e.gatewayNamespace | default "istio-system" }}
+  labels: {{- include "common.labels.standard" (dict "customLabels" .Values.commonLabels "context" $) | nindent 4 }}
+    openg2p.org/release-namespace: {{ .Release.Namespace | quote }}
+spec:
+  workloadSelector:
+    labels: {{- toYaml ($e.gatewaySelector | default (dict "istio" "ingressgateway")) | nindent 6 }}
+  configPatches:
+    - applyTo: HTTP_FILTER
+      match:
+        context: GATEWAY
+        listener:
+          filterChain:
+            filter:
+              name: envoy.filters.network.http_connection_manager
+              subFilter:
+                name: envoy.filters.http.router
+      patch:
+        operation: INSERT_BEFORE
+        value:
+          name: {{ $filter }}
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
+            stat_prefix: {{ $stat }}
+    - applyTo: HTTP_ROUTE
+      match:
+        context: GATEWAY
+        routeConfiguration:
+          vhost:
+            route:
+              name: {{ include "agriComposite.edgeRateLimitRoute" . | quote }}
+      patch:
+        operation: MERGE
+        value:
+          typed_per_filter_config:
+            {{ $filter }}:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
+              stat_prefix: {{ $stat }}
+              token_bucket:
+                max_tokens: {{ $requests }}
+                tokens_per_fill: {{ $requests }}
+                fill_interval: {{ printf "%ss" $seconds }}
+              filter_enabled:
+                runtime_key: agri_composite_edge_ratelimit_enabled
+                default_value:
+                  numerator: 100
+                  denominator: HUNDRED
+              filter_enforced:
+                runtime_key: agri_composite_edge_ratelimit_enforced
+                default_value:
+                  numerator: 100
+                  denominator: HUNDRED
+              response_headers_to_add:
+                - append_action: OVERWRITE_IF_EXISTS_OR_ADD
+                  header:
+                    key: x-local-rate-limit
+                    value: "true"
+{{- end }}

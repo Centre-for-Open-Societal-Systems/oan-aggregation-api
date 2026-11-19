@@ -1,0 +1,160 @@
+# Sample use case: a farmer's profile for a loan decision.
+#
+# Farmer Registry: who the farmer is, their land and declared main crops.
+# Crop Sown Registry: what they sowed — crop seasons (one per plot and crop) and
+# season summaries — filtered on crop_year / season when given.
+#
+# The Crop Sown Registry knows the farmer by farmer ID, so both crop sources
+# depend on the farmer source and read FARMER_ID from its record (or use the
+# subject itself when the partner sends a FARMER_ID).
+#
+# Each source names the registry's data scopes it uses (IDs <registry>.<name>, from
+# the registry's catalogue, signed POST /partner/data_scopes): the partner's consent
+# must grant every one of `scopes` (else: a mandatory source fails the request, an
+# optional one is not called) and may grant `optional_scopes` (left out: their
+# fields come back null). The composite asks for no other scope. GET the use case
+# for the per-registry list (consent_scopes). farmer-registry.farmer_identifiers is
+# required: the farmer ID the crop sources query by is read from it.
+#
+# Template note: keep a space between consecutive braces ("} }", "{ {") so
+# literal JSON never reads as a Jinja "{{ … }}".
+#
+# Who may call it is not set here: a partner needs a policy for it in Partner
+# Management (use_case: loan-profile@1; one policy per use case).
+
+use_case: loan-profile
+version: 1.0.0
+status: published
+title: Farmer loan profile
+description: >-
+  Identity, location, land and declared crops from the Farmer Registry, and crop
+  seasons and season summaries from the Crop Sown Registry, for a loan decision.
+  Pass crop_year and season to get one season (the total area sown is then that
+  season's); without them, all of the farmer's seasons come back, newest first.
+
+policy: credit-assessment
+purpose: credit-assessment
+consent:
+  required: true
+
+input:
+  subject:
+    id_types: [FAYDA_FAN, FARMER_ID]
+  parameters:
+    crop_year:
+      type: integer
+      description: Crop year, e.g. 2019 (Ethiopian calendar year the season belongs to)
+      min: 1990
+      max: 2100
+    season:
+      type: string
+      description: Season code
+      enum: [SEASON_MEHER, SEASON_BELG, SEASON_IRRIGATION]
+  batch: { max_subjects: 1 }
+
+sources:
+  - id: farmer
+    controller: farmer-registry
+    requirement: mandatory
+    scopes: [farmer-registry.farmer_identifiers, farmer-registry.personal_details,
+             farmer-registry.land, farmer-registry.main_crops]
+    optional_scopes: [farmer-registry.household_location, farmer-registry.land_location]
+    dci:
+      reg_type: Farmer
+      reg_record_type: spdci-extensions-dci:Farmer
+      query_template: |
+        {%- set field = 'foundational_id' if subject.type == 'FAYDA_FAN' else 'functional_record_id' -%}
+        {"query_type": "expression",
+         "query": {"type": "expression",
+                   "value": {"expression": {"query": {"{{ field }}": {"$eq": {{ subject.value | tojson }} } } } } },
+         "pagination": {"page_size": 1, "page_number": 1} }
+    timeout_ms: 10000
+    retries: 0
+
+  - id: season_summaries
+    controller: crop-sown-registry
+    requirement: optional
+    depends_on: [farmer]
+    scopes: [crop-sown-registry.farmer_reference, crop-sown-registry.crop_season,
+             crop-sown-registry.measures]
+    optional_scopes: [crop-sown-registry.location]
+    dci:
+      reg_type: CropSown
+      reg_record_type: spdci-extensions-agri:ActivityAggregate
+      query_template: |
+        {%- set ns = namespace(fid=none) -%}
+        {%- if subject.type == 'FARMER_ID' -%}{%- set ns.fid = subject.value -%}{%- endif -%}
+        {%- for rec in sources.farmer.records -%}
+          {%- for ident in rec.farmer_personal_details.member_identifier or [] -%}
+            {%- if ns.fid is none and ident.identifier_type == 'FARMER_ID' and ident.identifier_value -%}
+              {%- set ns.fid = ident.identifier_value -%}
+            {%- endif -%}
+          {%- endfor -%}
+        {%- endfor -%}
+        {"query_type": "expression",
+         "query": {"type": "expression",
+                   "value": {"expression": {"query": {
+                     "subject_id": {{ ns.fid | tojson }},
+                     "aggregate_type": "FARMER_SEASON_SUMMARY"
+                     {%- if parameters.crop_year is not none %}, "crop_year": {{ parameters.crop_year | tojson }}{% endif %}
+                     {%- if parameters.season %}, "season": {{ parameters.season | tojson }}{% endif %} } } } },
+         "pagination": {"page_size": 20, "page_number": 1} }
+    timeout_ms: 10000
+    retries: 0
+
+  - id: crop_seasons
+    controller: crop-sown-registry
+    requirement: optional
+    depends_on: [farmer]
+    scopes: [crop-sown-registry.farmer_reference, crop-sown-registry.crop_season,
+             crop-sown-registry.measures]
+    optional_scopes: [crop-sown-registry.location]
+    dci:
+      reg_type: CropSown
+      reg_record_type: spdci-extensions-agri:CropSeason
+      query_template: |
+        {%- set ns = namespace(fid=none) -%}
+        {%- if subject.type == 'FARMER_ID' -%}{%- set ns.fid = subject.value -%}{%- endif -%}
+        {%- for rec in sources.farmer.records -%}
+          {%- for ident in rec.farmer_personal_details.member_identifier or [] -%}
+            {%- if ns.fid is none and ident.identifier_type == 'FARMER_ID' and ident.identifier_value -%}
+              {%- set ns.fid = ident.identifier_value -%}
+            {%- endif -%}
+          {%- endfor -%}
+        {%- endfor -%}
+        {"query_type": "expression",
+         "query": {"type": "expression",
+                   "value": {"expression": {"query": {
+                     "subject_id": {{ ns.fid | tojson }}
+                     {%- if parameters.crop_year is not none %}, "crop_year": {{ parameters.crop_year | tojson }}{% endif %}
+                     {%- if parameters.season %}, "season": {{ parameters.season | tojson }}{% endif %} } } } },
+         "pagination": {"page_size": 100, "page_number": 1} }
+    timeout_ms: 10000
+    retries: 0
+
+response:
+  # JSONPath over {subject, parameters, sources: {<id>: {status, records: [...]}}}.
+  mapping:
+    farmer.name:        "$.sources.farmer.records[0].farmer_personal_details.demographic_info.name"
+    farmer.sex:         "$.sources.farmer.records[0].farmer_personal_details.demographic_info.sex"
+    farmer.birth_date:  "$.sources.farmer.records[0].farmer_personal_details.demographic_info.birth_date"
+    farmer.identifiers: "$.sources.farmer.records[0].farmer_personal_details.member_identifier"
+    farmer.location:    "$.sources.farmer.records[0].family_details.place"
+    farmer.main_crops:  "$.sources.farmer.records[0].main_crops"
+    land.parcels:       "$.sources.farmer.records[0].farm_details"
+    crops.seasons:      "$.sources.crop_seasons.records"
+    crops.season_summaries: "$.sources.season_summaries.records"
+  # Functions: sum, count, min, max, first, round. The output so far is at $.data.
+  derived:
+    land.parcel_count: "count($.sources.farmer.records[0].farm_details)"
+    # Sum of each parcel's land_size, in the parcels' unit (farm_details[].measurement).
+    land.total_size:   "round(sum($.sources.farmer.records[0].farm_details[*].land_size), 4)"
+    crops.total_area_sown_ha: "round(sum($.sources.crop_seasons.records[*].measures.area_sown_ha), 4)"
+  source_status: true
+
+execution:
+  overall_timeout_ms: 25000
+  partial_response: allowed   # a failing mandatory source (farmer) fails the request
+
+limits:
+  rate_per_partner: 60/min

@@ -1,0 +1,24 @@
+apiVersion: v2
+name: openg2p-agri-composite
+description: Agri Stack use-case composite — serves configured use cases by querying several registries over DCI with the partner's consent.
+type: application
+# Static placeholder: CI derives the real version from the branch/tag at package time
+# (develop -> 0.0.0-develop.<run>, N.N -> N.N.0-develop.<run>, N.N.N -> N.N.N).
+version: 0.0.0-develop
+appVersion: "develop"
+dependencies:
+  - name: common
+    repository: https://openg2p.github.io/openg2p-helm
+    version: 2.30.0
+icon: https://openg2p.github.io/openg2p-helm/openg2p-logo.png
+keywords:
+  - openg2p
+  - agri-stack
+  - composite
+  - dci
+maintainers:
+  - email: info@openg2p.org
+    name: OpenG2P
+annotations:
+  catalog.cattle.io/display-name: "Agri Stack Composite"
+  openg2p.org/add-to-rancher: ""

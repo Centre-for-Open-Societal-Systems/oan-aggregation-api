@@ -1,0 +1,77 @@
+{{- if .Values.composite.enabled }}
+{{- $edge := .Values.edgeRateLimit | default dict -}}
+{{- $values := .Values.composite -}}
+{{- $context := dict "Values" (merge (deepCopy $values) (dict "global" .Values.global)) "Chart" .Chart "Release" .Release "Files" .Files "Capabilities" .Capabilities -}}
+{{- with $context -}}
+{{- $ctx := . -}}
+{{- if and .Values.istio.enabled .Values.istio.virtualservice.enabled }}
+{{- $hostname := include "common.tplvalues.render" (dict "value" .Values.istio.virtualservice.host "context" $) }}
+{{- $prefix := include "common.tplvalues.render" (dict "value" .Values.istio.virtualservice.prefix "context" $) }}
+{{- /* Routes: [name, prefix]. With the edge rate limit on, a named route carries it
+       (the gateway EnvoyFilter matches the Envoy route by this name). */ -}}
+{{- /* The internal API (consent templates, read in-cluster by the Consent Manager) is never
+       routed on the public host: the public path that would reach it answers 404 (first route). */ -}}
+{{- $internal := "/composite/v1/internal" }}
+{{- $rewrite := include "common.tplvalues.render" (dict "value" (.Values.istio.virtualservice.rewriteUri | default "") "context" $) }}
+{{- $blocked := $internal }}
+{{- if $rewrite }}
+{{- if hasPrefix $rewrite $internal }}
+{{- $blocked = printf "%s%s" $prefix (trimPrefix $rewrite $internal) }}
+{{- else if hasPrefix $internal $rewrite }}
+{{- fail (printf "composite.istio.virtualservice.rewriteUri %q would route the public host into the internal API (%s)" $rewrite $internal) }}
+{{- end }}
+{{- end }}
+{{- $routes := list (list "" $prefix) }}
+{{- if $edge.enabled }}
+{{- $edgeRoute := include "agriComposite.edgeRateLimitRoute" . }}
+{{- if $edge.pathPrefix }}
+{{- if .Values.istio.virtualservice.rewriteUri }}
+{{- fail "edgeRateLimit.pathPrefix cannot be combined with composite.istio.virtualservice.rewriteUri; set edgeRateLimit.pathPrefix to \"\" (limit the whole hostname)" }}
+{{- end }}
+{{- $routes = list (list $edgeRoute $edge.pathPrefix) (list "" $prefix) }}
+{{- else }}
+{{- $routes = list (list $edgeRoute $prefix) }}
+{{- end }}
+{{- end }}
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: {{ template "common.names.fullname" . }}
+  labels: {{- include "common.labels.standard" (dict "customLabels" .Values.commonLabels "context" $) | nindent 4 }}
+spec:
+  hosts:
+    - {{ $hostname | quote }}
+  gateways:
+    - {{ default (include "common.names.fullname" .) .Values.istio.virtualservice.gateway }}
+  http:
+    - name: "internal-not-public"
+      match:
+        - uri:
+            prefix: {{ $blocked | quote }}
+      directResponse:
+        status: 404
+        body:
+          string: '{"error":{"code":"not_found","message":"Not Found"}}'
+    {{- range $routes }}
+    - {{ if index . 0 }}name: {{ index . 0 | quote }}
+      {{ end }}headers:
+        request:
+          set:
+            x-forwarded-host: {{ $hostname | quote }}
+            x-forwarded-proto: https
+      match:
+        - uri:
+            prefix: {{ index . 1 }}
+      {{- if $ctx.Values.istio.virtualservice.rewriteUri }}
+      rewrite:
+        uri: {{ include "common.tplvalues.render" (dict "value" $ctx.Values.istio.virtualservice.rewriteUri "context" $) }}
+      {{- end }}
+      route:
+        - destination:
+            host: {{ include "common.tplvalues.render" (dict "value" $ctx.Values.istio.virtualservice.destination "context" $) }}
+            port:
+              number: {{ include "common.tplvalues.render" (dict "value" $ctx.Values.istio.virtualservice.destinationPort "context" $) }}
+    {{- end }}
+{{- end }}
+{{- end -}}
+{{- end }}

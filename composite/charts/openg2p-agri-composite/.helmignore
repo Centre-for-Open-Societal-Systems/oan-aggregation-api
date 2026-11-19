@@ -1,0 +1,2 @@
+# Local install overrides (not part of the packaged chart)
+overrides.yaml

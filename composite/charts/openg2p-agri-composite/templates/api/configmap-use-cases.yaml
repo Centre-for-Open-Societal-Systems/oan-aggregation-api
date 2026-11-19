@@ -1,0 +1,13 @@
+{{- if and .Values.composite.enabled (not .Values.composite.existingUseCasesConfigMap) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-use-cases
+  labels: {{- include "common.labels.standard" (dict "customLabels" .Values.commonLabels "context" $) | nindent 4 }}
+    app.kubernetes.io/component: agri-composite-use-cases
+data:
+  {{- range $name, $body := .Values.composite.useCases }}
+  {{ printf "%s.yaml" $name }}: |
+{{ $body | indent 4 }}
+  {{- end }}
+{{- end }}

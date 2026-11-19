@@ -1,0 +1,69 @@
+{{- if and .Values.console.enabled .Values.console.keycloakInit.enabled }}
+{{- $k := .Values.console.keycloakInit -}}
+{{- $kc := .Values.console.keycloak -}}
+{{- $clientId := tpl .Values.console.iam.keycloakClientId $ -}}
+{{- /* Name = release + revision + hash of the pod inputs, as the keycloak-init
+       chart does: a failed install does not advance the revision, and a Job's
+       pod template is immutable. */ -}}
+{{- $podHash := printf "%s|%s|%s|%s" (toYaml $k) (toYaml $kc) $clientId (tpl .Values.global.consoleHostname $) | sha256sum | trunc 8 -}}
+{{- $suffix := printf "-%v-%s" .Release.Revision $podHash -}}
+# Creates (idempotently) the console's Keycloak client, its client roles and the
+# admin users' role mappings, with the Keycloak admin credentials.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ printf "%s-console-kc-init" .Release.Name | trunc (int (sub 63 (len $suffix))) | trimSuffix "-" }}{{ $suffix }}
+  labels: {{- include "common.labels.standard" (dict "customLabels" .Values.commonLabels "context" $) | nindent 4 }}
+    app.kubernetes.io/component: console-keycloak-init
+spec:
+  backoffLimit: {{ $k.backoffLimit | default 3 }}
+  ttlSecondsAfterFinished: {{ $k.ttlSecondsAfterFinished | default 600 }}
+  template:
+    metadata:
+      labels: {{- include "common.labels.matchLabels" (dict "customLabels" .Values.podLabels "context" $) | nindent 8 }}
+        app.kubernetes.io/component: console-keycloak-init
+    spec:
+      restartPolicy: OnFailure
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: keycloak-init
+          image: {{ printf "%s:%s" $k.image.repository (toString $k.image.tag) }}
+          imagePullPolicy: {{ $k.image.pullPolicy }}
+          env:
+            - name: KEYCLOAK_URL
+              value: {{ tpl $kc.url $ | quote }}
+            - name: KEYCLOAK_USER
+              value: {{ $kc.adminUser | quote }}
+            - name: KEYCLOAK_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ tpl $kc.adminSecret $ | quote }}
+                  key: {{ $kc.adminSecretPasswordKey | quote }}
+            - name: INPUT_FILE
+              value: /config/clients.yaml
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: client-secret
+              mountPath: /secrets/{{ $clientId }}
+              readOnly: true
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: config
+          configMap:
+            name: {{ .Release.Name }}-console-kc-init
+        - name: client-secret
+          secret:
+            secretName: {{ tpl $k.clientSecretName $ }}
+            items:
+              - key: client_secret
+                path: client_secret
+{{- end }}

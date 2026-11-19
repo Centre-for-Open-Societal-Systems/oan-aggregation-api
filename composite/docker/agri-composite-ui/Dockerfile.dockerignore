@@ -1,0 +1,13 @@
+# Used by BuildKit for this Dockerfile instead of composite/.dockerignore:
+# send only the UI sources, without local installs / builds / env files.
+*
+!ui
+ui/node_modules
+ui/.next
+ui/out
+ui/.env
+ui/.env.*
+!ui/.env.example
+ui/*.tsbuildinfo
+ui/npm-debug.log*
+**/.DS_Store

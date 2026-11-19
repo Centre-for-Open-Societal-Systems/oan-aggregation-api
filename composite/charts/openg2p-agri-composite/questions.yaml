@@ -1,0 +1,276 @@
+questions:
+# ------------------------------ General -----------------------------
+# Use cases are not in this form: edit composite.useCases in the "Edit YAML"
+# view of the values, or set composite.existingUseCasesConfigMap.
+- variable: global.baseDomain
+  description: Domain every hostname sits under (<service>.<Base Domain>). Use the same value as the commons install. Defaults to <namespace>.openg2p.org.
+  type: string
+  label: Base Domain
+  group: General
+- variable: global.compositeHostname
+  description: Public hostname partners call (Istio internal gateway). Defaults to agri-composite.<Base Domain>.
+  type: string
+  label: Composite Hostname
+  group: General
+- variable: composite.image.tag
+  description: Container image tag to deploy. Empty keeps the tag the chart was built with.
+  type: string
+  label: Image Tag
+  group: General
+- variable: composite.existingUseCasesConfigMap
+  description: "Optional: name of your own ConfigMap of use cases (keys <name>.yaml). Empty = use composite.useCases from the values (edit them in Edit YAML)."
+  type: string
+  label: Existing Use-Case ConfigMap
+  group: General
+- variable: composite.useCasesReloadSeconds
+  description: How often pods check the use-case files for changes (seconds; 0 = never, restart to apply)
+  type: int
+  default: 30
+  label: Use-Case Reload Interval
+  group: General
+
+# ---------------------------- Integration ---------------------------
+- variable: global.compositePartnerId
+  description: The Composite's partner ID in Partner Management (its key must be registered there). Registries see it as the sender; partners address it as the receiver.
+  type: string
+  default: agri-composite
+  label: Composite Partner ID
+  group: Integration
+- variable: global.partnerManagementApiUrl
+  description: Partner Management partner-api URL (partner public keys, and the partner policies that grant use cases)
+  type: string
+  default: http://commons-services-pm-partner-api
+  label: Partner Management URL
+  group: Integration
+- variable: global.auditManagerUrl
+  description: Audit Manager base URL for audit events. Empty disables auditing.
+  type: string
+  default: http://commons-services-auditmanager:80
+  label: Audit Manager URL
+  group: Integration
+- variable: composite.registries.farmer-registry.url
+  description: Farmer Registry partner API DCI sync search URL (full URL; the registry may be in another department or cluster)
+  type: string
+  required: true
+  label: Farmer Registry Search URL
+  group: Integration
+- variable: composite.registries.crop-sown-registry.url
+  description: Crop Sown Registry partner API DCI sync search URL (full URL; the registry may be in another department or cluster)
+  type: string
+  required: true
+  label: Crop Sown Registry Search URL
+  group: Integration
+
+# ------------------------ Agri Stack exchange ------------------------
+- variable: composite.consent.mode
+  description: "exchange (default): the partner's consent is checked at the exchange Consent Manager, and each registry gets its own consent token (Agri Stack exchange install). passthrough: the partner's consent goes to each registry unchanged, so each registry's Partner Management needs a scope policy for every partner."
+  type: enum
+  options:
+    - exchange
+    - passthrough
+  default: exchange
+  label: Consent Mode
+  group: Agri Stack exchange
+- variable: composite.consent.exchangeCmUrl
+  description: Exchange Consent Manager partner API base URL (/consent/v1/validate is appended). Default the Consent Manager in this namespace.
+  type: string
+  default: http://commons-services-cm-partner-api
+  label: Exchange Consent Manager URL
+  group: Agri Stack exchange
+  show_if: composite.consent.mode=exchange
+- variable: composite.consent.exchangeCmTimeoutSeconds
+  description: Timeout for the exchange Consent Manager call (seconds)
+  type: int
+  default: 5
+  label: Exchange Consent Manager Timeout
+  group: Agri Stack exchange
+  show_if: composite.consent.mode=exchange
+- variable: composite.envVars.AGRI_COMPOSITE_PARTNER_POLICY_HARD_TTL_SECONDS
+  description: "How long (seconds) the Composite keeps using a partner's last known use-case policy while Partner Management is unreachable (default 21600, 6 hours). During a Partner Management outage a revoked partner can still be served for up to this long; shorter stops it sooner, but refuses every partner sooner when Partner Management is down."
+  type: string
+  default: "21600"
+  label: Partner Policy Hard TTL (seconds)
+  group: Integration
+- variable: composite.corsAllowOrigins
+  description: Browser origins allowed to call the Composite (comma-separated). None by default: no browser calls it (the Consent Manager reads consent templates in-cluster). Empty for none.
+  type: string
+  default: ""
+  label: Allowed Browser Origins (CORS)
+  group: Agri Stack exchange
+
+# ------------------------------ Console -----------------------------
+# Read-only staff console (IAM login). Needs commons: Postgres, Keycloak,
+# Redis and the IAM staff portal API.
+- variable: console.enabled
+  description: "Deploy the staff console: the console UI, the API's admin API with IAM login, its database in the commons Postgres, its Keycloak client and its IAM application (roles AGRI_COMPOSITE_ADMIN / AGRI_COMPOSITE_VIEWER)."
+  type: boolean
+  default: true
+  label: Enable Console
+  group: Console
+- variable: global.consoleHostname
+  description: Public hostname of the console (Istio internal gateway). The namespace segment defaults to the install namespace.
+  type: string
+  label: Console Hostname
+  group: Console
+  show_if: console.enabled=true
+- variable: console.ui.image.tag
+  description: Console UI image tag. Empty keeps the tag the chart was built with.
+  type: string
+  label: Console UI Image Tag
+  group: Console
+  show_if: console.enabled=true
+- variable: console.iam.providerApiUrl
+  description: IAM staff portal API inside the cluster (login checks, permissions)
+  type: string
+  default: http://commons-services-iam-staff-portal-api
+  label: IAM Staff API URL (internal)
+  group: Console
+  show_if: console.enabled=true
+- variable: console.iam.publicUrl
+  description: IAM staff portal API as the browser reaches it (console login). Defaults to https://staff-iam.<Base Domain>.
+  type: string
+  label: IAM Staff API URL (public)
+  group: Console
+  show_if: console.enabled=true
+- variable: console.iam.redisUrl
+  description: Redis of the IAM staff portal API (login sessions)
+  type: string
+  default: redis://commons-redis-master:6379/0
+  label: IAM Redis URL
+  group: Console
+  show_if: console.enabled=true
+- variable: console.iam.keycloakClientId
+  description: The console's Keycloak client (staff realm), also its IAM application mnemonic. Created by the chart.
+  type: string
+  default: agri-composite
+  label: Keycloak Client ID
+  group: Console
+  show_if: console.enabled=true
+- variable: console.iam.cookieDomain
+  description: Parent domain of the staff login cookies, shared with the IAM staff API. Defaults to .<Base Domain>.
+  type: string
+  label: Cookie Domain
+  group: Console
+  show_if: console.enabled=true
+- variable: console.db.hostname
+  description: Postgres host (commons). The chart creates the database and user with the superuser Secret commons-postgresql.
+  type: string
+  default: commons-postgresql
+  label: Database Host
+  group: Console
+  show_if: console.enabled=true
+- variable: console.db.dbname
+  description: Console database name
+  type: string
+  default: agri_composite
+  label: Database Name
+  group: Console
+  show_if: console.enabled=true
+- variable: console.db.user
+  description: Console database user (password generated once into the Secret agri-composite-db)
+  type: string
+  default: agri_composite_user
+  label: Database User
+  group: Console
+  show_if: console.enabled=true
+- variable: console.pmPortalUrl
+  description: Partner Management portal link shown in the console. Defaults to https://partner-management.<Base Domain>.
+  type: string
+  label: Partner Management Portal URL
+  group: Console
+  show_if: console.enabled=true
+- variable: console.cmPortalUrl
+  description: Consent Manager portal link shown in the console. Defaults to https://consent-manager.<Base Domain>.
+  type: string
+  label: Consent Manager Portal URL
+  group: Console
+  show_if: console.enabled=true
+- variable: console.activityRetentionDays
+  description: Days the console's call log keeps each call (0 keeps everything)
+  type: int
+  default: 90
+  label: Call Log Retention (days)
+  group: Console
+  show_if: console.enabled=true
+
+# ---------------------------- Signing key ---------------------------
+- variable: composite.signingKey.generate
+  description: "Generate the Composite's signing key at install (kept on upgrades). Its public key is served at /.well-known/jwks.json, where Partner Management reads it. A Secret you created yourself is always left alone."
+  type: boolean
+  default: true
+  label: Generate Signing Key
+  group: Signing key
+- variable: composite.signingKey.secretName
+  description: "Secret holding the Composite's signing key: generated (key.pem, kid), or one you create before installing with composite.p12 (file), password, and optionally kid and algorithm."
+  type: string
+  default: agri-composite-signing
+  label: Signing Key Secret
+  group: Signing key
+
+# ----------------------------- Scaling ------------------------------
+- variable: composite.autoscaling.enabled
+  description: Autoscale the stateless API pods on CPU
+  type: boolean
+  default: false
+  label: Enable Autoscaling
+  group: Scaling
+- variable: composite.autoscaling.minReplicas
+  description: Minimum number of API pods
+  type: int
+  default: 1
+  label: Min Replicas
+  group: Scaling
+  show_if: composite.autoscaling.enabled=true
+- variable: composite.autoscaling.maxReplicas
+  description: Maximum number of API pods
+  type: int
+  default: 5
+  label: Max Replicas
+  group: Scaling
+  show_if: composite.autoscaling.enabled=true
+- variable: composite.replicaCount
+  description: Fixed number of API pods (when autoscaling is off)
+  type: int
+  default: 1
+  label: Replica Count
+  group: Scaling
+  show_if: composite.autoscaling.enabled=false
+- variable: composite.workers
+  description: gunicorn worker processes per pod
+  type: int
+  default: 2
+  label: Workers per Pod
+  group: Scaling
+
+# ---------------------------- Rate limits ---------------------------
+- variable: edgeRateLimit.enabled
+  description: "Limit all traffic to the Composite's use-case API at the Istio ingress gateway, before it reaches a pod (protects the service; not per partner). Creates an EnvoyFilter in the gateway's namespace (istio-system): the installing user needs rights on EnvoyFilters there."
+  type: boolean
+  default: false
+  label: Edge Rate Limit
+  group: Rate Limits
+- variable: edgeRateLimit.requests
+  description: Requests allowed per interval for all partners together, counted per gateway pod (2 gateway pods allow up to twice this). Over it the gateway answers 429 with the header x-local-rate-limit.
+  type: int
+  default: 120
+  min: 1
+  label: Edge Limit (Requests)
+  group: Rate Limits
+  show_if: edgeRateLimit.enabled=true
+- variable: edgeRateLimit.per
+  description: Interval the edge limit refills over.
+  type: enum
+  options:
+    - 1s
+    - 1m
+    - 1h
+  default: 1m
+  label: Edge Limit Interval
+  group: Rate Limits
+  show_if: edgeRateLimit.enabled=true
+- variable: composite.rateLimit.redis.url
+  description: Redis for the per-partner, per-use-case limits (limits.rate_per_partner in the use cases), shared by every pod. Empty = each worker process counts on its own. If Redis is down, each worker counts on its own until it is back (calls are not refused).
+  type: string
+  default: redis://commons-redis-master:6379/0
+  label: Rate Limit Redis URL
+  group: Rate Limits

@@ -1,0 +1,10 @@
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+backend/tests
+charts
+scripts
+*.p12
+*.pem
+ui/node_modules
+ui/.next
