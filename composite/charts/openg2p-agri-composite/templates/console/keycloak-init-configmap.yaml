@@ -1,0 +1,34 @@
+{{- if and .Values.console.enabled .Values.console.keycloakInit.enabled }}
+{{- $k := .Values.console.keycloakInit -}}
+{{- $clientId := tpl .Values.console.iam.keycloakClientId $ -}}
+# Input of the keycloak-init image (same format as the keycloak-init chart):
+# the console's confidential client with its client roles, and the role
+# mappings of the admin users.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-console-kc-init
+  labels: {{- include "common.labels.standard" (dict "customLabels" .Values.commonLabels "context" $) | nindent 4 }}
+    app.kubernetes.io/component: console-keycloak-init
+data:
+  clients.yaml: |
+    realms:
+      {{ tpl .Values.console.keycloak.realm $ }}:
+        clients:
+          - clientId: {{ $clientId | quote }}
+            name: {{ $k.clientName | quote }}
+            publicClient: false
+            serviceAccountsEnabled: true
+            redirectUris:
+              - {{ printf "https://%s/*" (tpl .Values.global.consoleHostname $) | quote }}
+            clientRoles: {{- toYaml $k.clientRoles | nindent 14 }}
+        {{- with $k.adminUsers }}
+        users:
+          {{- range . }}
+          - username: {{ . | quote }}
+            clientRoleMappings:
+              {{ $clientId | quote }}:
+                - AGRI_COMPOSITE_ADMIN
+          {{- end }}
+        {{- end }}
+{{- end }}

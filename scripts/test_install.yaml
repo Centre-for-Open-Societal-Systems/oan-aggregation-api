@@ -1,0 +1,75 @@
+# Configuration of scripts/test_install.py for the reference install: the Exchange in
+# namespace agrix, the Farmer Registry in trial and the Crop Sown Registry in dept1, all
+# under openg2p.org. Copy this file for another install and change what differs.
+#
+# Every hostname defaults from `domain` (<service>.<domain>, as the charts name them);
+# set a URL only when yours differs. Credentials are read with kubectl from the Secret
+# named (namespace defaults to the section's), or from the environment variable named
+# in `env` when it is set; they are never printed.
+
+# kubectl context to read Secrets with; empty = the current context. Across clusters,
+# give each credential an `env` instead and set those variables.
+kube_context: ""
+
+exchange:
+  namespace: agrix
+  domain: agrix.openg2p.org
+  composite:
+    url: ""                 # default https://agri-composite.<domain>
+    partner_id: agri-composite   # the Composite's partner ID (PM: PARTNER_AGRI_COMPOSITE)
+  partner_management:
+    staff_api_url: ""       # default https://pm-staff-portal.<domain>
+    partner_api_url: ""     # default https://partner-management-partner-api.<domain>
+    portal_url: ""          # default https://partner-management.<domain> (shown in messages)
+    token_url: ""           # default https://keycloak.<domain>/realms/staff/protocol/openid-connect/token
+    client_id: commons-services-staff-portal
+    client_secret:
+      secret: commons-services-staff-portal
+      key: client_secret
+      env: ""               # e.g. EXCHANGE_PM_CLIENT_SECRET
+  # A partner portal user for the test partner (<partner>-operator), its password kept
+  # in Secret partner-user-<partner>-operator in the Exchange namespace.
+  partner_portal:
+    enabled: true
+    url: ""                 # default https://consent-partner-portal.<domain>
+    keycloak_url: ""        # default https://keycloak.<domain>
+    realm: partner
+    client: consent-partner-portal
+    role: PARTNER_OPERATOR
+    admin_user: admin
+    admin_password:
+      secret: commons-keycloak
+      key: admin-password
+      env: ""
+
+# Each registry the use case reads: its data controller ID (as in the Composite's
+# registries and the use case) and its department's install. Same fields as the
+# Exchange's partner_management.
+registries:
+  - controller: farmer-registry
+    namespace: trial
+    domain: trial.openg2p.org
+  - controller: crop-sown-registry
+    namespace: dept1
+    domain: dept1.openg2p.org
+
+test:
+  partner: bank-a           # the test partner's ID (PM: PARTNER_BANK_A)
+  use_case: loan-profile
+  # The farmer: sample farmer FR-0007 of a demo install (sample person ETH-IND-0007).
+  subject:
+    type: FAYDA_FAN
+    value: "946053125409"
+  parameters: {}            # e.g. {crop_year: 2019, season: SEASON_MEHER}
+  # sign: the partner signs the consent; lookup: no consent sent, the Exchange CM finds
+  # the farmer's consent for this partner and use case (e.g. from the partner portal);
+  # id:<consent ID>: a consent the Exchange CM holds.
+  consent: sign
+  subject_id_types: [FAYDA_FAN, FARMER_ID]
+  # true: the script approves the requests it raises; false: an administrator approves
+  # them in Partner Management while the script waits.
+  auto_approve: true
+  wait_seconds: 1800
+  poll_seconds: 10
+  state_dir: ""             # the partner's key; default ~/.agri-stack-test/<exchange domain>
+  insecure_tls: false

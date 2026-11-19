@@ -1,0 +1,2475 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "OpenG2P Agri Stack Composite",
+    "description": "\nAgri Stack use-case Composite.\n\nServes approved use cases (configuration, not code) by querying several\nregistries over DCI with the subject's consent and returning one signed\nresponse. No partner data is stored (the console's call log holds outcomes\nand timings only).\n\n**Use cases** (partner API): every query is a signed envelope; the detached\nJWS is verified against the partner's keys in Partner Management, and the\nComposite signs every response. The describe endpoints need no signature.\n\n**Console (staff)**: read-only API for the Composite's console, behind a staff\nlogin with the `composite:view` permission; present only when the console is on.\n",
+    "contact": {
+      "url": "https://www.openg2p.org/",
+      "email": "info@openg2p.org"
+    },
+    "license": {
+      "name": "Mozilla Public License 2.0",
+      "url": "https://www.mozilla.org/en-US/MPL/2.0/"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/composite/v1/use-cases": {
+      "get": {
+        "tags": [
+          "Use cases"
+        ],
+        "summary": "List use cases",
+        "description": "The published use cases: for each, the subject types and parameters it takes, the registries (sources) it queries, the consent grants and data scopes it needs, and its output fields. Configuration only; not signed and needs no signature.",
+        "operationId": "list_use_cases_composite_v1_use_cases_get",
+        "responses": {
+          "200": {
+            "description": "The published use cases.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UseCaseList"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorListResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/composite/v1/use-cases/{use_case}": {
+      "get": {
+        "tags": [
+          "Use cases"
+        ],
+        "summary": "Describe a use case",
+        "description": "One published use case, by `name` or `name@major` (or `name` with the `X-Use-Case-Major` header). Without a major version, the highest published one. Use it to build the query and the consent: `input` lists the subject types and parameters, `consent_grants_needed` and `consent_scopes` what the consent must grant. Configuration only; needs no signature.",
+        "operationId": "describe_use_case_composite_v1_use_cases__use_case__get",
+        "parameters": [
+          {
+            "name": "use_case",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The use case: `name` (e.g. `loan-profile`) or `name@major` (e.g. `loan-profile@1`).",
+              "title": "Use Case"
+            },
+            "description": "The use case: `name` (e.g. `loan-profile`) or `name@major` (e.g. `loan-profile@1`)."
+          },
+          {
+            "name": "x-use-case-major",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Major version of the use case, when the path names it without `@major`. Without either, the highest published major is used.",
+              "title": "X-Use-Case-Major"
+            },
+            "description": "Major version of the use case, when the path names it without `@major`. Without either, the highest published major is used."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The use case.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UseCaseDescription"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_use_case`: the path and the header name different major versions, or the reference is malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`unknown_use_case`: no published use case by that reference.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/composite/v1/use-cases/{use_case}/query": {
+      "post": {
+        "tags": [
+          "Use cases"
+        ],
+        "summary": "Query a use case",
+        "description": "Serve one query for one subject. The body is a signed envelope `{signature, header, message}`: `signature` is a detached JWS over `{header, message}` made with the partner's key and verified against Partner Management (`header.sender_id`). The Composite checks that the partner has a policy for the use case (`name@major`) in Partner Management, and the subject's consent (`message.consent_id`, `message.consent_jws`, or neither: the Exchange's Consent Manager then looks up the consent it holds from this partner for this subject and the use case's purpose), queries each registry the use case names, and returns one response envelope signed with its own key.\n\nEach source gets a status: `ok`, `no_record`, `denied`, `unavailable` or `error`. A failing optional source leaves its fields null (the response is still 200); a failing mandatory source fails the request (`source_denied`, `source_unavailable`, `source_error`).\n\nEvery answer, errors included, is a signed envelope: on an error `header.status` is `rjct` and `message.error` has the `code` and `message`.",
+        "operationId": "query_composite_v1_use_cases__use_case__query_post",
+        "parameters": [
+          {
+            "name": "use_case",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The use case: `name` (e.g. `loan-profile`) or `name@major` (e.g. `loan-profile@1`).",
+              "title": "Use Case"
+            },
+            "description": "The use case: `name` (e.g. `loan-profile`) or `name@major` (e.g. `loan-profile@1`)."
+          },
+          {
+            "name": "x-use-case-major",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Major version of the use case, when the path names it without `@major`. Without either, the highest published major is used.",
+              "title": "X-Use-Case-Major"
+            },
+            "description": "Major version of the use case, when the path names it without `@major`. Without either, the highest published major is used."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The signed result. Optional sources that failed show in `sources`; their fields are null.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueryResponse"
+                },
+                "example": {
+                  "signature": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImFncmktY29tcG9zaXRlIn0..<signature>",
+                  "header": {
+                    "version": "1.0.0",
+                    "message_id": "0b6d1d0e-9e55-4d7a-8b3c-1f2e3d4c5b6a",
+                    "message_ts": "2026-10-01T10:00:01.234Z",
+                    "action": "on-query",
+                    "status": "succ",
+                    "sender_id": "agri-composite",
+                    "receiver_id": "bank-a",
+                    "meta": {
+                      "in_reply_to": "7f1c2a9e-3a51-4c0e-9d5b-0f6f3f2b1c11"
+                    }
+                  },
+                  "message": {
+                    "use_case": "loan-profile@1",
+                    "version": "1.0.0",
+                    "request_id": "5e0c7b8a-2f41-4d3e-a1b2-c3d4e5f6a7b8",
+                    "subject": {
+                      "type": "FAYDA_FAN",
+                      "value": "123456789012"
+                    },
+                    "consent_id": "c0a8012e-5b7d-4f0e-9a43-2f1d6e7b9a10",
+                    "sources": {
+                      "farmer": {
+                        "status": "ok"
+                      },
+                      "season_summaries": {
+                        "status": "ok"
+                      },
+                      "crop_seasons": {
+                        "status": "unavailable",
+                        "detail": "registry unavailable (HTTP 503)"
+                      }
+                    },
+                    "data": {
+                      "farmer": {
+                        "name": {
+                          "given_name": "Almaz",
+                          "surname": "Bekele"
+                        },
+                        "sex": "female",
+                        "birth_date": "1985-03-02",
+                        "main_crops": [
+                          "CROP_BREAD_WHEAT",
+                          "CROP_TEFF"
+                        ]
+                      },
+                      "land": {
+                        "parcel_count": 2,
+                        "total_size": 1.75,
+                        "parcels": [
+                          {
+                            "land_size": 1.25,
+                            "measurement": "Hectare",
+                            "land_tenure": "Owned"
+                          },
+                          {
+                            "land_size": 0.5,
+                            "measurement": "Hectare",
+                            "land_tenure": "Crop share"
+                          }
+                        ]
+                      },
+                      "crops": {
+                        "season_summaries": [
+                          {
+                            "crop_season": {
+                              "crop_year": 2019,
+                              "season": "SEASON_MEHER"
+                            },
+                            "measures": {
+                              "area_sown_ha": 1.15
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`signing_unavailable`: the Composite cannot sign; the envelope then has an empty signature.",
+            "content": {
+              "application/json": {
+                "examples": {
+                  "signing_unavailable": {
+                    "summary": "signing_unavailable",
+                    "value": {
+                      "signature": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImFncmktY29tcG9zaXRlIn0..<signature>",
+                      "header": {
+                        "version": "1.0.0",
+                        "message_id": "0b6d1d0e-9e55-4d7a-8b3c-1f2e3d4c5b6a",
+                        "message_ts": "2026-10-01T10:00:01.234Z",
+                        "action": "on-query",
+                        "status": "rjct",
+                        "sender_id": "agri-composite",
+                        "receiver_id": "bank-a",
+                        "meta": {
+                          "in_reply_to": "7f1c2a9e-3a51-4c0e-9d5b-0f6f3f2b1c11"
+                        },
+                        "status_reason_code": "signing_unavailable",
+                        "status_reason_message": "the composite cannot sign responses; check its signing key"
+                      },
+                      "message": {
+                        "use_case": "loan-profile@1",
+                        "request_id": "5e0c7b8a-2f41-4d3e-a1b2-c3d4e5f6a7b8",
+                        "error": {
+                          "code": "signing_unavailable",
+                          "message": "the composite cannot sign responses; check its signing key"
+                        }
+                      }
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/QueryErrorResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The envelope or input is not valid: `invalid_envelope`, `wrong_receiver`, `stale_request`, `invalid_use_case`, `invalid_input`, `consent_id_needs_exchange`.",
+            "content": {
+              "application/json": {
+                "examples": {
+                  "invalid_input": {
+                    "summary": "invalid_input",
+                    "value": {
+                      "signature": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImFncmktY29tcG9zaXRlIn0..<signature>",
+                      "header": {
+                        "version": "1.0.0",
+                        "message_id": "0b6d1d0e-9e55-4d7a-8b3c-1f2e3d4c5b6a",
+                        "message_ts": "2026-10-01T10:00:01.234Z",
+                        "action": "on-query",
+                        "status": "rjct",
+                        "sender_id": "agri-composite",
+                        "receiver_id": "bank-a",
+                        "meta": {
+                          "in_reply_to": "7f1c2a9e-3a51-4c0e-9d5b-0f6f3f2b1c11"
+                        },
+                        "status_reason_code": "invalid_input",
+                        "status_reason_message": "subject type must be one of ['FAYDA_FAN', 'FARMER_ID']"
+                      },
+                      "message": {
+                        "use_case": "loan-profile@1",
+                        "request_id": "5e0c7b8a-2f41-4d3e-a1b2-c3d4e5f6a7b8",
+                        "error": {
+                          "code": "invalid_input",
+                          "message": "subject type must be one of ['FAYDA_FAN', 'FARMER_ID']"
+                        }
+                      }
+                    }
+                  },
+                  "stale_request": {
+                    "summary": "stale_request",
+                    "value": {
+                      "signature": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImFncmktY29tcG9zaXRlIn0..<signature>",
+                      "header": {
+                        "version": "1.0.0",
+                        "message_id": "0b6d1d0e-9e55-4d7a-8b3c-1f2e3d4c5b6a",
+                        "message_ts": "2026-10-01T10:00:01.234Z",
+                        "action": "on-query",
+                        "status": "rjct",
+                        "sender_id": "agri-composite",
+                        "receiver_id": "bank-a",
+                        "meta": {
+                          "in_reply_to": "7f1c2a9e-3a51-4c0e-9d5b-0f6f3f2b1c11"
+                        },
+                        "status_reason_code": "stale_request",
+                        "status_reason_message": "header.message_ts is more than 300s from now"
+                      },
+                      "message": {
+                        "use_case": "loan-profile@1",
+                        "request_id": "5e0c7b8a-2f41-4d3e-a1b2-c3d4e5f6a7b8",
+                        "error": {
+                          "code": "stale_request",
+                          "message": "header.message_ts is more than 300s from now"
+                        }
+                      }
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/QueryErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`signature_invalid`: the signature does not verify against the sender's keys in Partner Management (unknown partner, unknown key or bad signature).",
+            "content": {
+              "application/json": {
+                "examples": {
+                  "signature_invalid": {
+                    "summary": "signature_invalid",
+                    "value": {
+                      "signature": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImFncmktY29tcG9zaXRlIn0..<signature>",
+                      "header": {
+                        "version": "1.0.0",
+                        "message_id": "0b6d1d0e-9e55-4d7a-8b3c-1f2e3d4c5b6a",
+                        "message_ts": "2026-10-01T10:00:01.234Z",
+                        "action": "on-query",
+                        "status": "rjct",
+                        "sender_id": "agri-composite",
+                        "receiver_id": "bank-a",
+                        "meta": {
+                          "in_reply_to": "7f1c2a9e-3a51-4c0e-9d5b-0f6f3f2b1c11"
+                        },
+                        "status_reason_code": "signature_invalid",
+                        "status_reason_message": "the request signature does not verify against the sender's Partner Management key"
+                      },
+                      "message": {
+                        "use_case": "loan-profile@1",
+                        "request_id": "5e0c7b8a-2f41-4d3e-a1b2-c3d4e5f6a7b8",
+                        "error": {
+                          "code": "signature_invalid",
+                          "message": "the request signature does not verify against the sender's Partner Management key"
+                        }
+                      }
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/QueryErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not allowed: `partner_not_allowed` (the partner has no policy for this use case, `name@major`, in Partner Management), `consent_required`, `consent_malformed`, `consent_signature_invalid`, `consent_subject_mismatch`, `consent_not_yet_valid`, `consent_expired`, `consent_grant_missing`, `consent_scope_missing`, `consent_denied` (the reason in the message, e.g. `consent_not_found` when no consent was sent and none is held), `consent_receipt_missing` (no consent token for a mandatory registry), `source_denied` (a mandatory source was denied).",
+            "content": {
+              "application/json": {
+                "examples": {
+                  "partner_not_allowed": {
+                    "summary": "partner_not_allowed",
+                    "value": {
+                      "signature": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImFncmktY29tcG9zaXRlIn0..<signature>",
+                      "header": {
+                        "version": "1.0.0",
+                        "message_id": "0b6d1d0e-9e55-4d7a-8b3c-1f2e3d4c5b6a",
+                        "message_ts": "2026-10-01T10:00:01.234Z",
+                        "action": "on-query",
+                        "status": "rjct",
+                        "sender_id": "agri-composite",
+                        "receiver_id": "bank-a",
+                        "meta": {
+                          "in_reply_to": "7f1c2a9e-3a51-4c0e-9d5b-0f6f3f2b1c11"
+                        },
+                        "status_reason_code": "partner_not_allowed",
+                        "status_reason_message": "partner 'bank-b' is not granted the use case loan-profile@1 in Partner Management"
+                      },
+                      "message": {
+                        "use_case": "loan-profile@1",
+                        "request_id": "5e0c7b8a-2f41-4d3e-a1b2-c3d4e5f6a7b8",
+                        "error": {
+                          "code": "partner_not_allowed",
+                          "message": "partner 'bank-b' is not granted the use case loan-profile@1 in Partner Management"
+                        }
+                      }
+                    }
+                  },
+                  "consent_denied": {
+                    "summary": "consent_denied",
+                    "value": {
+                      "signature": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImFncmktY29tcG9zaXRlIn0..<signature>",
+                      "header": {
+                        "version": "1.0.0",
+                        "message_id": "0b6d1d0e-9e55-4d7a-8b3c-1f2e3d4c5b6a",
+                        "message_ts": "2026-10-01T10:00:01.234Z",
+                        "action": "on-query",
+                        "status": "rjct",
+                        "sender_id": "agri-composite",
+                        "receiver_id": "bank-a",
+                        "meta": {
+                          "in_reply_to": "7f1c2a9e-3a51-4c0e-9d5b-0f6f3f2b1c11"
+                        },
+                        "status_reason_code": "consent_denied",
+                        "status_reason_message": "the exchange Consent Manager denied the consent (consent_expired)"
+                      },
+                      "message": {
+                        "use_case": "loan-profile@1",
+                        "request_id": "5e0c7b8a-2f41-4d3e-a1b2-c3d4e5f6a7b8",
+                        "error": {
+                          "code": "consent_denied",
+                          "message": "the exchange Consent Manager denied the consent (consent_expired)"
+                        }
+                      }
+                    }
+                  },
+                  "consent_not_found": {
+                    "summary": "consent_not_found",
+                    "value": {
+                      "signature": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImFncmktY29tcG9zaXRlIn0..<signature>",
+                      "header": {
+                        "version": "1.0.0",
+                        "message_id": "0b6d1d0e-9e55-4d7a-8b3c-1f2e3d4c5b6a",
+                        "message_ts": "2026-10-01T10:00:01.234Z",
+                        "action": "on-query",
+                        "status": "rjct",
+                        "sender_id": "agri-composite",
+                        "receiver_id": "bank-a",
+                        "meta": {
+                          "in_reply_to": "7f1c2a9e-3a51-4c0e-9d5b-0f6f3f2b1c11"
+                        },
+                        "status_reason_code": "consent_denied",
+                        "status_reason_message": "the exchange Consent Manager denied the consent (consent_not_found)"
+                      },
+                      "message": {
+                        "use_case": "loan-profile@1",
+                        "request_id": "5e0c7b8a-2f41-4d3e-a1b2-c3d4e5f6a7b8",
+                        "error": {
+                          "code": "consent_denied",
+                          "message": "the exchange Consent Manager denied the consent (consent_not_found)"
+                        }
+                      }
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/QueryErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`unknown_use_case`: no published use case with that name (and major version).",
+            "content": {
+              "application/json": {
+                "examples": {
+                  "unknown_use_case": {
+                    "summary": "unknown_use_case",
+                    "value": {
+                      "signature": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImFncmktY29tcG9zaXRlIn0..<signature>",
+                      "header": {
+                        "version": "1.0.0",
+                        "message_id": "0b6d1d0e-9e55-4d7a-8b3c-1f2e3d4c5b6a",
+                        "message_ts": "2026-10-01T10:00:01.234Z",
+                        "action": "on-query",
+                        "status": "rjct",
+                        "sender_id": "agri-composite",
+                        "receiver_id": "bank-a",
+                        "meta": {
+                          "in_reply_to": "7f1c2a9e-3a51-4c0e-9d5b-0f6f3f2b1c11"
+                        },
+                        "status_reason_code": "unknown_use_case",
+                        "status_reason_message": "no published use case 'loan-profile@2'"
+                      },
+                      "message": {
+                        "use_case": "loan-profile@1",
+                        "request_id": "5e0c7b8a-2f41-4d3e-a1b2-c3d4e5f6a7b8",
+                        "error": {
+                          "code": "unknown_use_case",
+                          "message": "no published use case 'loan-profile@2'"
+                        }
+                      }
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/QueryErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "`rate_limited`: the partner went over the use case's rate.",
+            "content": {
+              "application/json": {
+                "examples": {
+                  "rate_limited": {
+                    "summary": "rate_limited",
+                    "value": {
+                      "signature": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImFncmktY29tcG9zaXRlIn0..<signature>",
+                      "header": {
+                        "version": "1.0.0",
+                        "message_id": "0b6d1d0e-9e55-4d7a-8b3c-1f2e3d4c5b6a",
+                        "message_ts": "2026-10-01T10:00:01.234Z",
+                        "action": "on-query",
+                        "status": "rjct",
+                        "sender_id": "agri-composite",
+                        "receiver_id": "bank-a",
+                        "meta": {
+                          "in_reply_to": "7f1c2a9e-3a51-4c0e-9d5b-0f6f3f2b1c11"
+                        },
+                        "status_reason_code": "rate_limited",
+                        "status_reason_message": "more than 60/min for loan-profile@1"
+                      },
+                      "message": {
+                        "use_case": "loan-profile@1",
+                        "request_id": "5e0c7b8a-2f41-4d3e-a1b2-c3d4e5f6a7b8",
+                        "error": {
+                          "code": "rate_limited",
+                          "message": "more than 60/min for loan-profile@1"
+                        }
+                      }
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/QueryErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "`source_error` (a mandatory source failed) or `consent_exchange_error` (the Exchange's Consent Manager gave an answer the Composite cannot use).",
+            "content": {
+              "application/json": {
+                "examples": {
+                  "source_error": {
+                    "summary": "source_error",
+                    "value": {
+                      "signature": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImFncmktY29tcG9zaXRlIn0..<signature>",
+                      "header": {
+                        "version": "1.0.0",
+                        "message_id": "0b6d1d0e-9e55-4d7a-8b3c-1f2e3d4c5b6a",
+                        "message_ts": "2026-10-01T10:00:01.234Z",
+                        "action": "on-query",
+                        "status": "rjct",
+                        "sender_id": "agri-composite",
+                        "receiver_id": "bank-a",
+                        "meta": {
+                          "in_reply_to": "7f1c2a9e-3a51-4c0e-9d5b-0f6f3f2b1c11"
+                        },
+                        "status_reason_code": "source_error",
+                        "status_reason_message": "mandatory source failed: farmer (error)"
+                      },
+                      "message": {
+                        "use_case": "loan-profile@1",
+                        "request_id": "5e0c7b8a-2f41-4d3e-a1b2-c3d4e5f6a7b8",
+                        "sources": {
+                          "farmer": {
+                            "status": "error",
+                            "detail": "registry rejected the request (HTTP 400)"
+                          }
+                        },
+                        "error": {
+                          "code": "source_error",
+                          "message": "mandatory source failed: farmer (error)"
+                        }
+                      }
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/QueryErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`source_unavailable` (a mandatory source is down), `consent_exchange_unavailable`, or `partner_policy_unavailable` (Partner Management cannot be read to check the partner's use-case grant and no recent answer is cached).",
+            "content": {
+              "application/json": {
+                "examples": {
+                  "source_unavailable": {
+                    "summary": "source_unavailable",
+                    "value": {
+                      "signature": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImFncmktY29tcG9zaXRlIn0..<signature>",
+                      "header": {
+                        "version": "1.0.0",
+                        "message_id": "0b6d1d0e-9e55-4d7a-8b3c-1f2e3d4c5b6a",
+                        "message_ts": "2026-10-01T10:00:01.234Z",
+                        "action": "on-query",
+                        "status": "rjct",
+                        "sender_id": "agri-composite",
+                        "receiver_id": "bank-a",
+                        "meta": {
+                          "in_reply_to": "7f1c2a9e-3a51-4c0e-9d5b-0f6f3f2b1c11"
+                        },
+                        "status_reason_code": "source_unavailable",
+                        "status_reason_message": "mandatory source failed: farmer (unavailable)"
+                      },
+                      "message": {
+                        "use_case": "loan-profile@1",
+                        "request_id": "5e0c7b8a-2f41-4d3e-a1b2-c3d4e5f6a7b8",
+                        "sources": {
+                          "farmer": {
+                            "status": "unavailable",
+                            "detail": "registry unavailable (HTTP 503)"
+                          }
+                        },
+                        "error": {
+                          "code": "source_unavailable",
+                          "message": "mandatory source failed: farmer (unavailable)"
+                        }
+                      }
+                    }
+                  },
+                  "partner_policy_unavailable": {
+                    "summary": "partner_policy_unavailable",
+                    "value": {
+                      "signature": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImFncmktY29tcG9zaXRlIn0..<signature>",
+                      "header": {
+                        "version": "1.0.0",
+                        "message_id": "0b6d1d0e-9e55-4d7a-8b3c-1f2e3d4c5b6a",
+                        "message_ts": "2026-10-01T10:00:01.234Z",
+                        "action": "on-query",
+                        "status": "rjct",
+                        "sender_id": "agri-composite",
+                        "receiver_id": "bank-a",
+                        "meta": {
+                          "in_reply_to": "7f1c2a9e-3a51-4c0e-9d5b-0f6f3f2b1c11"
+                        },
+                        "status_reason_code": "partner_policy_unavailable",
+                        "status_reason_message": "Partner Management cannot be read to check the partner's use-case grant; try again later"
+                      },
+                      "message": {
+                        "use_case": "loan-profile@1",
+                        "request_id": "5e0c7b8a-2f41-4d3e-a1b2-c3d4e5f6a7b8",
+                        "error": {
+                          "code": "partner_policy_unavailable",
+                          "message": "Partner Management cannot be read to check the partner's use-case grant; try again later"
+                        }
+                      }
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/QueryErrorResponse"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`source_unavailable`: a mandatory source timed out (or the use case's overall timeout was reached).",
+            "content": {
+              "application/json": {
+                "examples": {
+                  "source_unavailable": {
+                    "summary": "source_unavailable",
+                    "value": {
+                      "signature": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImFncmktY29tcG9zaXRlIn0..<signature>",
+                      "header": {
+                        "version": "1.0.0",
+                        "message_id": "0b6d1d0e-9e55-4d7a-8b3c-1f2e3d4c5b6a",
+                        "message_ts": "2026-10-01T10:00:01.234Z",
+                        "action": "on-query",
+                        "status": "rjct",
+                        "sender_id": "agri-composite",
+                        "receiver_id": "bank-a",
+                        "meta": {
+                          "in_reply_to": "7f1c2a9e-3a51-4c0e-9d5b-0f6f3f2b1c11"
+                        },
+                        "status_reason_code": "source_unavailable",
+                        "status_reason_message": "mandatory source failed: farmer (unavailable)"
+                      },
+                      "message": {
+                        "use_case": "loan-profile@1",
+                        "request_id": "5e0c7b8a-2f41-4d3e-a1b2-c3d4e5f6a7b8",
+                        "sources": {
+                          "farmer": {
+                            "status": "unavailable",
+                            "detail": "registry timed out"
+                          }
+                        },
+                        "error": {
+                          "code": "source_unavailable",
+                          "message": "mandatory source failed: farmer (unavailable)"
+                        }
+                      }
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/QueryErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "description": "The signed request envelope.",
+                "properties": {
+                  "signature": {
+                    "description": "Detached JWS (`<protected>..<signature>`) over the canonical JSON of `{header, message}` (sorted keys, no whitespace), made with the partner's key. The JWS header names the key (`kid`). The Composite verifies it against the sender's keys in Partner Management.",
+                    "examples": [
+                      "eyJhbGciOiJFUzI1NiIsImtpZCI6ImJhbmstYS1rZXktMSJ9..MEUCIQ"
+                    ],
+                    "title": "Signature",
+                    "type": "string"
+                  },
+                  "header": {
+                    "properties": {
+                      "version": {
+                        "default": "1.0.0",
+                        "examples": [
+                          "1.0.0"
+                        ],
+                        "title": "Version",
+                        "type": "string"
+                      },
+                      "message_id": {
+                        "description": "The partner's ID for this request; echoed as `meta.in_reply_to`.",
+                        "examples": [
+                          "7f1c2a9e-3a51-4c0e-9d5b-0f6f3f2b1c11"
+                        ],
+                        "title": "Message Id",
+                        "type": "string"
+                      },
+                      "message_ts": {
+                        "description": "ISO-8601 time of the request. Must be within 5 minutes of the Composite's clock.",
+                        "examples": [
+                          "2026-10-01T10:00:00Z"
+                        ],
+                        "title": "Message Ts",
+                        "type": "string"
+                      },
+                      "action": {
+                        "default": "query",
+                        "examples": [
+                          "query"
+                        ],
+                        "title": "Action",
+                        "type": "string"
+                      },
+                      "sender_id": {
+                        "description": "The partner's ID in Partner Management. The signature is checked against this partner's keys.",
+                        "examples": [
+                          "bank-a"
+                        ],
+                        "title": "Sender Id",
+                        "type": "string"
+                      },
+                      "receiver_id": {
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "description": "The Composite's partner ID. When sent, it must match.",
+                        "examples": [
+                          "agri-composite"
+                        ],
+                        "title": "Receiver Id"
+                      }
+                    },
+                    "required": [
+                      "message_id",
+                      "message_ts",
+                      "sender_id"
+                    ],
+                    "title": "QueryRequestHeader",
+                    "type": "object"
+                  },
+                  "message": {
+                    "properties": {
+                      "subject": {
+                        "description": "The person the query is about.",
+                        "properties": {
+                          "type": {
+                            "description": "Identifier type. One of the use case's `input.subject.id_types`, e.g. `FAYDA_FAN` (the Fayda FAN) or `FARMER_ID` (the Farmer Registry's farmer ID).",
+                            "examples": [
+                              "FAYDA_FAN"
+                            ],
+                            "title": "Type",
+                            "type": "string"
+                          },
+                          "value": {
+                            "description": "The identifier value.",
+                            "examples": [
+                              "123456789012"
+                            ],
+                            "title": "Value",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "type",
+                          "value"
+                        ],
+                        "title": "Subject",
+                        "type": "object"
+                      },
+                      "parameters": {
+                        "additionalProperties": true,
+                        "description": "Use-case parameters (see `input.parameters` of the use case). Unknown names are rejected.",
+                        "examples": [
+                          {
+                            "crop_year": 2019,
+                            "season": "SEASON_MEHER"
+                          }
+                        ],
+                        "title": "Parameters",
+                        "type": "object"
+                      },
+                      "consent_id": {
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "description": "The ID of a consent the subject gave, held by the Exchange's Consent Manager. Send this or `consent_jws`, not both; send neither to have the Consent Manager look the consent up. Needs the Composite's Exchange consent mode.",
+                        "examples": [
+                          "c0a8012e-5b7d-4f0e-9a43-2f1d6e7b9a10"
+                        ],
+                        "title": "Consent Id"
+                      },
+                      "consent_jws": {
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "description": "A consent the partner signed: a compact JWS whose claims name the subject, the purpose, a validity and one grant per registry with its data scopes. Send this or `consent_id`, not both. With neither (Exchange consent mode only), the Exchange's Consent Manager looks up the consent it holds from this partner for this subject and the use case's purpose (e.g. one collected in the partner portal).",
+                        "examples": [
+                          "eyJhbGciOiJFUzI1NiIsImtpZCI6ImJhbmstYS1rZXktMSJ9.eyJzdWJqZWN0X2lkIjp7fX0.c2ln"
+                        ],
+                        "title": "Consent Jws"
+                      }
+                    },
+                    "required": [
+                      "subject"
+                    ],
+                    "title": "QueryMessage",
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "signature",
+                  "header",
+                  "message"
+                ],
+                "title": "QueryRequest",
+                "type": "object"
+              },
+              "examples": {
+                "consent_lookup": {
+                  "summary": "No consent: the Exchange looks it up (e.g. collected in the partner portal)",
+                  "value": {
+                    "signature": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImJhbmstYS1rZXktMSJ9..<signature>",
+                    "header": {
+                      "version": "1.0.0",
+                      "message_id": "7f1c2a9e-3a51-4c0e-9d5b-0f6f3f2b1c11",
+                      "message_ts": "2026-10-01T10:00:00Z",
+                      "action": "query",
+                      "sender_id": "bank-a",
+                      "receiver_id": "agri-composite"
+                    },
+                    "message": {
+                      "subject": {
+                        "type": "FAYDA_FAN",
+                        "value": "123456789012"
+                      },
+                      "parameters": {
+                        "crop_year": 2019,
+                        "season": "SEASON_MEHER"
+                      }
+                    }
+                  }
+                },
+                "consent_id": {
+                  "summary": "Consent held by the Exchange (consent_id)",
+                  "value": {
+                    "signature": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImJhbmstYS1rZXktMSJ9..<signature>",
+                    "header": {
+                      "version": "1.0.0",
+                      "message_id": "7f1c2a9e-3a51-4c0e-9d5b-0f6f3f2b1c11",
+                      "message_ts": "2026-10-01T10:00:00Z",
+                      "action": "query",
+                      "sender_id": "bank-a",
+                      "receiver_id": "agri-composite"
+                    },
+                    "message": {
+                      "subject": {
+                        "type": "FAYDA_FAN",
+                        "value": "123456789012"
+                      },
+                      "parameters": {
+                        "crop_year": 2019,
+                        "season": "SEASON_MEHER"
+                      },
+                      "consent_id": "c0a8012e-5b7d-4f0e-9a43-2f1d6e7b9a10"
+                    }
+                  }
+                },
+                "consent_jws": {
+                  "summary": "Consent the partner signed (consent_jws), by farmer ID",
+                  "value": {
+                    "signature": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImJhbmstYS1rZXktMSJ9..<signature>",
+                    "header": {
+                      "version": "1.0.0",
+                      "message_id": "7f1c2a9e-3a51-4c0e-9d5b-0f6f3f2b1c11",
+                      "message_ts": "2026-10-01T10:00:00Z",
+                      "action": "query",
+                      "sender_id": "bank-a",
+                      "receiver_id": "agri-composite"
+                    },
+                    "message": {
+                      "subject": {
+                        "type": "FARMER_ID",
+                        "value": "FR-0007"
+                      },
+                      "parameters": {
+                        "crop_year": 2019
+                      },
+                      "consent_jws": "<compact JWS signed by the partner, with grants per registry>"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/.well-known/jwks.json": {
+      "get": {
+        "tags": [
+          "Keys"
+        ],
+        "summary": "The composite's public keys (JWKS)",
+        "description": "Public key(s) the composite signs with; empty `keys` when it has no signing key.",
+        "operationId": "get_jwks__well_known_jwks_json_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorListResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorListResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorListResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorListResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/composite/v1/admin/overview": {
+      "get": {
+        "tags": [
+          "Console (staff)"
+        ],
+        "summary": "Overview",
+        "description": "The Composite's settings (partner ID, consent mode, Partner Management URL, signing key ID), counts of use cases, registries and partners, and the last 24 hours of calls.\n\nStaff only: needs a console login (IAM session cookie or `Authorization: Bearer`) with the `composite:view` permission. Present only when the console is on (`console_enabled` and a database).",
+        "operationId": "overview_composite_v1_admin_overview_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No staff session (or it expired)."
+          },
+          "403": {
+            "description": "The staff user lacks the `composite:view` permission."
+          }
+        }
+      }
+    },
+    "/composite/v1/admin/use-cases": {
+      "get": {
+        "tags": [
+          "Console (staff)"
+        ],
+        "summary": "List use cases (console)",
+        "description": "Published use cases with the partners granted each in Partner Management (`granted_to`: PM partner IDs; null with `granted_to_error` when PM cannot be read) and file name, and the use-case files that failed to load (with the error).\n\nStaff only: needs a console login (IAM session cookie or `Authorization: Bearer`) with the `composite:view` permission. Present only when the console is on (`console_enabled` and a database).",
+        "operationId": "list_use_cases_composite_v1_admin_use_cases_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No staff session (or it expired)."
+          },
+          "403": {
+            "description": "The staff user lacks the `composite:view` permission."
+          }
+        }
+      }
+    },
+    "/composite/v1/admin/use-cases/{use_case}": {
+      "get": {
+        "tags": [
+          "Console (staff)"
+        ],
+        "summary": "Get a use case (console)",
+        "description": "One published use case (`name` or `name@major`) with the partners granted it in Partner Management, its response mapping, derived fields and the YAML file text.\n\nStaff only: needs a console login (IAM session cookie or `Authorization: Bearer`) with the `composite:view` permission. Present only when the console is on (`console_enabled` and a database).",
+        "operationId": "get_use_case_composite_v1_admin_use_cases__use_case__get",
+        "parameters": [
+          {
+            "name": "use_case",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Use Case"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No staff session (or it expired)."
+          },
+          "403": {
+            "description": "The staff user lacks the `composite:view` permission."
+          },
+          "400": {
+            "description": "`invalid_use_case`: the reference is malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (`unknown_use_case`, `unknown_registry`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/composite/v1/admin/registries": {
+      "get": {
+        "tags": [
+          "Console (staff)"
+        ],
+        "summary": "List registries",
+        "description": "The configured registries: search and catalogue URLs, Partner Management partner ID, whether the catalogue answered, the number of data scopes, and the use cases that query each.\n\nStaff only: needs a console login (IAM session cookie or `Authorization: Bearer`) with the `composite:view` permission. Present only when the console is on (`console_enabled` and a database).",
+        "operationId": "list_registries_composite_v1_admin_registries_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No staff session (or it expired)."
+          },
+          "403": {
+            "description": "The staff user lacks the `composite:view` permission."
+          }
+        }
+      }
+    },
+    "/composite/v1/admin/registries/{registry_id}/data-scopes": {
+      "get": {
+        "tags": [
+          "Console (staff)"
+        ],
+        "summary": "Get a registry's data scopes",
+        "description": "The registry's data scope catalogue (each scope's current version and fields) and the use-case sources that ask for each scope. Cached; `refresh=true` fetches it again.\n\nStaff only: needs a console login (IAM session cookie or `Authorization: Bearer`) with the `composite:view` permission. Present only when the console is on (`console_enabled` and a database).",
+        "operationId": "get_data_scopes_composite_v1_admin_registries__registry_id__data_scopes_get",
+        "parameters": [
+          {
+            "name": "registry_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Registry Id"
+            }
+          },
+          {
+            "name": "refresh",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Fetch the catalogue again instead of using the cache.",
+              "default": false,
+              "title": "Refresh"
+            },
+            "description": "Fetch the catalogue again instead of using the cache."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No staff session (or it expired)."
+          },
+          "403": {
+            "description": "The staff user lacks the `composite:view` permission."
+          },
+          "404": {
+            "description": "Not found (`unknown_use_case`, `unknown_registry`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/composite/v1/admin/partners": {
+      "get": {
+        "tags": [
+          "Console (staff)"
+        ],
+        "summary": "List partners",
+        "description": "Partners with a Partner Management policy for a published use case (one policy per use case): the use cases granted and the keys Partner Management serves for each (key ID and algorithm). `pm_error` is set when Partner Management cannot be read.\n\nStaff only: needs a console login (IAM session cookie or `Authorization: Bearer`) with the `composite:view` permission. Present only when the console is on (`console_enabled` and a database).",
+        "operationId": "list_partners_composite_v1_admin_partners_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No staff session (or it expired)."
+          },
+          "403": {
+            "description": "The staff user lacks the `composite:view` permission."
+          }
+        }
+      }
+    },
+    "/composite/v1/admin/activity": {
+      "get": {
+        "tags": [
+          "Console (staff)"
+        ],
+        "summary": "List calls",
+        "description": "The call log, newest first: use case, partner, HTTP status, outcome, reason, duration and per-source statuses. No request or response data is stored. `total` stops at 10000 (`total_capped` is then true). `partners`: the partner IDs in the log (for filtering).\n\nStaff only: needs a console login (IAM session cookie or `Authorization: Bearer`) with the `composite:view` permission. Present only when the console is on (`console_enabled` and a database).",
+        "operationId": "list_activity_composite_v1_admin_activity_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
+              "description": "Rows per page.",
+              "default": 50,
+              "title": "Limit"
+            },
+            "description": "Rows per page."
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Rows to skip.",
+              "default": 0,
+              "title": "Offset"
+            },
+            "description": "Rows to skip."
+          },
+          {
+            "name": "partner",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only this partner's calls.",
+              "title": "Partner"
+            },
+            "description": "Only this partner's calls."
+          },
+          {
+            "name": "use_case",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only calls to this use case (`name@major`).",
+              "title": "Use Case"
+            },
+            "description": "Only calls to this use case (`name@major`)."
+          },
+          {
+            "name": "outcome",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only `success`, `denied` or `failure`.",
+              "title": "Outcome"
+            },
+            "description": "Only `success`, `denied` or `failure`."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No staff session (or it expired)."
+          },
+          "403": {
+            "description": "The staff user lacks the `composite:view` permission."
+          },
+          "400": {
+            "description": "`invalid_outcome`: unknown `outcome` filter.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ping": {
+      "get": {
+        "tags": [
+          "ping"
+        ],
+        "summary": "Get Ping",
+        "description": "Returns \"pong\" always, if the service is healthy.\nThis can also used for service health checks.",
+        "operationId": "get_ping_ping_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorListResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorListResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorListResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorListResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ApiError": {
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ApiErrorBody"
+          }
+        },
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "title": "ApiError",
+        "description": "An unsigned error from a describe or console endpoint."
+      },
+      "ApiErrorBody": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "title": "Code",
+            "description": "Machine-readable error code.",
+            "examples": [
+              "unknown_use_case"
+            ]
+          },
+          "message": {
+            "type": "string",
+            "title": "Message",
+            "description": "What went wrong, for a person.",
+            "examples": [
+              "no published use case 'loan-profile@2'"
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "ApiErrorBody"
+      },
+      "ErrorListResponse": {
+        "properties": {
+          "errors": {
+            "items": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            },
+            "type": "array",
+            "title": "Errors"
+          }
+        },
+        "type": "object",
+        "required": [
+          "errors"
+        ],
+        "title": "ErrorListResponse"
+      },
+      "ErrorResponse": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "title": "Code",
+            "default": ""
+          },
+          "message": {
+            "type": "string",
+            "title": "Message",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "title": "ErrorResponse"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "ParameterSpec": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "title": "Type",
+            "description": "`string`, `integer`, `number` or `boolean`.",
+            "examples": [
+              "integer"
+            ]
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description",
+            "examples": [
+              "Crop year, e.g. 2019"
+            ]
+          },
+          "required": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Required",
+            "description": "The partner must send it."
+          },
+          "default": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default",
+            "description": "Used when the partner leaves it out."
+          },
+          "enum": {
+            "anyOf": [
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enum",
+            "description": "Allowed values."
+          },
+          "min": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Min"
+          },
+          "max": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "title": "ParameterSpec"
+      },
+      "QueryErrorMessage": {
+        "properties": {
+          "use_case": {
+            "type": "string",
+            "title": "Use Case",
+            "examples": [
+              "loan-profile@1"
+            ]
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "subject": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Subject"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "consent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Consent Id",
+            "description": "The consent the Exchange's Consent Manager decided on, when it got that far."
+          },
+          "sources": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/SourceStatus"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sources",
+            "description": "Per-source statuses, when the error is a failing source."
+          },
+          "error": {
+            "$ref": "#/components/schemas/ApiErrorBody"
+          }
+        },
+        "type": "object",
+        "required": [
+          "use_case",
+          "request_id",
+          "error"
+        ],
+        "title": "QueryErrorMessage"
+      },
+      "QueryErrorResponse": {
+        "properties": {
+          "signature": {
+            "type": "string",
+            "title": "Signature",
+            "description": "Detached JWS made with the Composite's key (empty only for `signing_unavailable`)."
+          },
+          "header": {
+            "$ref": "#/components/schemas/ResponseHeader"
+          },
+          "message": {
+            "$ref": "#/components/schemas/QueryErrorMessage"
+          }
+        },
+        "type": "object",
+        "required": [
+          "signature",
+          "header",
+          "message"
+        ],
+        "title": "QueryErrorResponse",
+        "description": "The signed error envelope (`header.status` is `rjct`)."
+      },
+      "QueryResponse": {
+        "properties": {
+          "signature": {
+            "type": "string",
+            "title": "Signature",
+            "description": "Detached JWS over the canonical JSON of `{header, message}`, made with the Composite's key. Verify it against the Composite's keys in Partner Management."
+          },
+          "header": {
+            "$ref": "#/components/schemas/ResponseHeader"
+          },
+          "message": {
+            "$ref": "#/components/schemas/QueryResultMessage"
+          }
+        },
+        "type": "object",
+        "required": [
+          "signature",
+          "header",
+          "message"
+        ],
+        "title": "QueryResponse",
+        "description": "The signed response envelope."
+      },
+      "QueryResultMessage": {
+        "properties": {
+          "use_case": {
+            "type": "string",
+            "title": "Use Case",
+            "examples": [
+              "loan-profile@1"
+            ]
+          },
+          "version": {
+            "type": "string",
+            "title": "Version",
+            "description": "The use case version that served the query.",
+            "examples": [
+              "1.0.0"
+            ]
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id",
+            "description": "The Composite's ID for this query (in its logs and audit events)."
+          },
+          "subject": {
+            "$ref": "#/components/schemas/Subject"
+          },
+          "consent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Consent Id",
+            "description": "The consent used, as the Exchange's Consent Manager named it (also a looked-up one).",
+            "examples": [
+              "c0a8012e-5b7d-4f0e-9a43-2f1d6e7b9a10"
+            ]
+          },
+          "sources": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/SourceStatus"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sources",
+            "description": "One status per source, when the use case has `source_status` on."
+          },
+          "data": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Data",
+            "description": "The use case's output fields. A field built from a failed source is null; an empty list or 0 means the registry has nothing."
+          }
+        },
+        "type": "object",
+        "required": [
+          "use_case",
+          "version",
+          "request_id",
+          "subject",
+          "data"
+        ],
+        "title": "QueryResultMessage"
+      },
+      "ResponseHeader": {
+        "properties": {
+          "version": {
+            "type": "string",
+            "title": "Version",
+            "default": "1.0.0",
+            "examples": [
+              "1.0.0"
+            ]
+          },
+          "message_id": {
+            "type": "string",
+            "title": "Message Id",
+            "description": "The Composite's ID for this response."
+          },
+          "message_ts": {
+            "type": "string",
+            "title": "Message Ts",
+            "examples": [
+              "2026-10-01T10:00:01.234Z"
+            ]
+          },
+          "action": {
+            "type": "string",
+            "title": "Action",
+            "default": "on-query",
+            "examples": [
+              "on-query"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "succ",
+              "rjct"
+            ],
+            "title": "Status",
+            "description": "`succ` on 200, `rjct` on an error."
+          },
+          "sender_id": {
+            "type": "string",
+            "title": "Sender Id",
+            "description": "The Composite's partner ID.",
+            "examples": [
+              "agri-composite"
+            ]
+          },
+          "receiver_id": {
+            "type": "string",
+            "title": "Receiver Id",
+            "description": "The partner's ID (the request's `sender_id`).",
+            "examples": [
+              "bank-a"
+            ]
+          },
+          "meta": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Meta",
+            "description": "`in_reply_to`: the request's `message_id`."
+          },
+          "status_reason_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status Reason Code",
+            "description": "On `rjct`: the error code."
+          },
+          "status_reason_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status Reason Message",
+            "description": "On `rjct`: the error message."
+          }
+        },
+        "type": "object",
+        "required": [
+          "message_id",
+          "message_ts",
+          "status",
+          "sender_id",
+          "receiver_id"
+        ],
+        "title": "ResponseHeader"
+      },
+      "SourceStatus": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "no_record",
+              "denied",
+              "unavailable",
+              "error"
+            ],
+            "title": "Status",
+            "description": "`ok`: records found. `no_record`: the registry has none for the subject. `denied`: the registry or the consent refused (or the consent does not grant the source's scopes). `unavailable`: timeout, HTTP 5xx/408/429, or not reachable. `error`: any other failure."
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail",
+            "description": "Why, when not `ok`."
+          }
+        },
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "title": "SourceStatus"
+      },
+      "Subject": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "title": "Type",
+            "description": "Identifier type. One of the use case's `input.subject.id_types`, e.g. `FAYDA_FAN` (the Fayda FAN) or `FARMER_ID` (the Farmer Registry's farmer ID).",
+            "examples": [
+              "FAYDA_FAN"
+            ]
+          },
+          "value": {
+            "type": "string",
+            "title": "Value",
+            "description": "The identifier value.",
+            "examples": [
+              "123456789012"
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "type",
+          "value"
+        ],
+        "title": "Subject",
+        "description": "The person the query is about."
+      },
+      "UseCaseDescription": {
+        "properties": {
+          "use_case": {
+            "type": "string",
+            "title": "Use Case",
+            "description": "Reference `name@major`.",
+            "examples": [
+              "loan-profile@1"
+            ]
+          },
+          "name": {
+            "type": "string",
+            "title": "Name",
+            "examples": [
+              "loan-profile"
+            ]
+          },
+          "version": {
+            "type": "string",
+            "title": "Version",
+            "examples": [
+              "1.0.0"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "title": "Status",
+            "examples": [
+              "published"
+            ]
+          },
+          "title": {
+            "type": "string",
+            "title": "Title",
+            "examples": [
+              "Farmer loan profile"
+            ]
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "policy": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Policy",
+            "examples": [
+              "credit-assessment"
+            ]
+          },
+          "purpose": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Purpose",
+            "description": "The consent's purpose code must match.",
+            "examples": [
+              "credit-assessment"
+            ]
+          },
+          "consent": {
+            "additionalProperties": {
+              "type": "boolean"
+            },
+            "type": "object",
+            "title": "Consent",
+            "description": "`required`: the query needs the subject's consent.",
+            "examples": [
+              {
+                "required": true
+              }
+            ]
+          },
+          "input": {
+            "$ref": "#/components/schemas/UseCaseInput"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/UseCaseSource"
+            },
+            "type": "array",
+            "title": "Sources"
+          },
+          "consent_grants_needed": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Consent Grants Needed",
+            "description": "Registries the consent must have a grant for.",
+            "examples": [
+              [
+                "crop-sown-registry",
+                "farmer-registry"
+              ]
+            ]
+          },
+          "consent_scopes": {
+            "additionalProperties": {
+              "additionalProperties": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "type": "object"
+            },
+            "type": "object",
+            "title": "Consent Scopes",
+            "description": "Per registry, the data scopes the consent's grant must (`required`) and may (`optional`) name.",
+            "examples": [
+              {
+                "farmer-registry": {
+                  "optional": [
+                    "farmer-registry.land_location"
+                  ],
+                  "required": [
+                    "farmer-registry.farmer_identifiers"
+                  ]
+                }
+              }
+            ]
+          },
+          "output_fields": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Output Fields",
+            "description": "Fields of the response's `data`, as dotted paths.",
+            "examples": [
+              [
+                "farmer.name",
+                "land.total_size"
+              ]
+            ]
+          },
+          "source_status": {
+            "type": "boolean",
+            "title": "Source Status",
+            "description": "The response carries `sources` (one status per source)."
+          },
+          "partial_response": {
+            "type": "string",
+            "title": "Partial Response",
+            "description": "`allowed`: a failing optional source still gives a 200; `denied`: any failing source fails the request."
+          },
+          "rate_per_partner": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rate Per Partner",
+            "description": "Per-partner rate limit.",
+            "examples": [
+              "60/min"
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "use_case",
+          "name",
+          "version",
+          "status",
+          "title",
+          "consent",
+          "input",
+          "sources",
+          "consent_grants_needed",
+          "consent_scopes",
+          "output_fields",
+          "source_status",
+          "partial_response"
+        ],
+        "title": "UseCaseDescription",
+        "description": "A published use case: what to send and what comes back. Configuration only."
+      },
+      "UseCaseInput": {
+        "properties": {
+          "subject": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": "object",
+            "title": "Subject",
+            "description": "`id_types`: the subject types this use case accepts.",
+            "examples": [
+              {
+                "id_types": [
+                  "FAYDA_FAN",
+                  "FARMER_ID"
+                ]
+              }
+            ]
+          },
+          "parameters": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ParameterSpec"
+            },
+            "type": "object",
+            "title": "Parameters",
+            "description": "Parameters the partner may send in `message.parameters`, by name."
+          },
+          "batch": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Batch",
+            "examples": [
+              {
+                "max_subjects": 1
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "subject",
+          "parameters",
+          "batch"
+        ],
+        "title": "UseCaseInput"
+      },
+      "UseCaseList": {
+        "properties": {
+          "use_cases": {
+            "items": {
+              "$ref": "#/components/schemas/UseCaseDescription"
+            },
+            "type": "array",
+            "title": "Use Cases"
+          }
+        },
+        "type": "object",
+        "required": [
+          "use_cases"
+        ],
+        "title": "UseCaseList"
+      },
+      "UseCaseSource": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id",
+            "description": "Source ID, used as the key in the response's `sources`.",
+            "examples": [
+              "farmer"
+            ]
+          },
+          "controller": {
+            "type": "string",
+            "title": "Controller",
+            "description": "The registry (data controller) it queries.",
+            "examples": [
+              "farmer-registry"
+            ]
+          },
+          "requirement": {
+            "type": "string",
+            "enum": [
+              "mandatory",
+              "optional"
+            ],
+            "title": "Requirement",
+            "description": "A failing mandatory source fails the request; a failing optional one leaves its fields null."
+          },
+          "depends_on": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Depends On",
+            "description": "Sources whose records this one needs first."
+          },
+          "scopes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Scopes",
+            "description": "Data scopes the consent must grant for this source."
+          },
+          "optional_scopes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Optional Scopes",
+            "description": "Data scopes the consent may grant; left out, their fields are null."
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "controller",
+          "requirement",
+          "depends_on",
+          "scopes",
+          "optional_scopes"
+        ],
+        "title": "UseCaseSource"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  },
+  "servers": [
+    {
+      "url": "https://{host}",
+      "description": "The Composite (paths start with /composite/v1)",
+      "variables": {
+        "host": {
+          "default": "composite.example.org",
+          "description": "The Composite's host name"
+        }
+      }
+    }
+  ]
+}

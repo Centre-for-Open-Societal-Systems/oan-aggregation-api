@@ -1,0 +1,23 @@
+{{- if .Values.composite.enabled }}
+{{- $values := .Values.composite -}}
+{{- $context := dict "Values" (merge (deepCopy $values) (dict "global" .Values.global)) "Chart" .Chart "Release" .Release "Files" .Files "Capabilities" .Capabilities -}}
+{{- with $context -}}
+{{- if and .Values.istio.enabled .Values.istio.gateway.enabled }}
+{{- $hostname := include "common.tplvalues.render" (dict "value" .Values.istio.virtualservice.host "context" $) }}
+apiVersion: networking.istio.io/v1alpha3
+kind: Gateway
+metadata:
+  name: {{ template "common.names.fullname" . }}
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+    - port:
+        number: 80
+        name: http
+        protocol: HTTP
+      hosts:
+        - {{ $hostname | quote }}
+{{- end }}
+{{- end -}}
+{{- end }}

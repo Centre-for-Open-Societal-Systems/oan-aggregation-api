@@ -1,0 +1,85 @@
+{{- if and .Values.composite.enabled .Values.sanity.enabled -}}
+{{- $s := .Values.sanity -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-sanity
+  labels: {{- include "common.labels.standard" (dict "customLabels" .Values.commonLabels "context" $) | nindent 4 }}
+    app.kubernetes.io/component: sanity
+  annotations:
+    # Runs on every install/upgrade (Install / Upgrade in Rancher).
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "5"
+    # Keep the finished pod so its logs stay viewable; replaced on the next run.
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: {{- include "common.labels.matchLabels" (dict "customLabels" .Values.podLabels "context" $) | nindent 8 }}
+        app.kubernetes.io/component: sanity
+    spec:
+      restartPolicy: Never
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: sanity
+          # The API image itself (Python + stdlib); no separate sanity image.
+          image: {{ include "common.images.image" (dict "imageRoot" .Values.composite.image "global" .Values.global) }}
+          imagePullPolicy: {{ .Values.composite.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources: {{- toYaml $s.resources | nindent 12 }}
+          env:
+            - name: SANITY_BASE_URL
+              value: {{ tpl $s.baseUrl $ | quote }}
+            - name: SANITY_READINESS_TIMEOUT
+              value: {{ $s.readinessTimeout | quote }}
+            - name: SANITY_FAIL_ON_ERROR
+              value: {{ $s.failOnError | quote }}
+          command: ["python3", "-c"]
+          args:
+            - |
+              import json, os, sys, time, urllib.request
+              base = os.environ["SANITY_BASE_URL"].rstrip("/")
+              deadline = time.time() + int(os.environ.get("SANITY_READINESS_TIMEOUT", "180"))
+              fail_on_error = os.environ.get("SANITY_FAIL_ON_ERROR", "true").lower() == "true"
+              def get(path):
+                  with urllib.request.urlopen(base + path, timeout=10) as r:
+                      return r.status, r.read()
+              failures, last = [], None
+              while True:
+                  try:
+                      status, _ = get("/ping")
+                      if status == 200:
+                          print("PASS ping")
+                          break
+                  except Exception as e:
+                      last = e
+                  if time.time() > deadline:
+                      failures.append(f"ping: service not ready ({last!r})")
+                      break
+                  time.sleep(3)
+              if not failures:
+                  try:
+                      status, body = get("/composite/v1/use-cases")
+                      use_cases = [u["use_case"] for u in json.loads(body)["use_cases"]]
+                      print(f"PASS list use cases: {use_cases}")
+                      if not use_cases:
+                          print("WARN no published use cases (check the use-case ConfigMap and the pod logs)")
+                  except Exception as e:
+                      failures.append(f"list use cases: {e!r}")
+              for f in failures:
+                  print("FAIL", f)
+              sys.exit(1 if failures and fail_on_error else 0)
+{{- end }}

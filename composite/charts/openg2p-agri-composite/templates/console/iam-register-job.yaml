@@ -1,0 +1,130 @@
+{{- /* Needs keycloakInit: its token uses the client secret keycloakInit creates. */ -}}
+{{- if and .Values.console.enabled .Values.console.iamRegister.enabled .Values.console.keycloakInit.enabled }}
+{{- $r := .Values.console.iamRegister -}}
+{{- $kc := .Values.console.keycloak -}}
+{{- $iamUrl := tpl .Values.console.iam.providerApiUrl $ -}}
+# Registers the console in IAM: pushes the application tile and its
+# permissions/roles catalog to the IAM staff portal API, authenticated with a
+# client-credentials token of the console's Keycloak client (keycloakInit).
+# Idempotent (IAM upserts by mnemonic). The token/register steps retry: the
+# Keycloak client may still be being created when this starts.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  # Revision suffix so upgrades create a fresh Job when this is a regular
+  # resource (Rancher skips Helm hooks; Job specs are immutable).
+  name: {{ printf "%s-console-iam-register-%v" .Release.Name .Release.Revision | trunc 63 | trimSuffix "-" }}
+  labels: {{- include "common.labels.standard" (dict "customLabels" .Values.commonLabels "context" $) | nindent 4 }}
+    app.kubernetes.io/component: console-iam-register
+  {{- if ne (toString $r.runAsHook) "false" }}
+  {{- with $r.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- end }}
+spec:
+  backoffLimit: {{ $r.backoffLimit | default 5 }}
+  ttlSecondsAfterFinished: {{ $r.ttlSecondsAfterFinished | default 600 }}
+  template:
+    metadata:
+      labels: {{- include "common.labels.matchLabels" (dict "customLabels" .Values.podLabels "context" $) | nindent 8 }}
+        app.kubernetes.io/component: console-iam-register
+    spec:
+      restartPolicy: OnFailure
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        - name: wait-for-iam
+          image: {{ printf "%s:%s" $r.image.repository (toString $r.image.tag) }}
+          imagePullPolicy: {{ $r.image.pullPolicy }}
+          command: ['sh', '-c']
+          args:
+            - |
+              echo "Waiting for IAM staff-portal API at ${IAM_BASE_URL}..."
+              until curl -sf --max-time 5 "${IAM_BASE_URL}/ping" >/dev/null 2>&1; do
+                echo "  waiting for iam-staff-portal-api..."; sleep 5
+              done
+              echo "  iam-staff-portal-api is ready."
+          env:
+            - name: IAM_BASE_URL
+              value: {{ $iamUrl | quote }}
+      containers:
+        - name: iam-register
+          image: {{ printf "%s:%s" $r.image.repository (toString $r.image.tag) }}
+          imagePullPolicy: {{ $r.image.pullPolicy }}
+          env:
+            - name: IAM_REGISTER_URL
+              value: {{ printf "%s/user-access/staff_portal_applications" $iamUrl | quote }}
+            - name: TOKEN_URL
+              value: {{ printf "%s/realms/%s/protocol/openid-connect/token" (tpl $kc.url $) (tpl $kc.realm $) | quote }}
+            - name: CLIENT_ID
+              value: {{ tpl .Values.console.iam.keycloakClientId $ | quote }}
+            - name: CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ tpl .Values.console.keycloakInit.clientSecretName $ | quote }}
+                  key: client_secret
+            - name: APP_MNEMONIC
+              value: {{ tpl $r.applicationMnemonic $ | quote }}
+            - name: APP_URL
+              value: {{ tpl $r.applicationUrl $ | quote }}
+            - name: APP_DESCRIPTION
+              value: {{ tpl ($r.applicationDescription | default "Agri Stack Composite") $ | quote }}
+            - name: TOKEN_MAX_ATTEMPTS
+              value: {{ $r.tokenMaxAttempts | default 30 | quote }}
+            - name: REGISTER_MAX_ATTEMPTS
+              value: {{ $r.registerMaxAttempts | default 10 | quote }}
+          command: ['sh', '-c']
+          args:
+            - |
+              set -eu
+              echo "Building registration payload for ${APP_MNEMONIC} -> ${APP_URL}"
+              sed -e "s|__APPLICATION_MNEMONIC__|${APP_MNEMONIC}|g" \
+                  -e "s|__APPLICATION_URL__|${APP_URL}|g" \
+                  -e "s|__APPLICATION_DESCRIPTION__|${APP_DESCRIPTION}|g" \
+                  /payload/payload.json > /tmp/body.json
+
+              echo "Requesting access token from ${TOKEN_URL}"
+              i=0
+              TOKEN=""
+              while [ "$i" -lt "${TOKEN_MAX_ATTEMPTS}" ]; do
+                RESP=$(curl -s --max-time 10 -X POST "${TOKEN_URL}" \
+                  -d grant_type=client_credentials \
+                  -d client_id="${CLIENT_ID}" \
+                  --data-urlencode client_secret="${CLIENT_SECRET}" || true)
+                TOKEN=$(printf '%s' "${RESP}" | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+                if [ -n "${TOKEN}" ]; then break; fi
+                echo "  token not ready (attempt ${i}); response: ${RESP}"
+                i=$((i+1)); sleep 5
+              done
+              if [ -z "${TOKEN}" ]; then
+                echo "ERROR: could not obtain access token"; exit 1
+              fi
+              echo "  got access token."
+
+              echo "Registering application with IAM at ${IAM_REGISTER_URL}"
+              i=0
+              while [ "$i" -lt "${REGISTER_MAX_ATTEMPTS}" ]; do
+                CODE=$(curl -s -o /tmp/out.json -w '%{http_code}' --max-time 30 \
+                  -X POST "${IAM_REGISTER_URL}" \
+                  -H "Authorization: Bearer ${TOKEN}" \
+                  -H "Content-Type: application/json" \
+                  --data @/tmp/body.json || true)
+                echo "  register HTTP ${CODE}: $(cat /tmp/out.json 2>/dev/null || true)"
+                case "${CODE}" in
+                  2*) echo "Registration succeeded."; exit 0 ;;
+                esac
+                i=$((i+1)); sleep 5
+              done
+              echo "ERROR: registration failed after ${REGISTER_MAX_ATTEMPTS} attempts"; exit 1
+          volumeMounts:
+            - name: payload
+              mountPath: /payload
+          {{- if $r.resources }}
+          resources: {{- include "common.tplvalues.render" (dict "value" $r.resources "context" $) | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: payload
+          configMap:
+            name: {{ .Release.Name }}-console-iam-register-payload
+{{- end }}

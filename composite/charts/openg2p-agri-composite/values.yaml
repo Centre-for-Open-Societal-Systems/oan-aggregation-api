@@ -1,0 +1,740 @@
+global:
+  namespace: "" # empty => the install namespace (.Release.Namespace)
+  # Domain every hostname sits under: <service>.<baseDomain>. Use the same
+  # value as the commons install (Base Domain). Rendered with tpl.
+  baseDomain: '{{ .Values.global.namespace | default .Release.Namespace }}.openg2p.org'
+
+  # Public hostname partners call (outside the cluster), through the Istio
+  # "internal" gateway like the registries' partner APIs.
+  compositeHostname: 'agri-composite.{{ tpl .Values.global.baseDomain $ }}'
+
+  # The composite's own Partner Management ID: header.sender_id towards the
+  # registries and in responses; partners send it as header.receiver_id.
+  compositePartnerId: agri-composite
+
+  # Partner Management partner-api (partner public keys), as the registries use it.
+  partnerManagementApiUrl: http://commons-services-pm-partner-api
+
+  # Audit Manager base URL (CloudEvents). Empty => auditing off.
+  auditManagerUrl: 'http://commons-services-auditmanager:80'
+
+  # ── Console (used only when console.enabled) ──────────────────────────────
+  # Public hostname of the staff console (Istio internal gateway).
+  consoleHostname: 'agri-composite-console.{{ tpl .Values.global.baseDomain $ }}'
+  # Public IAM staff API (the browser logs in through it), as commons serves it.
+  staffIamHostname: 'staff-iam.{{ tpl .Values.global.baseDomain $ }}'
+  # Parent domain of the staff login cookies, shared with the IAM staff API.
+  consoleCookieDomain: '.{{ tpl .Values.global.baseDomain $ }}'
+
+composite:
+  enabled: true
+  nameOverride: api
+  hostname: '{{ tpl .Values.global.compositeHostname $ }}'
+
+  replicaCount: 1
+  # Stateless pods: scale horizontally on CPU. Memory-based autoscaling is off on
+  # purpose (Python RSS does not shrink, so a memory HPA never scales back down).
+  # Use-case rate limits are counted across pods in Redis (rateLimit below).
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 5
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: null
+  updateStrategy:
+    type: RollingUpdate
+  serviceAccount:
+    create: false
+    name: ""
+
+  image:
+    repository: openg2p/openg2p-agri-composite-api
+    # Placeholder: CI injects the version at package time.
+    tag: "develop"
+    pullPolicy: Always
+
+  # gunicorn worker processes per pod (uvicorn workers; each keeps its own
+  # connection pool and key cache).
+  workers: 2
+
+  # The image runs as uid 1001 and writes nothing; the root filesystem is
+  # read-only with an emptyDir at /tmp (gunicorn's worker heartbeat).
+  podSecurityContext:
+    enabled: true
+    runAsNonRoot: true
+    runAsUser: 1001
+    runAsGroup: 1001
+    fsGroup: 1001
+    seccompProfile:
+      type: RuntimeDefault
+  containerSecurityContext:
+    enabled: true
+    runAsNonRoot: true
+    runAsUser: 1001
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: ["ALL"]
+
+  containerPort: 8000
+  service:
+    type: ClusterIP
+    port: 80
+    externalTrafficPolicy: Cluster
+
+  istio:
+    enabled: true
+    virtualservice:
+      enabled: true
+      host: '{{ tpl .Values.global.compositeHostname $ }}'
+      gateway: "internal"
+      # The API Service's name (common.names.fullname of composite.*), so release
+      # names containing "api" or "console" still route.
+      destination: '{{ include "agriComposite.apiServiceName" $ }}'
+      destinationPort: 80
+      # The internal API (/composite/v1/internal: consent templates, read in-cluster by the
+      # Exchange Consent Manager) is never routed here: that path answers 404 on this host.
+      prefix: /
+      rewriteUri: ""
+    gateway:
+      enabled: false
+
+  # ── Composite signing key ─────────────────────────────────────────────────
+  # generate: true (default) — the chart creates the Secret on first install
+  # with a generated EC P-256 key (pemKey) and a kid, and keeps it on upgrades
+  # and uninstall. The composite serves its public key at /.well-known/jwks.json;
+  # Partner Management reads it from there (bootstrapPartners), so nothing has
+  # to be registered by hand.
+  # Your own key instead: create the Secret before installing, with a .p12; the
+  # chart then leaves the Secret alone (a .p12 wins over a PEM key):
+  # kubectl -n <ns> create secret generic agri-composite-signing \
+  #   --from-file=composite.p12=./composite.p12 --from-literal=password='<p12 password>' \
+  #   --from-literal=kid=agri-composite-2026-01 --from-literal=algorithm=auto
+  # kid: label sent in the JWS header (blank → the certificate's SHA-256 thumbprint);
+  # it must match the kid Partner Management serves for the composite.
+  # algorithm: auto (from the key type: EC → ES256, Ed25519 → EdDSA, RSA → RS256).
+  signingKey:
+    generate: true
+    secretName: agri-composite-signing
+    pemKey: key.pem
+    p12Key: composite.p12
+    passwordKey: password
+    kidKey: kid
+    algorithmKey: algorithm
+    mountPath: /app/secrets
+
+  # ── Registries (data controllers): DCI sync search URL per controller ID ──
+  # Full URLs, set per install: a registry may run in another department's
+  # namespace or cluster. An empty URL makes that source fail.
+  # Partner Management has no registry endpoints yet, so they are set here.
+  # partnerId (optional): the registry's PM partner ID — when set, the
+  # registry's response signature is verified against its PM key.
+  registries:
+    farmer-registry:
+      url: ""
+      partnerId: ""
+    crop-sown-registry:
+      url: ""
+      partnerId: ""
+
+  # ── Consent mode ─────────────────────────────────────────────────────────
+  # exchange (default; Agri Stack exchange install): the composite first
+  # validates the consent at the exchange Consent Manager, which issues one
+  # signed, short-lived consent token per registry and query; each registry
+  # gets its own token.
+  # passthrough (a single install): the partner's consent JWS goes to each
+  # registry unchanged; each registry validates it with its own Consent Manager.
+  # The composite's partner ID must be a token presenter at that CM, and each
+  # department CM must trust the exchange CM as a token issuer.
+  consent:
+    # exchange (default): the partner's consent is checked at the exchange Consent
+    # Manager, which gives each registry its own consent token (Agri Stack
+    # exchange install). passthrough: the partner's consent goes to each registry
+    # unchanged, so every registry's Partner Management needs a scope policy for every
+    # partner (a single install where the registries share the composite's commons).
+    # Either way, a partner calls a use case only when it has a policy for that use
+    # case (name@major) in the Composite's Partner Management.
+    mode: exchange
+    # Exchange Consent Manager partner-api base URL (/consent/v1/validate is
+    # appended): the CM of the composite's own namespace. Used only when mode is exchange.
+    exchangeCmUrl: http://commons-services-cm-partner-api
+    exchangeCmTimeoutSeconds: 5
+
+  # ── Use cases: name → YAML (one use case per entry) ─────────────────────
+  # Edit in Rancher's "Edit YAML" values view. Rendered into a ConfigMap
+  # mounted at useCasesMountPath; pods reload changed files every
+  # useCasesReloadSeconds without a restart. Set existingUseCasesConfigMap to
+  # mount your own ConfigMap instead (keys = <name>.yaml).
+  # Browser origins allowed to call the composite's APIs (comma-separated, templated):
+  # None by default: no browser calls the Composite (the Consent Manager reads
+  # consent templates in-cluster). Empty: none (no CORS headers).
+  corsAllowOrigins: ''
+  existingUseCasesConfigMap: ""
+  useCasesMountPath: /app/config/use-cases
+  useCasesReloadSeconds: 30
+  useCases:
+    # Kept identical to composite/use-cases/loan-profile.yaml (a test checks it).
+    loan-profile: |
+      # Sample use case: a farmer's profile for a loan decision.
+      #
+      # Farmer Registry: who the farmer is, their land and declared main crops.
+      # Crop Sown Registry: what they sowed — crop seasons (one per plot and crop) and
+      # season summaries — filtered on crop_year / season when given.
+      #
+      # The Crop Sown Registry knows the farmer by farmer ID, so both crop sources
+      # depend on the farmer source and read FARMER_ID from its record (or use the
+      # subject itself when the partner sends a FARMER_ID).
+      #
+      # Each source names the registry's data scopes it uses (IDs <registry>.<name>, from
+      # the registry's catalogue, signed POST /partner/data_scopes): the partner's consent
+      # must grant every one of `scopes` (else: a mandatory source fails the request, an
+      # optional one is not called) and may grant `optional_scopes` (left out: their
+      # fields come back null). The composite asks for no other scope. GET the use case
+      # for the per-registry list (consent_scopes). farmer-registry.farmer_identifiers is
+      # required: the farmer ID the crop sources query by is read from it.
+      #
+      # Template note: keep a space between consecutive braces ("} }", "{ {") so
+      # literal JSON never reads as a Jinja "{{ … }}".
+      #
+      # Who may call it is not set here: a partner needs a policy for it in Partner
+      # Management (use_case: loan-profile@1; one policy per use case).
+
+      use_case: loan-profile
+      version: 1.0.0
+      status: published
+      title: Farmer loan profile
+      description: >-
+        Identity, location, land and declared crops from the Farmer Registry, and crop
+        seasons and season summaries from the Crop Sown Registry, for a loan decision.
+        Pass crop_year and season to get one season (the total area sown is then that
+        season's); without them, all of the farmer's seasons come back, newest first.
+
+      policy: credit-assessment
+      purpose: credit-assessment
+      consent:
+        required: true
+
+      input:
+        subject:
+          id_types: [FAYDA_FAN, FARMER_ID]
+        parameters:
+          crop_year:
+            type: integer
+            description: Crop year, e.g. 2019 (Ethiopian calendar year the season belongs to)
+            min: 1990
+            max: 2100
+          season:
+            type: string
+            description: Season code
+            enum: [SEASON_MEHER, SEASON_BELG, SEASON_IRRIGATION]
+        batch: { max_subjects: 1 }
+
+      sources:
+        - id: farmer
+          controller: farmer-registry
+          requirement: mandatory
+          scopes: [farmer-registry.farmer_identifiers, farmer-registry.personal_details,
+                   farmer-registry.land, farmer-registry.main_crops]
+          optional_scopes: [farmer-registry.household_location, farmer-registry.land_location]
+          dci:
+            reg_type: Farmer
+            reg_record_type: spdci-extensions-dci:Farmer
+            query_template: |
+              {%- set field = 'foundational_id' if subject.type == 'FAYDA_FAN' else 'functional_record_id' -%}
+              {"query_type": "expression",
+               "query": {"type": "expression",
+                         "value": {"expression": {"query": {"{{ field }}": {"$eq": {{ subject.value | tojson }} } } } } },
+               "pagination": {"page_size": 1, "page_number": 1} }
+          timeout_ms: 10000
+          retries: 0
+
+        - id: season_summaries
+          controller: crop-sown-registry
+          requirement: optional
+          depends_on: [farmer]
+          scopes: [crop-sown-registry.farmer_reference, crop-sown-registry.crop_season,
+                   crop-sown-registry.measures]
+          optional_scopes: [crop-sown-registry.location]
+          dci:
+            reg_type: CropSown
+            reg_record_type: spdci-extensions-agri:ActivityAggregate
+            query_template: |
+              {%- set ns = namespace(fid=none) -%}
+              {%- if subject.type == 'FARMER_ID' -%}{%- set ns.fid = subject.value -%}{%- endif -%}
+              {%- for rec in sources.farmer.records -%}
+                {%- for ident in rec.farmer_personal_details.member_identifier or [] -%}
+                  {%- if ns.fid is none and ident.identifier_type == 'FARMER_ID' and ident.identifier_value -%}
+                    {%- set ns.fid = ident.identifier_value -%}
+                  {%- endif -%}
+                {%- endfor -%}
+              {%- endfor -%}
+              {"query_type": "expression",
+               "query": {"type": "expression",
+                         "value": {"expression": {"query": {
+                           "subject_id": {{ ns.fid | tojson }},
+                           "aggregate_type": "FARMER_SEASON_SUMMARY"
+                           {%- if parameters.crop_year is not none %}, "crop_year": {{ parameters.crop_year | tojson }}{% endif %}
+                           {%- if parameters.season %}, "season": {{ parameters.season | tojson }}{% endif %} } } } },
+               "pagination": {"page_size": 20, "page_number": 1} }
+          timeout_ms: 10000
+          retries: 0
+
+        - id: crop_seasons
+          controller: crop-sown-registry
+          requirement: optional
+          depends_on: [farmer]
+          scopes: [crop-sown-registry.farmer_reference, crop-sown-registry.crop_season,
+                   crop-sown-registry.measures]
+          optional_scopes: [crop-sown-registry.location]
+          dci:
+            reg_type: CropSown
+            reg_record_type: spdci-extensions-agri:CropSeason
+            query_template: |
+              {%- set ns = namespace(fid=none) -%}
+              {%- if subject.type == 'FARMER_ID' -%}{%- set ns.fid = subject.value -%}{%- endif -%}
+              {%- for rec in sources.farmer.records -%}
+                {%- for ident in rec.farmer_personal_details.member_identifier or [] -%}
+                  {%- if ns.fid is none and ident.identifier_type == 'FARMER_ID' and ident.identifier_value -%}
+                    {%- set ns.fid = ident.identifier_value -%}
+                  {%- endif -%}
+                {%- endfor -%}
+              {%- endfor -%}
+              {"query_type": "expression",
+               "query": {"type": "expression",
+                         "value": {"expression": {"query": {
+                           "subject_id": {{ ns.fid | tojson }}
+                           {%- if parameters.crop_year is not none %}, "crop_year": {{ parameters.crop_year | tojson }}{% endif %}
+                           {%- if parameters.season %}, "season": {{ parameters.season | tojson }}{% endif %} } } } },
+               "pagination": {"page_size": 100, "page_number": 1} }
+          timeout_ms: 10000
+          retries: 0
+
+      response:
+        # JSONPath over {subject, parameters, sources: {<id>: {status, records: [...]}}}.
+        mapping:
+          farmer.name:        "$.sources.farmer.records[0].farmer_personal_details.demographic_info.name"
+          farmer.sex:         "$.sources.farmer.records[0].farmer_personal_details.demographic_info.sex"
+          farmer.birth_date:  "$.sources.farmer.records[0].farmer_personal_details.demographic_info.birth_date"
+          farmer.identifiers: "$.sources.farmer.records[0].farmer_personal_details.member_identifier"
+          farmer.location:    "$.sources.farmer.records[0].family_details.place"
+          farmer.main_crops:  "$.sources.farmer.records[0].main_crops"
+          land.parcels:       "$.sources.farmer.records[0].farm_details"
+          crops.seasons:      "$.sources.crop_seasons.records"
+          crops.season_summaries: "$.sources.season_summaries.records"
+        # Functions: sum, count, min, max, first, round. The output so far is at $.data.
+        derived:
+          land.parcel_count: "count($.sources.farmer.records[0].farm_details)"
+          # Sum of each parcel's land_size, in the parcels' unit (farm_details[].measurement).
+          land.total_size:   "round(sum($.sources.farmer.records[0].farm_details[*].land_size), 4)"
+          crops.total_area_sown_ha: "round(sum($.sources.crop_seasons.records[*].measures.area_sown_ha), 4)"
+        source_status: true
+
+      execution:
+        overall_timeout_ms: 25000
+        partial_response: allowed   # a failing mandatory source (farmer) fails the request
+
+      limits:
+        rate_per_partner: 60/min
+
+  # ── Rate limit per partner and use case (limits.rate_per_partner) ────────
+  # Token buckets in Redis, shared by every pod and worker. Empty url → each
+  # worker process counts on its own. While Redis is unreachable each worker
+  # counts on its own (a warning is logged; partner calls never fail for it).
+  # The commons Redis has no password; for one with auth set passwordSecret.
+  rateLimit:
+    redis:
+      url: 'redis://commons-redis-master:6379/0'
+      # Keys <prefix><partner>:<use case>; the release name keeps installs apart.
+      keyPrefix: '{{ .Release.Name }}:ratelimit:'
+      passwordSecret:
+        name: ""
+        key: redis-password
+      timeoutSeconds: 0.25
+      # After a Redis failure, count locally this long before trying Redis again.
+      retrySeconds: 10
+
+  envVars:
+    AGRI_COMPOSITE_APP_PORT: '{{ .Values.containerPort }}'
+    AGRI_COMPOSITE_NO_OF_WORKERS: '{{ .Values.workers }}'
+    AGRI_COMPOSITE_COMPOSITE_PARTNER_ID: '{{ tpl .Values.global.compositePartnerId $ }}'
+    AGRI_COMPOSITE_PARTNER_MGMT_API_URL: '{{ tpl .Values.global.partnerManagementApiUrl $ }}'
+    AGRI_COMPOSITE_AUDIT_MANAGER_URL: '{{ tpl .Values.global.auditManagerUrl $ }}'
+    AGRI_COMPOSITE_USE_CASES_DIR: '{{ .Values.useCasesMountPath }}'
+    AGRI_COMPOSITE_USE_CASES_RELOAD_SECONDS: '{{ .Values.useCasesReloadSeconds }}'
+    AGRI_COMPOSITE_SIGNING_P12_PATH: '{{ .Values.signingKey.mountPath }}/{{ .Values.signingKey.p12Key }}'
+    AGRI_COMPOSITE_SIGNING_KEY_PEM_PATH: '{{ .Values.signingKey.mountPath }}/{{ .Values.signingKey.pemKey }}'
+    AGRI_COMPOSITE_LOGGING_LEVEL: INFO
+    # Browser origins allowed to call the composite (e.g. the Consent Manager's partner
+    # portal reading the public use-case list). Rendered as a JSON list (the setting is a
+    # list, and an empty or plain-text value stops the API at start); [] = no CORS.
+    AGRI_COMPOSITE_CORS_ALLOW_ORIGINS: '{{ include "agriComposite.corsOriginsJson" $ }}'
+    AGRI_COMPOSITE_CONSENT_MODE: '{{ .Values.consent.mode | default "exchange" }}'
+    AGRI_COMPOSITE_CONSENT_EXCHANGE_CM_URL: '{{ tpl (.Values.consent.exchangeCmUrl | default "") $ }}'
+    AGRI_COMPOSITE_CONSENT_EXCHANGE_CM_TIMEOUT_SECONDS: '{{ .Values.consent.exchangeCmTimeoutSeconds | default 5 }}'
+    # Partner request freshness window (header.message_ts), seconds.
+    AGRI_COMPOSITE_REQUEST_MAX_SKEW_SECONDS: "300"
+    # Outbound connection pool per worker.
+    AGRI_COMPOSITE_HTTP_MAX_CONNECTIONS: "200"
+    AGRI_COMPOSITE_HTTP_MAX_KEEPALIVE_CONNECTIONS: "50"
+    # Partner key cache (PM): soft TTL, last-known-good during a PM outage.
+    AGRI_COMPOSITE_PARTNER_KEY_CACHE_TTL_SECONDS: "300"
+    AGRI_COMPOSITE_PARTNER_KEY_HARD_TTL_SECONDS: "21600"
+    # Partner use-case grants (one PM policy per partner and use case), cached per pod: soft TTL (also
+    # bounded by PM's Cache-Control; how long a revoked grant may still work), last
+    # answer kept during a PM outage (hard TTL, then 503), "no grant" cached (negative TTL).
+    AGRI_COMPOSITE_PARTNER_POLICY_CACHE_TTL_SECONDS: "60"
+    AGRI_COMPOSITE_PARTNER_POLICY_HARD_TTL_SECONDS: "21600"
+    AGRI_COMPOSITE_PARTNER_POLICY_NEGATIVE_TTL_SECONDS: "30"
+
+  envVarsFrom:
+    AGRI_COMPOSITE_SIGNING_P12_PASSWORD:
+      secretKeyRef:
+        name: '{{ .Values.signingKey.secretName }}'
+        key: '{{ .Values.signingKey.passwordKey }}'
+        optional: true
+    AGRI_COMPOSITE_SIGNING_KID:
+      secretKeyRef:
+        name: '{{ .Values.signingKey.secretName }}'
+        key: '{{ .Values.signingKey.kidKey }}'
+        optional: true
+    AGRI_COMPOSITE_SIGNING_ALGORITHM:
+      secretKeyRef:
+        name: '{{ .Values.signingKey.secretName }}'
+        key: '{{ .Values.signingKey.algorithmKey }}'
+        optional: true
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 192Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+
+  startupProbe:
+    enabled: true
+    httpGet:
+      path: /ping
+      port: http
+    periodSeconds: 5
+    timeoutSeconds: 5
+    failureThreshold: 30
+  livenessProbe:
+    enabled: true
+    httpGet:
+      path: /ping
+      port: http
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 6
+  readinessProbe:
+    enabled: true
+    httpGet:
+      path: /ping
+      port: http
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 6
+
+# ── Edge rate limit at the Istio ingress gateway ──────────────────────────
+# A local (per gateway pod) token bucket on the Composite's partner API route,
+# before any request reaches a pod: protects the service from floods, whoever
+# sends them. Not per partner (partners sign inside the request body; the
+# gateway cannot tell them apart); that is the Composite's own limit.
+# The EnvoyFilter is created in gatewayNamespace (istio-system): the installing
+# user needs create/update/delete on envoyfilters.networking.istio.io there.
+edgeRateLimit:
+  # Off by default: it creates an EnvoyFilter in the gateway's namespace
+  # (istio-system), which a user limited to their own namespace cannot create.
+  enabled: false
+  # Requests allowed per interval, per gateway pod (2 gateway pods → up to 2×).
+  requests: 120
+  # Refill interval: <n>s, <n>m or <n>h.
+  per: 1m
+  # Only this path is limited (the use-case API); empty → the whole hostname.
+  pathPrefix: /composite/v1/use-cases
+  gatewayNamespace: istio-system
+  gatewaySelector:
+    istio: ingressgateway
+
+# ── Console (read-only staff console) ───────────────────────────────────────
+# On by default; console.enabled: false turns it off (nothing below is rendered
+# and the API serves the partner API only: no database, no IAM). On:
+#   - the API gets the admin API (/composite/v1/admin) with IAM staff login and
+#     a Postgres database for its call log (AGRI_COMPOSITE_CONSOLE_* / DB_* /
+#     AUTH_* env, see agriComposite.consoleApiEnv in _helpers.tpl);
+#   - the console UI (Next.js) is deployed at global.consoleHostname;
+#   - a Job creates the database and its user in the shared commons Postgres
+#     (password kept in the db.secretName Secret, generated once);
+#   - a Job creates the Keycloak client (keycloakInit) and another registers the
+#     console in IAM (iamRegister) so admins can grant its roles there.
+console:
+  enabled: true
+
+  # ── IAM (staff login; same iam-core settings as Master Data's API) ────────
+  iam:
+    # IAM staff portal API inside the cluster (login, permission resolution).
+    providerApiUrl: http://commons-services-iam-staff-portal-api
+    # The same API as the browser reaches it (console UI login).
+    publicUrl: 'https://{{ tpl .Values.global.staffIamHostname $ }}'
+    # Redis of the IAM staff portal API (refresh-token / login transaction store).
+    redisUrl: redis://commons-redis-master:6379/0
+    transactionStoreBackend: redis
+    # Keycloak client of the console in the staff realm. Also its IAM
+    # application mnemonic (IAM requires the two to match).
+    keycloakClientId: agri-composite
+    # IAM login provider the console UI offers (IAM's login_providers id).
+    loginProviderId: "1"
+    cookieDomain: '{{ tpl .Values.global.consoleCookieDomain $ }}'
+    # Double-submit CSRF on state-changing admin requests.
+    csrfEnabled: true
+
+  # Links shown in the console.
+  pmPortalUrl: 'https://partner-management.{{ tpl .Values.global.baseDomain $ }}'
+  cmPortalUrl: 'https://consent-manager.{{ tpl .Values.global.baseDomain $ }}'
+  # Call log rows older than this are deleted (0 keeps everything).
+  activityRetentionDays: 90
+  # Registry data scope catalogues are cached this long (seconds).
+  catalogueCacheSeconds: 300
+  # Extra API env when the console is on (templated literals), e.g. DB pool sizes.
+  apiEnvVars: {}
+  #   AGRI_COMPOSITE_DB_POOL_SIZE: "5"
+
+  # ── Database (the console's call log) in the shared commons Postgres ──────
+  db:
+    driver: postgresql+asyncpg
+    hostname: commons-postgresql
+    port: 5432
+    dbname: agri_composite
+    user: agri_composite_user
+    # Secret holding the user's password (key passwordKey).
+    secretName: agri-composite-db
+    passwordKey: agri-composite-db-user
+    # true: the chart creates the Secret with a random password once and keeps
+    # it (also across uninstall). false: create it yourself before installing.
+    createSecret: true
+    # API pods wait (init container) up to timeoutSeconds until they can log in
+    # to the database, so the console finds it on first install. On timeout the
+    # pod starts anyway (the partner API never waits on the console's database).
+    waitForDb:
+      enabled: true
+      timeoutSeconds: 180
+      image:
+        # Any image with sh and psql; the command is set explicitly (this one's
+        # entrypoint is its init script). Same image as pgInit.
+        repository: openg2p/postgres-init
+        tag: "1.2.0"
+        pullPolicy: IfNotPresent
+    # Job (regular resource, every install/upgrade) creating the database and
+    # user with the Postgres superuser; idempotent (re-syncs the password).
+    pgInit:
+      enabled: true
+      # The postgres-init image, fed the same env as the postgres-init chart.
+      image:
+        repository: openg2p/postgres-init
+        tag: "1.2.0"
+        pullPolicy: IfNotPresent
+      adminUser: postgres
+      adminSecret: commons-postgresql
+      adminSecretPasswordKey: postgres-password
+      extensions: []
+      backoffLimit: 4
+      ttlSecondsAfterFinished: 600
+
+  # ── Keycloak (commons) ─────────────────────────────────────────────────────
+  keycloak:
+    # In-cluster Keycloak URL (admin API for keycloakInit; token for iamRegister).
+    url: http://commons-keycloak:80
+    realm: staff
+    adminUser: admin
+    adminSecret: commons-keycloak
+    adminSecretPasswordKey: admin-password
+
+  # Job (regular resource) creating the console's confidential Keycloak client
+  # (iam.keycloakClientId) with the client roles below, and its client secret
+  # Secret (generated once, kept). Idempotent. Same image as keycloak-init.
+  keycloakInit:
+    enabled: true
+    # The keycloak-init image (as the keycloak-init chart runs it: INPUT_FILE
+    # clients.yaml, client secret under /secrets/<clientId>).
+    image:
+      repository: openg2p/keycloak-init
+      tag: "1.2.0"
+      pullPolicy: IfNotPresent
+    clientName: Agri Stack Composite Console
+    # Secret with key client_secret (used by iamRegister). When keycloakInit is
+    # off, iamRegister is not rendered either (it needs this client secret).
+    clientSecretName: '{{ tpl .Values.console.iam.keycloakClientId $ }}-keycloak-client'
+    # Must match the role mnemonics in files/iam-registration/payload.json.
+    clientRoles:
+      - AGRI_COMPOSITE_ADMIN
+      - AGRI_COMPOSITE_VIEWER
+    # Existing staff-realm users given AGRI_COMPOSITE_ADMIN (commons creates admin).
+    adminUsers:
+      - admin
+    backoffLimit: 3
+    ttlSecondsAfterFinished: 600
+
+  # ── IAM registration (application tile + permissions + roles) ─────────────
+  # Pushes files/iam-registration/payload.json to the IAM staff portal API.
+  # Rendered only with keycloakInit.enabled (its token uses that client secret).
+  iamRegister:
+    enabled: true
+    # true: run as a Helm post-install/post-upgrade hook (standalone installs).
+    # false: run as a regular resource -- set this in umbrella charts / helmfiles,
+    # where one failing hook stops every later hook and Rancher may skip hooks.
+    # The Job name carries the release revision either way.
+    runAsHook: true
+    applicationMnemonic: '{{ tpl .Values.console.iam.keycloakClientId $ }}'
+    applicationUrl: 'https://{{ tpl .Values.global.consoleHostname $ }}'
+    applicationDescription: "Agri Stack Composite"
+    image:
+      repository: curlimages/curl
+      tag: "8.11.1"
+      pullPolicy: IfNotPresent
+    backoffLimit: 5
+    tokenMaxAttempts: 30
+    registerMaxAttempts: 10
+    ttlSecondsAfterFinished: 600
+    # Hook objects are deleted once they succeed (hook-succeeded), so none is
+    # left behind to collide with the regular Job/ConfigMap of the same name
+    # when runAsHook is later switched to false (Helm refuses to adopt an object
+    # it does not own, and the upgrade fails).
+    annotations:
+      "helm.sh/hook": post-install,post-upgrade
+      "helm.sh/hook-weight": "20"
+      "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    payloadAnnotations:
+      "helm.sh/hook": post-install,post-upgrade
+      "helm.sh/hook-weight": "19"
+      "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    resources:
+      requests:
+        cpu: 25m
+        memory: 64Mi
+      limits:
+        memory: 128Mi
+
+  # ── Console UI (Next.js standalone) ───────────────────────────────────────
+  ui:
+    nameOverride: console
+    hostname: '{{ tpl .Values.global.consoleHostname $ }}'
+
+    replicaCount: 1
+    autoscaling:
+      enabled: false
+      minReplicas: 1
+      maxReplicas: 3
+      targetCPUUtilizationPercentage: 80
+      targetMemoryUtilizationPercentage: null
+    updateStrategy:
+      type: RollingUpdate
+    serviceAccount:
+      create: false
+      name: ""
+
+    image:
+      repository: openg2p/openg2p-agri-composite-ui
+      # Placeholder: CI injects the version at package time.
+      tag: "develop"
+      pullPolicy: Always
+
+    # The image runs as uid 1001 (nextjs); the root filesystem is read-only with
+    # emptyDirs at /tmp and /app/.next/cache (Next.js runtime cache).
+    podSecurityContext:
+      enabled: true
+      runAsNonRoot: true
+      runAsUser: 1001
+      runAsGroup: 1001
+      fsGroup: 1001
+      seccompProfile:
+        type: RuntimeDefault
+    containerSecurityContext:
+      enabled: true
+      runAsNonRoot: true
+      runAsUser: 1001
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop: ["ALL"]
+
+    containerPort: 3000
+    service:
+      type: ClusterIP
+      port: 80
+      externalTrafficPolicy: Cluster
+
+    istio:
+      enabled: true
+      virtualservice:
+        enabled: true
+        host: '{{ tpl .Values.global.consoleHostname $ }}'
+        gateway: "internal"
+        # The console UI Service's name (common.names.fullname of console.ui.*).
+        destination: '{{ include "agriComposite.consoleServiceName" $ }}'
+        destinationPort: 80
+        prefix: /
+        rewriteUri: ""
+      gateway:
+        enabled: false
+
+    envVars:
+      # The composite API service in this release (server-side proxy target).
+      BACKEND_URL: 'http://{{ include "agriComposite.apiServiceName" $ }}'
+      IAM_URL: '{{ tpl .Values.console.iam.publicUrl $ }}'
+      LOGIN_PROVIDER_ID: '{{ .Values.console.iam.loginProviderId }}'
+      APPLICATION_MNEMONIC: '{{ tpl .Values.console.iam.keycloakClientId $ }}'
+      COOKIE_DOMAIN: '{{ tpl .Values.console.iam.cookieDomain $ }}'
+      DEFAULT_LOCALE: en
+      NODE_ENV: production
+    envVarsFrom: {}
+
+    resources:
+      requests:
+        cpu: 50m
+        memory: 192Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+    startupProbe:
+      enabled: true
+      httpGet:
+        path: /
+        port: http
+      periodSeconds: 5
+      timeoutSeconds: 5
+      failureThreshold: 30
+    livenessProbe:
+      enabled: true
+      httpGet:
+        path: /
+        port: http
+      periodSeconds: 30
+      timeoutSeconds: 5
+      failureThreshold: 6
+    readinessProbe:
+      enabled: true
+      httpGet:
+        path: /
+        port: http
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 6
+
+# ── Sanity (post-install / post-upgrade hook) ───────────────────────────────
+# Pings the API and lists the published use cases, using the API image itself
+# (no separate sanity image). Creates no data. A failure fails the release;
+# failOnError: false (values only) makes it report-only.
+sanity:
+  enabled: true
+  baseUrl: 'http://{{ include "agriComposite.apiServiceName" $ }}'
+  readinessTimeout: 180
+  failOnError: true
+  resources:
+    requests:
+      cpu: 20m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi

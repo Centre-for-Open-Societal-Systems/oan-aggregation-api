@@ -1,0 +1,91 @@
+{{- if .Values.composite.enabled }}
+{{- $values := .Values.composite -}}
+{{- $context := dict "Values" (merge (deepCopy $values) (dict "global" .Values.global)) "Chart" .Chart "Release" .Release "Files" .Files "Capabilities" .Capabilities -}}
+{{- with $context -}}
+apiVersion: {{ include "common.capabilities.deployment.apiVersion" . }}
+kind: Deployment
+metadata:
+  name: {{ include "common.names.fullname" . }}
+  labels: {{- include "common.labels.standard" (dict "customLabels" .Values.commonLabels "context" $) | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  {{- if .Values.updateStrategy }}
+  strategy: {{- include "common.tplvalues.render" (dict "value" .Values.updateStrategy "context" $) | nindent 4 }}
+  {{- end }}
+  selector:
+    matchLabels: {{- include "common.labels.matchLabels" (dict "customLabels" .Values.podLabels "context" $) | nindent 6 }}
+      app.kubernetes.io/component: agri-composite-{{ .Values.nameOverride }}
+  template:
+    metadata:
+      labels: {{- include "common.labels.standard" (dict "customLabels" .Values.podLabels "context" $) | nindent 8 }}
+        app.kubernetes.io/component: agri-composite-{{ .Values.nameOverride }}
+    spec:
+      serviceAccountName: {{ include "agriComposite.serviceAccountName" . }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if and .Values.podSecurityContext .Values.podSecurityContext.enabled }}
+      securityContext: {{- include "common.tplvalues.render" (dict "value" (omit .Values.podSecurityContext "enabled") "context" $) | nindent 8 }}
+      {{- end }}
+      {{- if and $.Values.console.enabled $.Values.console.db.waitForDb.enabled }}
+      initContainers: {{- include "agriComposite.consoleWaitForDb" (dict "root" $ "securityContext" (and .Values.containerSecurityContext .Values.containerSecurityContext.enabled (omit .Values.containerSecurityContext "enabled"))) | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ include "common.names.name" . }}
+          image: {{ include "common.images.image" (dict "imageRoot" .Values.image "global" .Values.global) }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if and .Values.containerSecurityContext .Values.containerSecurityContext.enabled }}
+          securityContext: {{- include "common.tplvalues.render" (dict "value" (omit .Values.containerSecurityContext "enabled") "context" $) | nindent 12 }}
+          {{- end }}
+          env: {{- include "agriComposite.envVars" . | nindent 12 }}
+            {{- if $.Values.console.enabled }}
+            {{- include "agriComposite.consoleApiEnv" $ | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.containerPort }}
+              protocol: TCP
+          {{- if .Values.resources }}
+          resources: {{- include "common.tplvalues.render" (dict "value" .Values.resources "context" $) | nindent 12 }}
+          {{- end }}
+          {{- if and .Values.startupProbe .Values.startupProbe.enabled }}
+          startupProbe: {{- include "common.tplvalues.render" (dict "value" (omit .Values.startupProbe "enabled") "context" $) | nindent 12 }}
+          {{- end }}
+          {{- if and .Values.livenessProbe .Values.livenessProbe.enabled }}
+          livenessProbe: {{- include "common.tplvalues.render" (dict "value" (omit .Values.livenessProbe "enabled") "context" $) | nindent 12 }}
+          {{- end }}
+          {{- if and .Values.readinessProbe .Values.readinessProbe.enabled }}
+          readinessProbe: {{- include "common.tplvalues.render" (dict "value" (omit .Values.readinessProbe "enabled") "context" $) | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: use-cases
+              mountPath: {{ .Values.useCasesMountPath }}
+              readOnly: true
+            - name: signing-key
+              mountPath: {{ .Values.signingKey.mountPath }}
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: use-cases
+          configMap:
+            name: {{ include "agriComposite.useCasesConfigMap" . }}
+        - name: signing-key
+          secret:
+            secretName: {{ .Values.signingKey.secretName }}
+            # Optional so the pod starts (and reports the missing key) before
+            # the Secret exists; queries fail until it does.
+            optional: true
+            items:
+              - key: {{ .Values.signingKey.p12Key }}
+                path: {{ .Values.signingKey.p12Key }}
+              - key: {{ .Values.signingKey.pemKey }}
+                path: {{ .Values.signingKey.pemKey }}
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
+{{- end -}}
+{{- end }}

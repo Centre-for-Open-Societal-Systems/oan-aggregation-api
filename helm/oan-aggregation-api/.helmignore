@@ -1,5 +1,0 @@
-# Environment overlays stay in the repository; oan-helm refuses packages that carry them.
-values-*.yaml
-values-live.yaml
-private-values*.yaml
-.env*

@@ -1,0 +1,18 @@
+# Helm (fetched chart dependencies)
+charts/*/charts/
+charts/*/Chart.lock
+charts/*/*.tgz
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+
+# Test keys and keystores — never commit private keys
+*.p12
+*.pem
+

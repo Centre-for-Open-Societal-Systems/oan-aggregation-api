@@ -1,0 +1,60 @@
+{{- if and .Values.console.enabled .Values.console.db.pgInit.enabled }}
+{{- $db := .Values.console.db -}}
+{{- $p := $db.pgInit -}}
+# Creates the console database and its user in the shared Postgres with the
+# superuser (openg2p/postgres-init, as the postgres-init chart runs it). A
+# regular resource, not a hook (see postgres-init: a hook can deadlock with the
+# pods waiting for the database). Idempotent; the name carries the release
+# revision so each install/upgrade runs it afresh (Job specs are immutable).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ printf "%s-console-db-init-%v" .Release.Name .Release.Revision | trunc 63 | trimSuffix "-" }}
+  labels: {{- include "common.labels.standard" (dict "customLabels" .Values.commonLabels "context" $) | nindent 4 }}
+    app.kubernetes.io/component: console-db-init
+spec:
+  backoffLimit: {{ $p.backoffLimit | default 4 }}
+  ttlSecondsAfterFinished: {{ $p.ttlSecondsAfterFinished | default 600 }}
+  template:
+    metadata:
+      labels: {{- include "common.labels.matchLabels" (dict "customLabels" .Values.podLabels "context" $) | nindent 8 }}
+        app.kubernetes.io/component: console-db-init
+    spec:
+      restartPolicy: OnFailure
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: postgres-init
+          image: {{ printf "%s:%s" $p.image.repository (toString $p.image.tag) }}
+          imagePullPolicy: {{ $p.image.pullPolicy }}
+          env:
+            - name: POSTGRES_HOST
+              value: {{ tpl (toString $db.hostname) $ | quote }}
+            - name: POSTGRES_PORT
+              value: {{ $db.port | quote }}
+            - name: POSTGRES_USER
+              value: {{ $p.adminUser | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ tpl $p.adminSecret $ | quote }}
+                  key: {{ tpl $p.adminSecretPasswordKey $ | quote }}
+            - name: DB_NAME
+              value: {{ tpl $db.dbname $ | quote }}
+            - name: DB_USER
+              value: {{ tpl $db.user $ | quote }}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ tpl $db.secretName $ | quote }}
+                  key: {{ tpl $db.passwordKey $ | quote }}
+            - name: DB_EXTENSIONS
+              value: {{ join "," ($p.extensions | default list) | quote }}
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+{{- end }}

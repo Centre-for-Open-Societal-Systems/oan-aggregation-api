@@ -1,0 +1,23 @@
+{{- /* Needs keycloakInit: its token uses the client secret keycloakInit creates. */ -}}
+{{- if and .Values.console.enabled .Values.console.iamRegister.enabled .Values.console.keycloakInit.enabled }}
+# Catalog the console pushes into IAM (tile + permissions + roles). The
+# release-specific mnemonic, URL and description are placeholders
+# (__APPLICATION_MNEMONIC__ / __APPLICATION_URL__ / __APPLICATION_DESCRIPTION__)
+# substituted by the iam-register Job.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-console-iam-register-payload
+  labels: {{- include "common.labels.standard" (dict "customLabels" .Values.commonLabels "context" $) | nindent 4 }}
+    app.kubernetes.io/component: console-iam-register
+  {{- /* Hook annotations only when runAsHook (default true): nulls in a parent's
+       values cannot remove a subchart's default annotations. */}}
+  {{- if ne (toString .Values.console.iamRegister.runAsHook) "false" }}
+  {{- with .Values.console.iamRegister.payloadAnnotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- end }}
+data:
+  payload.json: |-
+{{ .Files.Get "files/iam-registration/payload.json" | indent 4 }}
+{{- end }}
