@@ -5,8 +5,9 @@ description: OAN Aggregation API (OpenG2P Aggregation Layer) for OpenAgriNet (OA
 type: application
 # CI packages this chart as 0.0.0-develop.<commit count> (oan-helm scripts/ci/derive-version.sh).
 version: 0.0.0
-# Application release version: the first part of the image tag (<appVersion>-<branch>.<build>, e.g. 0.0.0-develop.42).
-appVersion: "0.0.0"
+# Application release version: the first part of the image tag (<appVersion>-<branch>.<build>, e.g. 0.0.1-develop.42).
+# Bump it when the Jenkins job is recreated: BUILD_NUMBER restarts at 1.
+appVersion: "0.0.1"
 keywords:
 - oan
 - openagrinet
