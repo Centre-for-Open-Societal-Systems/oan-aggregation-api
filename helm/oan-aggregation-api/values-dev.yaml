@@ -71,6 +71,11 @@ catalog:
           - demographic_info.name.second_name
           - demographic_info.name.surname
           - demographic_info.phone_number
+          - demographic_info.email
+          - place.name
+          - place.geo.@type
+          - place.geo.latitude
+          - place.geo.longitude
           - demographic_info.sex
           - demographic_info.birth_date
           - marital_status

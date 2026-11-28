@@ -1,5 +1,25 @@
 """The field-level filter: only the configured paths of a block leave the service."""
+from pathlib import Path
+
 import pytest
+import yaml
+
+
+@pytest.mark.parametrize("filename", ["deploy/registries.yaml", "helm/oan-aggregation-api/values-dev.yaml"])
+def test_farmer_personal_scope_keeps_contact_and_place_only_as_configured(filename):
+    root = Path(__file__).resolve().parents[2]
+    config = yaml.safe_load((root / filename).read_text(encoding="utf-8"))
+    fields = config.get("catalog", config)["registries"]["FARMER_REGISTRY"]["scopes"]["farmer_personal_details"]["fields"]
+    record = {
+        "demographic_info": {"email": "sample@example.test", "phone_number": ["+12025550100"],
+                             "internal_note": "not consented"},
+        "place": {"name": "Sample locality", "geo": {"@type": "spdci:GeoLocation", "latitude": 0,
+                                                     "longitude": 39, "internal_note": "not consented"}},
+    }
+    assert project(record, compile_fields(fields)) == {
+        "demographic_info": {"email": "sample@example.test", "phone_number": ["+12025550100"]},
+        "place": {"name": "Sample locality", "geo": {"@type": "spdci:GeoLocation", "latitude": 0, "longitude": 39}},
+    }
 
 from openg2p_aggregation_layer.registry_catalog import (
     compile_fields,
